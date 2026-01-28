@@ -1,0 +1,21 @@
+cat > .dockerignore << 'EOF'
+**/.git
+**/.vscode
+**/browse.vc.db
+
+# ROS2 build artifacts
+build
+install
+log
+
+# Python caches
+__pycache__
+*.pyc
+.venv
+venv
+
+# Big archives
+*.tar
+*.tar.gz
+*.zip
+EOF

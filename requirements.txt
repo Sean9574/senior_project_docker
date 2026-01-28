@@ -1,0 +1,12 @@
+
+gymnasium>=0.28
+
+# Deep learning
+torch>=2.0
+pyquaternion
+termcolor
+
+# Reward monitor web UI
+Flask>=2.2
+Flask-SocketIO>=5.3
+eventlet>=0.33

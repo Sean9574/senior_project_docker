@@ -1,0 +1,42 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>senior_project</name>
+  <version>0.0.1</version>
+  <description>Stretch 2 RL integration with MuJoCo simulation.</description>
+
+  <maintainer email="sbrainard@ltu.edu">sean</maintainer>
+  <license>Apache-2.0</license>
+
+  <!-- Build system for ament_python packages -->
+  <buildtool_depend>ament_python</buildtool_depend>
+
+  <!-- ROS 2 Python runtime -->
+  <exec_depend>rclpy</exec_depend>
+
+  <!-- Launch system (your RL.launch.py uses these) -->
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+
+  <!-- Used by get_package_share_directory() in your launch file -->
+  <exec_depend>ament_index_python</exec_depend>
+
+  <!-- Nodes launched by RL.launch.py -->
+  <exec_depend>robot_state_publisher</exec_depend>
+  <exec_depend>joint_state_publisher</exec_depend>
+  <exec_depend>rviz2</exec_depend>
+
+  <!-- External packages referenced/required at runtime -->
+  <exec_depend>stretch_description</exec_depend>
+  <exec_depend>stretch_simulation</exec_depend>
+
+  <!-- Message packages used by learner_node.py imports -->
+  <exec_depend>geometry_msgs</exec_depend>
+  <exec_depend>nav_msgs</exec_depend>
+  <exec_depend>sensor_msgs</exec_depend>
+  <exec_depend>std_msgs</exec_depend>
+  <exec_depend>visualization_msgs</exec_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>
