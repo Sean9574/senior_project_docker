@@ -14,7 +14,7 @@ Supports:
 
 ## Requirements
 
-- Linux host
+- Linux 22.04
 - Docker installed
 - X11 desktop (for RViz)
 - (Optional) NVIDIA GPU + `nvidia-container-toolkit`
