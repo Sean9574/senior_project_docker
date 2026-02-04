@@ -4,14 +4,18 @@ SAM3 Navigation Launch File
 
 Starts everything needed for SAM3-based object navigation with multiple
 depth estimation methods:
-  1. SAM3 server (object detection/segmentation)
+  1. SAM3 server (object detection/segmentation) - OPTIONAL, can use shared server
   2. Mono depth server (optional, for RGB-only depth estimation)
   3. SAM3 goal generator  (supports depth camera, mono depth, or bbox heuristic)
   4. RL simulation + learner
 
 Usage:
-    # With depth camera (default)
+    # Standalone mode (starts its own SAM3 server)
     ros2 launch senior_project sam3_navigation.launch.py target:="cup"
+    
+    # Parallel mode (uses shared SAM3 server in domain 0)
+    ros2 launch senior_project sam3_navigation.launch.py \
+        target:="cup" start_sam3_server:="false" sam3_domain:="0" sim_id:="1"
     
     # RGB-only with monocular depth estimation
     ros2 launch senior_project sam3_navigation.launch.py \
@@ -36,6 +40,7 @@ from launch.actions import (
     ExecuteProcess,
     IncludeLaunchDescription,
     LogInfo,
+    OpaqueFunction,
     TimerAction,
 )
 from launch.conditions import IfCondition
@@ -52,6 +57,30 @@ def generate_launch_description():
     pkg_dir = get_package_share_directory('senior_project')
     
     # ===================== ARGUMENTS =====================
+    
+    # Simulation identity (for parallel runs)
+    ld.add_action(DeclareLaunchArgument(
+        "sim_id", default_value="0",
+        description="Simulation ID (used for port offsets in parallel mode)"
+    ))
+    
+    # SAM3 server configuration
+    ld.add_action(DeclareLaunchArgument(
+        "start_sam3_server", default_value="true",
+        description="Whether to start SAM3 server (false when using shared server)"
+    ))
+    ld.add_action(DeclareLaunchArgument(
+        "sam3_domain", default_value="0",
+        description="ROS_DOMAIN_ID where SAM3 server is running (for shared server mode)"
+    ))
+    ld.add_action(DeclareLaunchArgument(
+        "sam3_server_host", default_value="localhost",
+        description="SAM3 server hostname"
+    ))
+    ld.add_action(DeclareLaunchArgument(
+        "sam3_server_port", default_value="8100",
+        description="SAM3 server port"
+    ))
     
     # SAM3 args
     ld.add_action(DeclareLaunchArgument(
@@ -84,6 +113,14 @@ def generate_launch_description():
         "mono_depth_model", default_value="auto",
         description="Mono depth model: auto, depth_anything, midas, simple"
     ))
+    ld.add_action(DeclareLaunchArgument(
+        "start_mono_depth_server", default_value="true",
+        description="Whether to start mono depth server (false when using shared server)"
+    ))
+    ld.add_action(DeclareLaunchArgument(
+        "mono_depth_port", default_value="8101",
+        description="Mono depth server port"
+    ))
     
     # RL args
     ld.add_action(DeclareLaunchArgument("ns", default_value="stretch"))
@@ -98,6 +135,7 @@ def generate_launch_description():
         "ckpt_dir", default_value=os.path.expanduser("~/rl_checkpoints")
     ))
     ld.add_action(DeclareLaunchArgument("load_ckpt", default_value=""))
+    ld.add_action(DeclareLaunchArgument("headless", default_value="false"))
     
     # Camera topics (for non-standard setups)
     ld.add_action(DeclareLaunchArgument(
@@ -110,46 +148,103 @@ def generate_launch_description():
         "camera_info_topic", default_value="/camera/color/camera_info"
     ))
     
-    # ===================== SAM3 SERVER =====================
+    # Use OpaqueFunction to handle conditional logic with runtime values
+    ld.add_action(OpaqueFunction(function=_configure_launch))
     
-    sam3_server = ExecuteProcess(
-        cmd=['bash', '-c',
-            f'source {home}/miniconda3/etc/profile.d/conda.sh && '
-            f'conda activate sam3 && '
-            f'python {home}/ament_ws/src/stretch_ros2/senior_project/senior_project/sam3_server.py'
-        ],
-        output='screen',
-        name='sam3_server',
-    )
-    ld.add_action(sam3_server)
+    return ld
+
+
+def _configure_launch(context):
+    """Configure launch based on runtime argument values."""
+    home = os.path.expanduser("~")
+    pkg_dir = get_package_share_directory('senior_project')
     
-    # Set SAM3 prompt after server starts
-    set_prompt = ExecuteProcess(
-        cmd=['bash', '-c',
-            'sleep 15 && curl -X POST "http://localhost:8100/prompt/$(echo $TARGET | sed \'s/ /%20/g\')"'
-        ],
-        output='screen',
-        additional_env={'TARGET': LaunchConfiguration("target")},
-    )
-    ld.add_action(set_prompt)
+    # Get argument values
+    sim_id = LaunchConfiguration("sim_id").perform(context)
+    start_sam3 = LaunchConfiguration("start_sam3_server").perform(context).lower() in ("true", "1", "yes")
+    sam3_host = LaunchConfiguration("sam3_server_host").perform(context)
+    sam3_port = LaunchConfiguration("sam3_server_port").perform(context)
+    start_mono = LaunchConfiguration("start_mono_depth_server").perform(context).lower() in ("true", "1", "yes")
+    use_mono = LaunchConfiguration("use_mono_depth_server").perform(context).lower() in ("true", "1", "yes")
+    mono_port = LaunchConfiguration("mono_depth_port").perform(context)
     
-    # ===================== MONO DEPTH SERVER (OPTIONAL) =====================
+    actions = []
     
-    mono_depth_server = ExecuteProcess(
-        cmd=['bash', '-c',
-            f'source {home}/miniconda3/etc/profile.d/conda.sh && '
-            f'conda activate depth && '  # Assumes a 'depth' conda env, adjust as needed
-            f'python {home}/ament_ws/src/stretch_ros2/senior_project/senior_project/mono_depth_server.py '
-            f'--model $MONO_MODEL'
-        ],
-        output='screen',
-        name='mono_depth_server',
-        additional_env={'MONO_MODEL': LaunchConfiguration("mono_depth_model")},
-        condition=IfCondition(LaunchConfiguration("use_mono_depth_server")),
-    )
-    ld.add_action(mono_depth_server)
+    # Build server URLs
+    sam3_url = f"http://{sam3_host}:{sam3_port}"
+    mono_url = f"http://{sam3_host}:{mono_port}"
+    
+    # ===================== INFO =====================
+    
+    actions.append(LogInfo(msg=""))
+    actions.append(LogInfo(msg="============================================================"))
+    actions.append(LogInfo(msg=f"  SAM3 Navigation - Sim {sim_id}"))
+    actions.append(LogInfo(msg="============================================================"))
+    actions.append(LogInfo(msg=""))
+    
+    # ===================== SAM3 SERVER (CONDITIONAL) =====================
+    
+    if start_sam3:
+        actions.append(LogInfo(msg=f"  [0s]  SAM3 server starting on port {sam3_port}"))
+        
+        sam3_server = ExecuteProcess(
+            cmd=['bash', '-c',
+                f'source {home}/miniconda3/etc/profile.d/conda.sh && '
+                f'conda activate sam3 && '
+                f'python {home}/ament_ws/src/stretch_ros2/senior_project/senior_project/sam3_server.py '
+                f'--port {sam3_port}'
+            ],
+            output='screen',
+            name='sam3_server',
+        )
+        actions.append(sam3_server)
+        
+        # Set SAM3 prompt after server starts
+        set_prompt = ExecuteProcess(
+            cmd=['bash', '-c',
+                f'sleep 15 && curl -X POST "{sam3_url}/prompt/$(echo $TARGET | sed \'s/ /%20/g\')"'
+            ],
+            output='screen',
+            additional_env={'TARGET': LaunchConfiguration("target")},
+        )
+        actions.append(set_prompt)
+        actions.append(LogInfo(msg="  [15s] SAM3 prompt being set"))
+    else:
+        actions.append(LogInfo(msg=f"  [---] Using shared SAM3 server at {sam3_url}"))
+        
+        # Still need to set the prompt on the shared server
+        set_prompt = ExecuteProcess(
+            cmd=['bash', '-c',
+                f'sleep 5 && curl -X POST "{sam3_url}/prompt/$(echo $TARGET | sed \'s/ /%20/g\')"'
+            ],
+            output='screen',
+            additional_env={'TARGET': LaunchConfiguration("target")},
+        )
+        actions.append(set_prompt)
+    
+    # ===================== MONO DEPTH SERVER (CONDITIONAL) =====================
+    
+    if use_mono and start_mono:
+        actions.append(LogInfo(msg=f"  [0s]  Mono depth server starting on port {mono_port}"))
+        
+        mono_depth_server = ExecuteProcess(
+            cmd=['bash', '-c',
+                f'source {home}/miniconda3/etc/profile.d/conda.sh && '
+                f'conda activate depth && '
+                f'python {home}/ament_ws/src/stretch_ros2/senior_project/senior_project/mono_depth_server.py '
+                f'--model $MONO_MODEL --port {mono_port}'
+            ],
+            output='screen',
+            name='mono_depth_server',
+            additional_env={'MONO_MODEL': LaunchConfiguration("mono_depth_model")},
+        )
+        actions.append(mono_depth_server)
+    elif use_mono:
+        actions.append(LogInfo(msg=f"  [---] Using shared mono depth server at {mono_url}"))
     
     # ===================== RL SIMULATION =====================
+    
+    actions.append(LogInfo(msg="  [5s]  RL simulation starting"))
     
     rl_launch = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
@@ -166,22 +261,25 @@ def generate_launch_description():
             'rollout_steps': LaunchConfiguration('rollout_steps'),
             'ckpt_dir': LaunchConfiguration('ckpt_dir'),
             'load_ckpt': LaunchConfiguration('load_ckpt'),
+            'headless': LaunchConfiguration('headless'),
         }.items(),
     )
     
-    # Delay RL launch to let SAM3 server start
-    ld.add_action(TimerAction(period=5.0, actions=[rl_launch]))
+    # Delay RL launch to let servers start
+    actions.append(TimerAction(period=5.0, actions=[rl_launch]))
     
-    # ===================== SAM3 GOAL GENERATOR V2 =====================
+    # ===================== SAM3 GOAL GENERATOR =====================
+    
+    actions.append(LogInfo(msg="  [25s] Goal generator starting"))
     
     sam3_goal_node = Node(
         package='senior_project',
-        executable='sam3_goal_generator',  # New V2 node
+        executable='sam3_goal_generator',
         name='sam3_goal_generator',
         output='screen',
         parameters=[{
-            'server_url': 'http://localhost:8100',
-            'mono_depth_url': 'http://localhost:8101',
+            'server_url': sam3_url,
+            'mono_depth_url': mono_url,
             'target': LaunchConfiguration('target'),
             'confidence_threshold': LaunchConfiguration('confidence_threshold'),
             'goal_offset': LaunchConfiguration('goal_offset'),
@@ -198,29 +296,19 @@ def generate_launch_description():
     )
     
     # Delay goal generator to let everything else start
-    ld.add_action(TimerAction(period=25.0, actions=[sam3_goal_node]))
+    actions.append(TimerAction(period=25.0, actions=[sam3_goal_node]))
     
-    # ===================== INFO =====================
+    # ===================== MORE INFO =====================
     
-    ld.add_action(LogInfo(msg=""))
-    ld.add_action(LogInfo(msg="============================================================"))
-    ld.add_action(LogInfo(msg="  SAM3 Navigation - Multi-Depth Mode System"))
-    ld.add_action(LogInfo(msg="============================================================"))
-    ld.add_action(LogInfo(msg=""))
-    ld.add_action(LogInfo(msg="  [0s]  SAM3 server starting"))
-    ld.add_action(LogInfo(msg="  [0s]  Mono depth server starting (if enabled)"))
-    ld.add_action(LogInfo(msg="  [5s]  RL simulation starting"))
-    ld.add_action(LogInfo(msg="  [15s] SAM3 prompt being set"))
-    ld.add_action(LogInfo(msg="  [25s] Goal generator starting"))
-    ld.add_action(LogInfo(msg=""))
-    ld.add_action(LogInfo(msg="  Depth Modes:"))
-    ld.add_action(LogInfo(msg="    auto  - depth camera -> mono depth -> bbox size"))
-    ld.add_action(LogInfo(msg="    depth - depth camera only"))
-    ld.add_action(LogInfo(msg="    mono  - monocular depth estimation"))
-    ld.add_action(LogInfo(msg="    bbox  - bounding box size heuristic"))
-    ld.add_action(LogInfo(msg=""))
-    ld.add_action(LogInfo(msg="  Change target: ros2 topic pub --once \\"))
-    ld.add_action(LogInfo(msg="    /sam3_goal_generator/set_target std_msgs/String \"data: 'chair'\""))
-    ld.add_action(LogInfo(msg=""))
+    actions.append(LogInfo(msg=""))
+    actions.append(LogInfo(msg="  Depth Modes:"))
+    actions.append(LogInfo(msg="    auto  - depth camera -> mono depth -> bbox size"))
+    actions.append(LogInfo(msg="    depth - depth camera only"))
+    actions.append(LogInfo(msg="    mono  - monocular depth estimation"))
+    actions.append(LogInfo(msg="    bbox  - bounding box size heuristic"))
+    actions.append(LogInfo(msg=""))
+    actions.append(LogInfo(msg="  Change target: ros2 topic pub --once \\"))
+    actions.append(LogInfo(msg="    /sam3_goal_generator/set_target std_msgs/String \"data: 'chair'\""))
+    actions.append(LogInfo(msg=""))
     
-    return ld
+    return actions

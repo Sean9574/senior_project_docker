@@ -3,22 +3,18 @@
 Parallel Simulation Runner for SAM3 Navigation
 
 Spawns multiple simulations in parallel, each with its own:
-  - ROS_DOMAIN_ID
+  - ROS_DOMAIN_ID (sim_base_domain + sim_id)
   - Server ports
   - Checkpoint directory
 
-Now supports passing headless from the caller (launch file or CLI) so the per-sim
-launch behavior follows that setting.
+All simulations connect to a SHARED SAM3 server running in sam3_domain.
 
 Usage:
-    # Run 4 parallel sims (headless true)
-    python parallel_runner.py --num_sims 4 --target "cup" --headless true
-
-    # Run 4 parallel sims (headless false)
-    python parallel_runner.py --num_sims 4 --target "cup" --headless false
+    # Run 4 parallel sims with shared SAM3 server in domain 0, sims in domains 10-13
+    python parallel_runner.py --num_sims 4 --target "cup" --sam3_domain 0 --sim_base_domain 10
 
     # Run and merge on completion
-    python parallel_runner.py --num_sims 4 --target "cup" --merge_on_exit --headless true
+    python parallel_runner.py --num_sims 4 --target "cup" --merge_on_exit --sam3_domain 0
 """
 
 import argparse
@@ -43,12 +39,14 @@ class ParallelRunner:
         total_steps: int = 200000,
         rollout_steps: int = 2048,
         base_ckpt_dir: str = "~/rl_checkpoints",
-        launch_file: str = "sam3_navigation_parallel.launch.py",
+        launch_file: str = "sam3_navigation.launch.py",
         package: str = "senior_project",
         extra_args: Optional[Dict[str, str]] = None,
         merge_on_exit: bool = False,
         stagger_delay: float = 10.0,
         headless: bool = True,
+        sam3_domain: int = 0,
+        sim_base_domain: int = 10,
     ):
         self.num_sims = num_sims
         self.target = target
@@ -61,6 +59,8 @@ class ParallelRunner:
         self.merge_on_exit = merge_on_exit
         self.stagger_delay = stagger_delay
         self.headless = bool(headless)
+        self.sam3_domain = sam3_domain
+        self.sim_base_domain = sim_base_domain
 
         self.processes: List[subprocess.Popen] = []
         self.start_time: Optional[datetime] = None
@@ -89,6 +89,10 @@ class ParallelRunner:
             except Exception:
                 pass
 
+    def _get_sim_domain(self, sim_id: int) -> int:
+        """Get the ROS_DOMAIN_ID for a specific simulation."""
+        return self.sim_base_domain + sim_id
+
     def _build_launch_command(self, sim_id: int) -> List[str]:
         """Build the ros2 launch command for a simulation."""
         ckpt_dir = os.path.join(self.base_ckpt_dir, f"sim_{sim_id}")
@@ -101,11 +105,20 @@ class ParallelRunner:
             f"rollout_steps:={self.rollout_steps}",
             f"ckpt_dir:={ckpt_dir}",
             f"headless:={str(self.headless).lower()}",
+            # Pass SAM3 domain so the sim knows where to connect
+            f"sam3_domain:={self.sam3_domain}",
         ]
+        
+        
+        
+        
+        
+        
 
-        # Add any extra arguments (but never allow extra to override headless)
+        # Add any extra arguments (but never allow extra to override headless or sam3_domain)
         for key, value in self.extra_args.items():
-            if key.strip().lower() == "headless":
+            key_lower = key.strip().lower()
+            if key_lower in ("headless", "sam3_domain"):
                 continue
             cmd.append(f"{key}:={value}")
 
@@ -115,9 +128,10 @@ class ParallelRunner:
         """Start a single simulation instance."""
         cmd = self._build_launch_command(sim_id)
 
-        # Set environment with unique ROS_DOMAIN_ID
+        # Set environment with unique ROS_DOMAIN_ID for this sim
+        sim_domain = self._get_sim_domain(sim_id)
         env = os.environ.copy()
-        env["ROS_DOMAIN_ID"] = str(sim_id)
+        env["ROS_DOMAIN_ID"] = str(sim_domain)
 
         # Create log directory
         log_dir = os.path.join(self.base_ckpt_dir, f"sim_{sim_id}", "logs")
@@ -129,7 +143,8 @@ class ParallelRunner:
 
         print(
             f"[Runner] Starting sim {sim_id} "
-            f"(DOMAIN_ID={sim_id}, ports={8100 + sim_id*10}+, headless={self.headless})"
+            f"(DOMAIN_ID={sim_domain}, SAM3_DOMAIN={self.sam3_domain}, "
+            f"ports={8100 + sim_id*10}+, headless={self.headless})"
         )
 
         proc = subprocess.Popen(
@@ -158,6 +173,8 @@ class ParallelRunner:
         print(f"  Headless: {self.headless}")
         print(f"  Checkpoint Dir: {self.base_ckpt_dir}")
         print(f"  Merge on Exit: {self.merge_on_exit}")
+        print(f"  SAM3 Server Domain: {self.sam3_domain}")
+        print(f"  Sim Domains: {self.sim_base_domain} - {self.sim_base_domain + self.num_sims - 1}")
         print(f"{'='*60}\n")
 
         for sim_id in range(self.num_sims):
@@ -268,6 +285,8 @@ class ParallelRunner:
         print(f"  Total Time: {elapsed/60:.1f} minutes")
         print(f"  Simulations: {self.num_sims}")
         print(f"  Headless: {self.headless}")
+        print(f"  SAM3 Server Domain: {self.sam3_domain}")
+        print(f"  Sim Domains: {self.sim_base_domain} - {self.sim_base_domain + self.num_sims - 1}")
         print(f"  Checkpoints: {self.base_ckpt_dir}/sim_*/")
         if self.merge_on_exit:
             print(f"  Merged Model: {self.base_ckpt_dir}/merged.pt")
@@ -310,18 +329,26 @@ def main():
         help="Delay between launching simulations in seconds (default: 10.0)"
     )
     parser.add_argument(
-        "--launch_file", type=str, default="sam3_navigation_parallel.launch.py",
-        help="Launch file to use"
+        "--launch_file", type=str, default="sam3_navigation.launch.py",
+        help="Launch file to use for each simulation"
     )
     parser.add_argument(
         "--package", type=str, default="senior_project",
         help="ROS package containing launch file"
     )
-
-    # NEW: headless propagated into each sim launch
     parser.add_argument(
         "--headless", type=str, default="true",
         help="Headless mode: true/false (propagated into each sim launch)"
+    )
+
+    # Domain configuration
+    parser.add_argument(
+        "--sam3_domain", type=int, default=0,
+        help="ROS_DOMAIN_ID where the shared SAM3 server is running (default: 0)"
+    )
+    parser.add_argument(
+        "--sim_base_domain", type=int, default=10,
+        help="Base ROS_DOMAIN_ID for simulations; sim N uses base + N (default: 10)"
     )
 
     # Collect any extra launch arguments
@@ -351,6 +378,8 @@ def main():
         merge_on_exit=args.merge_on_exit,
         stagger_delay=args.stagger_delay,
         headless=_str2bool(args.headless),
+        sam3_domain=args.sam3_domain,
+        sim_base_domain=args.sim_base_domain,
     )
 
     runner.start_all()
