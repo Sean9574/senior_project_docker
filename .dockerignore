@@ -1,21 +1,39 @@
-cat > .dockerignore << 'EOF'
-**/.git
-**/.vscode
-**/browse.vc.db
+# ROS / colcon artifacts (do NOT bake into images)
+build/
+install/
+log/
 
-# Common junk
-**/__pycache__
+# Python
+__pycache__/
+**/__pycache__/
 **/*.pyc
-**/.venv
-**/venv
+**/*.pyo
+**/*.pyd
 
-# ROS2 build outputs (if present)
-build
-install
-log
+# Training / runtime outputs (keep them out of the image)
+models/
+checkpoints/
+multi_robot_checkpoints/
+runs/
+logs/
+MUJOCO_LOG.TXT
+nn_exports/
 
-# Archives
-**/*.tar
-**/*.tar.gz
-**/*.zip
-EOF
+# VCS + editor
+.git/
+.gitignore
+.github/
+.vscode/
+.idea/
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Archives / big binaries
+*.tar
+*.tar.gz
+*.tgz
+*.zip
+*.7z
+*.iso

@@ -30,7 +30,7 @@ setup(
             'sam3_goal_generator = senior_project.sam3_goal_generator:main',
             'sam3_depth_node = senior_project.sam3_depth_node:main',
             'sam3_server = senior_project.sam3_server:main',
-            
+            'parallel_runner = senior_project.parallel_runner:main',
             
         ],
     },

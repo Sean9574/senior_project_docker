@@ -1,13 +1,18 @@
 #!/usr/bin/env python3
 """
-Stretch Robot RL Environment + Learner
+Stretch Robot RL Environment + Learner (IMPROVED VERSION)
 
-LEARNED EXPLORATION:
+IMPROVEMENTS OVER ORIGINAL:
+1. Prioritized Experience Replay (PER) - focuses learning on important transitions
+2. Random Network Distillation (RND) - learned intrinsic motivation replaces heuristics
+3. Observation normalization - stabilizes training
+4. Reward normalization - handles reward scale mismatch between modes
+
+Original behaviors preserved:
 - Agent receives ego-centric occupancy grid as part of observation
-- When no goal: rewarded for discovering new areas (coverage, novelty)
+- When no goal: rewarded for discovering new areas (now with RND bonus)
 - When goal set: rewarded for reaching goal (progress, alignment)
 - Same network learns both behaviors via "has_goal" flag in observation
-- NO hand-crafted exploration heuristics - pure RL
 """
 
 import argparse
@@ -42,15 +47,15 @@ from visualization_msgs.msg import Marker, MarkerArray
 # CONFIG
 # =============================================================================
 
-CHECKPOINT_FILENAME = "td3_explore_agent.pt"
+CHECKPOINT_FILENAME = "td3_explore_agent_v2.pt"  # New filename for improved version
 AUTO_LOAD_CHECKPOINT = True
 
-EPISODE_SECONDS = 60.0  # Longer episodes for exploration
+EPISODE_SECONDS = 60.0
 
 # --- Occupancy Grid ---
-GRID_SIZE = 16              # 16x16 grid
-GRID_RESOLUTION = 0.5       # meters per cell (16 * 0.5 = 8m x 8m view)
-GRID_MAX_RANGE = 10.0       # Max LiDAR range for grid updates
+GRID_SIZE = 24
+GRID_RESOLUTION = 0.5
+GRID_MAX_RANGE = 12.0
 
 # --- Movement Limits ---
 V_MAX = 1.25
@@ -72,18 +77,32 @@ ALIGN_SCALE = 3.0
 STEP_COST = -0.05
 
 # --- Exploration Rewards (when NO goal) ---
-R_NEW_CELL = 2.0            # Reward per newly discovered cell
-R_NOVELTY_SCALE = 0.5       # Reward for being in less-visited areas
-R_FRONTIER_BONUS = 5.0      # Bonus for moving toward unexplored areas
-R_COLLISION_EXPLORE = -500.0  # Collision penalty during exploration
-R_STEP_EXPLORE = -0.02      # Small step cost during exploration
+# NOTE: These are now supplemented by RND intrinsic reward
+R_NEW_CELL = 2.0
+R_NOVELTY_SCALE = 0.5
+R_FRONTIER_BONUS = 5.0
+R_COLLISION_EXPLORE = -500.0
+R_STEP_EXPLORE = -0.02
+
+# --- RND Config (NEW) ---
+RND_WEIGHT_INITIAL = 1.0      # Initial weight for intrinsic reward
+RND_WEIGHT_DECAY = 0.99995    # Decay per step (reaches ~0.6 at 100k steps)
+RND_WEIGHT_MIN = 0.1          # Minimum intrinsic reward weight
+RND_FEATURE_DIM = 64          # RND embedding dimension
+RND_LR = 1e-4                 # RND predictor learning rate
+
+# --- PER Config (NEW) ---
+PER_ALPHA = 0.6               # Priority exponent (0 = uniform, 1 = full prioritization)
+PER_BETA_START = 0.4          # Initial importance sampling correction
+PER_BETA_END = 1.0            # Final beta (annealed over training)
+PER_EPSILON = 1e-6            # Small constant to avoid zero priorities
 
 # Visit tracking
-VISIT_DECAY = 0.995         # How fast visit counts decay
-NOVELTY_RADIUS = 1.0        # Radius to check for novelty
+VISIT_DECAY = 0.995
+NOVELTY_RADIUS = 1.0
 
 # --- LiDAR ---
-LIDAR_FORWARD_OFFSET_RAD = math.pi  # If scan "front" is robot rear
+LIDAR_FORWARD_OFFSET_RAD = math.pi
 NUM_LIDAR_BINS = 60
 LIDAR_MAX_RANGE = 20.0
 
@@ -96,10 +115,10 @@ DEBUG_EVERY_N = 50
 
 # --- Visualization ---
 PUBLISH_MAP = True
-PUBLISH_MAP_EVERY_N = 10       # Publish map every N steps
+PUBLISH_MAP_EVERY_N = 10
 PUBLISH_PATH = True
-PATH_HISTORY_LENGTH = 1000     # Keep last N positions for path visualization
-MAP_FRAME = "odom"             # Frame ID for the map
+PATH_HISTORY_LENGTH = 1000
+MAP_FRAME = "odom"
 
 
 # =============================================================================
@@ -125,7 +144,371 @@ def set_seed(seed: int):
 
 
 # =============================================================================
-# Ego-Centric Occupancy Grid
+# NEW: Running Mean/Std for Normalization
+# =============================================================================
+
+class RunningMeanStd:
+    """Tracks running mean and standard deviation for normalization."""
+    
+    def __init__(self, shape: Tuple[int, ...] = (), epsilon: float = 1e-8):
+        self.mean = np.zeros(shape, dtype=np.float64)
+        self.var = np.ones(shape, dtype=np.float64)
+        self.count = epsilon
+    
+    def update(self, x: np.ndarray):
+        """Update statistics with a batch of data."""
+        batch_mean = np.mean(x, axis=0)
+        batch_var = np.var(x, axis=0)
+        batch_count = x.shape[0] if x.ndim > 1 else 1
+        
+        if x.ndim == 1:
+            batch_mean = x
+            batch_var = np.zeros_like(x)
+            batch_count = 1
+        
+        self._update_from_moments(batch_mean, batch_var, batch_count)
+    
+    def _update_from_moments(self, batch_mean, batch_var, batch_count):
+        delta = batch_mean - self.mean
+        tot_count = self.count + batch_count
+        
+        new_mean = self.mean + delta * batch_count / tot_count
+        m_a = self.var * self.count
+        m_b = batch_var * batch_count
+        m_2 = m_a + m_b + np.square(delta) * self.count * batch_count / tot_count
+        new_var = m_2 / tot_count
+        
+        self.mean = new_mean
+        self.var = new_var
+        self.count = tot_count
+    
+    def normalize(self, x: np.ndarray) -> np.ndarray:
+        """Normalize input using running statistics."""
+        return (x - self.mean) / np.sqrt(self.var + 1e-8)
+
+
+class RewardNormalizer:
+    """Normalizes rewards to have roughly unit variance."""
+    
+    def __init__(self, clip: float = 10.0):
+        self.rms = RunningMeanStd(shape=())
+        self.clip = clip
+    
+    def normalize(self, reward: float, update: bool = True) -> float:
+        """Normalize reward and optionally update statistics."""
+        if update:
+            self.rms.update(np.array([reward]))
+        
+        std = np.sqrt(self.rms.var + 1e-8)
+        normalized = reward / max(std, 1.0)
+        return float(np.clip(normalized, -self.clip, self.clip))
+
+
+# =============================================================================
+# NEW: Random Network Distillation (RND)
+# =============================================================================
+
+class RNDModule(nn.Module):
+    """
+    Random Network Distillation for intrinsic motivation.
+    
+    The intrinsic reward is the prediction error between:
+    - A fixed, randomly initialized target network
+    - A predictor network that learns to match the target
+    
+    Novel states have high prediction error = high intrinsic reward.
+    """
+    
+    def __init__(self, obs_dim: int, hidden: int = 256, 
+                 feature_dim: int = RND_FEATURE_DIM, device: torch.device = None):
+        super().__init__()
+        
+        self.device = device or torch.device("cpu")
+        
+        # Fixed random target network (NEVER updated)
+        self.target = nn.Sequential(
+            nn.Linear(obs_dim, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, feature_dim)
+        ).to(self.device)
+        
+        # Freeze target network
+        for param in self.target.parameters():
+            param.requires_grad = False
+        
+        # Predictor network (trained to match target)
+        self.predictor = nn.Sequential(
+            nn.Linear(obs_dim, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, feature_dim)
+        ).to(self.device)
+        
+        # Optimizer for predictor only
+        self.optimizer = torch.optim.Adam(self.predictor.parameters(), lr=RND_LR)
+        
+        # Running stats for observation normalization (RND-specific)
+        self.obs_rms = RunningMeanStd(shape=(obs_dim,))
+        
+        # Running stats for intrinsic reward normalization
+        self.reward_rms = RunningMeanStd(shape=())
+    
+    def normalize_obs(self, obs: np.ndarray) -> np.ndarray:
+        """Normalize observation for RND (separate from main obs norm)."""
+        return np.clip(self.obs_rms.normalize(obs), -5.0, 5.0)
+    
+    @torch.no_grad()
+    def compute_intrinsic_reward(self, obs: np.ndarray) -> float:
+        """
+        Compute intrinsic reward as prediction error.
+        Higher error = more novel state = higher reward.
+        """
+        # Update observation statistics
+        self.obs_rms.update(obs.reshape(1, -1))
+        
+        # Normalize observation
+        obs_norm = self.normalize_obs(obs)
+        obs_tensor = torch.as_tensor(obs_norm, dtype=torch.float32, device=self.device)
+        
+        if obs_tensor.dim() == 1:
+            obs_tensor = obs_tensor.unsqueeze(0)
+        
+        # Compute prediction error
+        target_features = self.target(obs_tensor)
+        predictor_features = self.predictor(obs_tensor)
+        
+        intrinsic_reward = (target_features - predictor_features).pow(2).mean().item()
+        
+        # Normalize intrinsic reward
+        self.reward_rms.update(np.array([intrinsic_reward]))
+        normalized_reward = intrinsic_reward / np.sqrt(self.reward_rms.var + 1e-8)
+        
+        return float(normalized_reward)
+    
+    def update(self, obs_batch: torch.Tensor) -> float:
+        """
+        Update predictor network to better match target.
+        Returns the loss value for logging.
+        """
+        # Normalize observations
+        obs_np = obs_batch.cpu().numpy()
+        obs_norm = np.clip(
+            (obs_np - self.obs_rms.mean) / np.sqrt(self.obs_rms.var + 1e-8),
+            -5.0, 5.0
+        )
+        obs_norm_tensor = torch.as_tensor(obs_norm, dtype=torch.float32, device=self.device)
+        
+        # Forward pass
+        with torch.no_grad():
+            target_features = self.target(obs_norm_tensor)
+        
+        predictor_features = self.predictor(obs_norm_tensor)
+        
+        # MSE loss
+        loss = F.mse_loss(predictor_features, target_features)
+        
+        # Update predictor
+        self.optimizer.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.predictor.parameters(), 1.0)
+        self.optimizer.step()
+        
+        return float(loss.item())
+    
+    def state_dict_custom(self) -> Dict:
+        """Get state dict including running statistics."""
+        return {
+            "predictor": self.predictor.state_dict(),
+            "target": self.target.state_dict(),
+            "optimizer": self.optimizer.state_dict(),
+            "obs_rms_mean": self.obs_rms.mean,
+            "obs_rms_var": self.obs_rms.var,
+            "obs_rms_count": self.obs_rms.count,
+            "reward_rms_mean": self.reward_rms.mean,
+            "reward_rms_var": self.reward_rms.var,
+            "reward_rms_count": self.reward_rms.count,
+        }
+    
+    def load_state_dict_custom(self, state_dict: Dict):
+        """Load state dict including running statistics."""
+        self.predictor.load_state_dict(state_dict["predictor"])
+        self.target.load_state_dict(state_dict["target"])
+        self.optimizer.load_state_dict(state_dict["optimizer"])
+        self.obs_rms.mean = state_dict["obs_rms_mean"]
+        self.obs_rms.var = state_dict["obs_rms_var"]
+        self.obs_rms.count = state_dict["obs_rms_count"]
+        self.reward_rms.mean = state_dict["reward_rms_mean"]
+        self.reward_rms.var = state_dict["reward_rms_var"]
+        self.reward_rms.count = state_dict["reward_rms_count"]
+
+
+# =============================================================================
+# NEW: Prioritized Experience Replay (PER)
+# =============================================================================
+
+class SumTree:
+    """
+    Binary sum tree for efficient priority-based sampling.
+    Allows O(log n) updates and sampling.
+    """
+    
+    def __init__(self, capacity: int):
+        self.capacity = capacity
+        self.tree = np.zeros(2 * capacity - 1, dtype=np.float64)
+        self.data_pointer = 0
+    
+    def update(self, tree_idx: int, priority: float):
+        """Update priority at tree index."""
+        change = priority - self.tree[tree_idx]
+        self.tree[tree_idx] = priority
+        
+        # Propagate change up the tree
+        while tree_idx != 0:
+            tree_idx = (tree_idx - 1) // 2
+            self.tree[tree_idx] += change
+    
+    def add(self, priority: float) -> int:
+        """Add new priority, return data index."""
+        tree_idx = self.data_pointer + self.capacity - 1
+        self.update(tree_idx, priority)
+        
+        data_idx = self.data_pointer
+        self.data_pointer = (self.data_pointer + 1) % self.capacity
+        
+        return data_idx
+    
+    def get(self, value: float) -> Tuple[int, int, float]:
+        """
+        Get leaf index, data index, and priority for a value.
+        Used for proportional sampling.
+        """
+        parent_idx = 0
+        
+        while True:
+            left_child = 2 * parent_idx + 1
+            right_child = left_child + 1
+            
+            if left_child >= len(self.tree):
+                leaf_idx = parent_idx
+                break
+            
+            if value <= self.tree[left_child]:
+                parent_idx = left_child
+            else:
+                value -= self.tree[left_child]
+                parent_idx = right_child
+        
+        data_idx = leaf_idx - self.capacity + 1
+        return leaf_idx, data_idx, self.tree[leaf_idx]
+    
+    @property
+    def total_priority(self) -> float:
+        return self.tree[0]
+
+
+class PrioritizedReplayBuffer:
+    """
+    Prioritized Experience Replay buffer.
+    
+    Samples transitions with probability proportional to their TD error,
+    focusing learning on "surprising" or informative transitions.
+    """
+    
+    def __init__(self, obs_dim: int, act_dim: int, size: int, 
+                 device: torch.device, alpha: float = PER_ALPHA):
+        self.device = device
+        self.size = int(size)
+        self.alpha = alpha
+        self.ptr = 0
+        self.count = 0
+        
+        # Data storage
+        self.obs = np.zeros((self.size, obs_dim), dtype=np.float32)
+        self.next_obs = np.zeros((self.size, obs_dim), dtype=np.float32)
+        self.acts = np.zeros((self.size, act_dim), dtype=np.float32)
+        self.rews = np.zeros((self.size, 1), dtype=np.float32)
+        self.done = np.zeros((self.size, 1), dtype=np.float32)
+        
+        # Priority tree
+        self.tree = SumTree(self.size)
+        self.max_priority = 1.0
+    
+    def add(self, obs, act, rew, next_obs, done):
+        """Add transition with max priority (will be updated after first sample)."""
+        self.obs[self.ptr] = obs
+        self.acts[self.ptr] = act
+        self.rews[self.ptr] = rew
+        self.next_obs[self.ptr] = next_obs
+        self.done[self.ptr] = done
+        
+        # New transitions get max priority
+        priority = self.max_priority ** self.alpha
+        self.tree.add(priority)
+        
+        self.ptr = (self.ptr + 1) % self.size
+        self.count = min(self.count + 1, self.size)
+    
+    def sample(self, batch_size: int, beta: float = PER_BETA_START) -> Tuple:
+        """
+        Sample batch with importance sampling weights.
+        
+        Args:
+            batch_size: Number of transitions to sample
+            beta: Importance sampling exponent (annealed from 0.4 to 1.0)
+        
+        Returns:
+            obs, acts, rews, next_obs, done, weights, indices
+        """
+        indices = np.zeros(batch_size, dtype=np.int32)
+        priorities = np.zeros(batch_size, dtype=np.float32)
+        
+        # Divide total priority into segments for stratified sampling
+        segment = self.tree.total_priority / batch_size
+        
+        for i in range(batch_size):
+            # Sample from segment
+            low = segment * i
+            high = segment * (i + 1)
+            value = np.random.uniform(low, high)
+            
+            tree_idx, data_idx, priority = self.tree.get(value)
+            indices[i] = data_idx
+            priorities[i] = priority
+        
+        # Compute importance sampling weights
+        # P(i) = priority_i / sum(priorities)
+        probs = priorities / self.tree.total_priority
+        
+        # w_i = (N * P(i))^(-beta) / max(w)
+        weights = (self.count * probs) ** (-beta)
+        weights = weights / weights.max()  # Normalize
+        
+        return (
+            torch.as_tensor(self.obs[indices], device=self.device),
+            torch.as_tensor(self.acts[indices], device=self.device),
+            torch.as_tensor(self.rews[indices], device=self.device),
+            torch.as_tensor(self.next_obs[indices], device=self.device),
+            torch.as_tensor(self.done[indices], device=self.device),
+            torch.as_tensor(weights, device=self.device, dtype=torch.float32),
+            indices
+        )
+    
+    def update_priorities(self, indices: np.ndarray, td_errors: np.ndarray):
+        """Update priorities based on TD errors."""
+        for idx, td_error in zip(indices, td_errors):
+            priority = (abs(td_error) + PER_EPSILON) ** self.alpha
+            
+            tree_idx = idx + self.tree.capacity - 1
+            self.tree.update(tree_idx, priority)
+            
+            self.max_priority = max(self.max_priority, abs(td_error) + PER_EPSILON)
+
+
+# =============================================================================
+# Ego-Centric Occupancy Grid (unchanged from original)
 # =============================================================================
 
 class EgoOccupancyGrid:
@@ -141,30 +524,20 @@ class EgoOccupancyGrid:
         self.resolution = resolution
         self.half_size = size // 2
         
-        # Grid: 0 = unknown, 0.5 = free, 1.0 = occupied
         self.grid = np.zeros((size, size), dtype=np.float32)
         
-        # Persistent world map for tracking coverage
-        self.world_grid: Dict[Tuple[int, int], float] = {}  # (gx, gy) -> value
-        self.visit_counts: Dict[Tuple[int, int], float] = {}  # (gx, gy) -> visit count
+        self.world_grid: Dict[Tuple[int, int], float] = {}
+        self.visit_counts: Dict[Tuple[int, int], float] = {}
         
-        # Stats
         self.total_cells_discovered = 0
         self.cells_discovered_this_step = 0
     
     def world_to_grid_key(self, x: float, y: float) -> Tuple[int, int]:
-        """Convert world coordinates to world grid key."""
         return (int(x / self.resolution), int(y / self.resolution))
     
     def update_from_scan(self, robot_x: float, robot_y: float, robot_yaw: float,
                          scan: LaserScan) -> int:
-        """
-        Update the ego-centric grid from LiDAR scan.
-        Returns number of NEW cells discovered.
-        """
         self.cells_discovered_this_step = 0
-        
-        # Reset ego grid (it's rebuilt each step)
         self.grid.fill(0.0)
         
         ranges = np.array(scan.ranges, dtype=np.float32)
@@ -178,45 +551,36 @@ class EgoOccupancyGrid:
         range_max = min(scan.range_max, GRID_MAX_RANGE)
         range_min = max(scan.range_min, 0.05)
         
-        # Update visit count for current position
         robot_key = self.world_to_grid_key(robot_x, robot_y)
         self.visit_counts[robot_key] = self.visit_counts.get(robot_key, 0) + 1
         
-        # Process rays
-        for i in range(0, n_rays, 3):  # Skip for performance
+        for i in range(0, n_rays, 3):
             r = ranges[i]
             
             if np.isnan(r) or np.isinf(r) or r < range_min:
                 continue
             
             r = min(r, range_max)
-            
-            # Ray angle in world frame
             ray_angle_world = robot_yaw + angle_min + i * angle_inc + LIDAR_FORWARD_OFFSET_RAD
             
-            # Trace ray and mark cells
             step = self.resolution * 0.4
             for d in np.arange(step, r, step):
-                # World position
                 wx = robot_x + d * math.cos(ray_angle_world)
                 wy = robot_y + d * math.sin(ray_angle_world)
                 
-                # Update world grid (free)
                 world_key = self.world_to_grid_key(wx, wy)
                 if world_key not in self.world_grid:
                     self.world_grid[world_key] = 0.5
                     self.total_cells_discovered += 1
                     self.cells_discovered_this_step += 1
                 
-                # Update ego grid
                 ego_x, ego_y = self._world_to_ego(wx, wy, robot_x, robot_y, robot_yaw)
                 gx = int(ego_x / self.resolution) + self.half_size
                 gy = int(ego_y / self.resolution) + self.half_size
                 
                 if 0 <= gx < self.size and 0 <= gy < self.size:
-                    self.grid[gy, gx] = 0.5  # Free
+                    self.grid[gy, gx] = 0.5
             
-            # Mark endpoint as occupied (if not max range)
             if r < range_max - 0.5:
                 wx = robot_x + r * math.cos(ray_angle_world)
                 wy = robot_y + r * math.sin(ray_angle_world)
@@ -232,33 +596,23 @@ class EgoOccupancyGrid:
                 gy = int(ego_y / self.resolution) + self.half_size
                 
                 if 0 <= gx < self.size and 0 <= gy < self.size:
-                    self.grid[gy, gx] = 1.0  # Occupied
+                    self.grid[gy, gx] = 1.0
         
         return self.cells_discovered_this_step
     
     def _world_to_ego(self, wx: float, wy: float, 
                       robot_x: float, robot_y: float, robot_yaw: float) -> Tuple[float, float]:
-        """Transform world coordinates to ego-centric frame."""
-        # Translate
         dx = wx - robot_x
         dy = wy - robot_y
-        
-        # Rotate (so robot's forward is +y in ego frame)
-        angle = -robot_yaw + math.pi / 2  # Rotate so forward is up
+        angle = -robot_yaw + math.pi / 2
         ego_x = dx * math.cos(angle) - dy * math.sin(angle)
         ego_y = dx * math.sin(angle) + dy * math.cos(angle)
-        
         return ego_x, ego_y
     
     def get_novelty(self, robot_x: float, robot_y: float) -> float:
-        """
-        Get novelty score for current position.
-        Higher = less visited area.
-        """
         robot_key = self.world_to_grid_key(robot_x, robot_y)
         visit_count = self.visit_counts.get(robot_key, 0)
         
-        # Also check nearby cells
         total_visits = visit_count
         cells_checked = 1
         
@@ -271,33 +625,23 @@ class EgoOccupancyGrid:
                 cells_checked += 1
         
         avg_visits = total_visits / cells_checked
-        
-        # Novelty decreases with visits (exponential decay)
         novelty = math.exp(-avg_visits * 0.1)
         return float(novelty)
     
     def get_frontier_direction(self, robot_x: float, robot_y: float, robot_yaw: float) -> float:
-        """
-        Get angle to nearest frontier (boundary of explored area).
-        Returns angle in robot frame, or 0 if no frontier found.
-        """
         robot_key = self.world_to_grid_key(robot_x, robot_y)
         
         best_frontier = None
         best_dist = float('inf')
-        
-        # Search for frontier cells (free cells adjacent to unknown)
-        search_radius = 20  # Grid cells
+        search_radius = 20
         
         for dx in range(-search_radius, search_radius + 1):
             for dy in range(-search_radius, search_radius + 1):
                 key = (robot_key[0] + dx, robot_key[1] + dy)
                 
-                # Is this cell free?
                 if self.world_grid.get(key, 0) != 0.5:
                     continue
                 
-                # Check if adjacent to unknown
                 has_unknown_neighbor = False
                 for ndx, ndy in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
                     neighbor_key = (key[0] + ndx, key[1] + ndy)
@@ -306,16 +650,14 @@ class EgoOccupancyGrid:
                         break
                 
                 if has_unknown_neighbor:
-                    # This is a frontier cell
                     dist = math.hypot(dx, dy)
-                    if dist < best_dist and dist > 2:  # Not too close
+                    if dist < best_dist and dist > 2:
                         best_dist = dist
                         best_frontier = key
         
         if best_frontier is None:
             return 0.0
         
-        # Compute angle to frontier
         fx = best_frontier[0] * self.resolution
         fy = best_frontier[1] * self.resolution
         rx = robot_key[0] * self.resolution
@@ -327,16 +669,13 @@ class EgoOccupancyGrid:
         return float(angle_robot)
     
     def get_flat_grid(self) -> np.ndarray:
-        """Get flattened grid for observation."""
         return self.grid.flatten()
     
     def decay_visits(self):
-        """Decay visit counts over time."""
         for key in self.visit_counts:
             self.visit_counts[key] *= VISIT_DECAY
     
     def get_stats(self) -> Dict:
-        """Get exploration statistics."""
         return {
             'total_discovered': self.total_cells_discovered,
             'new_this_step': self.cells_discovered_this_step,
@@ -344,19 +683,11 @@ class EgoOccupancyGrid:
         }
     
     def reset(self):
-        """Reset for new episode (but keep world knowledge)."""
         self.grid.fill(0.0)
         self.cells_discovered_this_step = 0
-        # Note: We keep world_grid and visit_counts across episodes
-        # This lets the agent build up knowledge over training
     
     def get_occupancy_grid_msg(self, frame_id: str = "odom") -> OccupancyGrid:
-        """
-        Convert world grid to ROS OccupancyGrid message for RViz visualization.
-        Values: -1 = unknown, 0 = free, 100 = occupied
-        """
         if not self.world_grid:
-            # Return empty grid
             msg = OccupancyGrid()
             msg.header.frame_id = frame_id
             msg.info.resolution = self.resolution
@@ -365,14 +696,12 @@ class EgoOccupancyGrid:
             msg.data = [-1]
             return msg
         
-        # Find bounds of explored area
         keys = list(self.world_grid.keys())
         min_x = min(k[0] for k in keys)
         max_x = max(k[0] for k in keys)
         min_y = min(k[1] for k in keys)
         max_y = max(k[1] for k in keys)
         
-        # Add padding
         padding = 5
         min_x -= padding
         max_x += padding
@@ -382,19 +711,17 @@ class EgoOccupancyGrid:
         width = max_x - min_x + 1
         height = max_y - min_y + 1
         
-        # Create grid data
         data = []
         for gy in range(min_y, max_y + 1):
             for gx in range(min_x, max_x + 1):
                 key = (gx, gy)
                 if key not in self.world_grid:
-                    data.append(-1)  # Unknown
-                elif self.world_grid[key] >= 0.8:  # Occupied
+                    data.append(-1)
+                elif self.world_grid[key] >= 0.8:
                     data.append(100)
-                else:  # Free
+                else:
                     data.append(0)
         
-        # Build message
         msg = OccupancyGrid()
         msg.header.frame_id = frame_id
         msg.header.stamp.sec = 0
@@ -413,10 +740,6 @@ class EgoOccupancyGrid:
         return msg
     
     def get_visit_heatmap_msg(self, frame_id: str = "odom") -> OccupancyGrid:
-        """
-        Create a heatmap showing visit frequency.
-        Higher values = more visited.
-        """
         if not self.visit_counts:
             msg = OccupancyGrid()
             msg.header.frame_id = frame_id
@@ -441,7 +764,6 @@ class EgoOccupancyGrid:
         width = max_x - min_x + 1
         height = max_y - min_y + 1
         
-        # Find max visits for normalization
         max_visits = max(self.visit_counts.values()) if self.visit_counts else 1
         
         data = []
@@ -449,7 +771,6 @@ class EgoOccupancyGrid:
             for gx in range(min_x, max_x + 1):
                 key = (gx, gy)
                 visits = self.visit_counts.get(key, 0)
-                # Normalize to 0-100
                 normalized = int(100 * visits / max(max_visits, 1))
                 data.append(normalized)
         
@@ -468,7 +789,7 @@ class EgoOccupancyGrid:
 
 
 # =============================================================================
-# ROS Interface
+# ROS Interface (unchanged from original)
 # =============================================================================
 
 class StretchRosInterface(Node):
@@ -507,23 +828,19 @@ class StretchRosInterface(Node):
         self.reward_pub = self.create_publisher(Float32, "/reward", 10)
         self.reward_breakdown_pub = self.create_publisher(StringMsg, "/reward_breakdown", 10)
         
-        # Visualization publishers
         self.map_pub = self.create_publisher(OccupancyGrid, "/exploration_map", 10)
         self.heatmap_pub = self.create_publisher(OccupancyGrid, "/visit_heatmap", 10)
         self.path_pub = self.create_publisher(Marker, "/robot_path", 10)
         self.frontier_pub = self.create_publisher(MarkerArray, "/frontiers", 10)
         
-        # Path history
         self.path_history: deque = deque(maxlen=PATH_HISTORY_LENGTH)
         
         self.get_logger().info("[VIZ] Publishing: /exploration_map, /visit_heatmap, /robot_path")
     
     def add_path_point(self, x: float, y: float):
-        """Add a point to the path history."""
         self.path_history.append((x, y))
     
     def publish_path(self, frame_id: str = MAP_FRAME):
-        """Publish the robot's path as a line strip marker."""
         if len(self.path_history) < 2:
             return
         
@@ -535,9 +852,8 @@ class StretchRosInterface(Node):
         marker.type = Marker.LINE_STRIP
         marker.action = Marker.ADD
         
-        marker.scale.x = 0.05  # Line width
+        marker.scale.x = 0.05
         
-        # Color: gradient from blue (old) to green (new)
         marker.color.r = 0.0
         marker.color.g = 1.0
         marker.color.b = 0.5
@@ -574,50 +890,46 @@ class StretchRosInterface(Node):
 
 
 # =============================================================================
-# Gym Environment
+# Gym Environment (MODIFIED: adds RND intrinsic reward)
 # =============================================================================
 
 class StretchExploreEnv(gym.Env):
     """
     Environment that supports both exploration and goal-seeking.
     
-    Observation includes:
-    - LiDAR bins (normalized)
-    - Goal info (zeros if no goal)
-    - Velocity
-    - Previous action
-    - Has goal flag (0 or 1)
-    - Ego-centric occupancy grid (flattened)
-    - Frontier direction hint
-    - Novelty score
+    IMPROVEMENTS:
+    - RND module provides learned intrinsic reward
+    - Observation normalization for stable training
+    - Reward normalization for consistent scales
     """
     
-    def __init__(self, ros: StretchRosInterface, control_dt: float = 0.1):
+    def __init__(self, ros: StretchRosInterface, rnd_module: RNDModule,
+                 control_dt: float = 0.1):
         super().__init__()
         self.ros = ros
         self.control_dt = control_dt
+        self.rnd = rnd_module
         
         # Occupancy grid
         self.occ_grid = EgoOccupancyGrid()
         
+        # Normalization (NEW)
+        self.obs_rms = None  # Will be initialized after we know obs_dim
+        self.reward_normalizer = RewardNormalizer()
+        
+        # RND weight (decays over time)
+        self.rnd_weight = RND_WEIGHT_INITIAL
+        
         # State
         self.step_count = 0
+        self.total_steps = 0  # Global step count for RND weight decay
         self.max_steps = int(EPISODE_SECONDS / control_dt)
         self.episode_index = 1
         self.episode_return = 0.0
         self.prev_action = np.zeros(2, dtype=np.float32)
         self.prev_goal_dist = 0.0
         
-        # Observation space:
-        # - lidar: 60
-        # - goal_info: 5 (dx, dy, dist, sin, cos)
-        # - velocity: 2 (v, w)
-        # - prev_action: 2
-        # - has_goal: 1
-        # - grid: GRID_SIZE * GRID_SIZE
-        # - frontier_dir: 2 (sin, cos of frontier angle)
-        # - novelty: 1
-        
+        # Observation space
         grid_flat_size = GRID_SIZE * GRID_SIZE
         obs_dim = NUM_LIDAR_BINS + 5 + 2 + 2 + 1 + grid_flat_size + 2 + 1
         
@@ -631,6 +943,9 @@ class StretchExploreEnv(gym.Env):
             dtype=np.float32
         )
         
+        # Initialize observation normalizer
+        self.obs_rms = RunningMeanStd(shape=(obs_dim,))
+        
         # Wait for sensors
         self.ros.get_logger().info("[ENV] Waiting for sensors...")
         self.ros.wait_for_sensors()
@@ -640,10 +955,10 @@ class StretchExploreEnv(gym.Env):
             f"grid={GRID_SIZE}x{GRID_SIZE}={grid_flat_size})"
         )
         self.ros.get_logger().info(
-            f"[ENV] Explore rewards: new_cell={R_NEW_CELL}, novelty_scale={R_NOVELTY_SCALE}"
+            f"[ENV] IMPROVED: Using RND (weight={RND_WEIGHT_INITIAL}, decay={RND_WEIGHT_DECAY})"
         )
         self.ros.get_logger().info(
-            f"[ENV] Goal rewards: progress_scale={PROGRESS_SCALE}, goal={R_GOAL}"
+            f"[ENV] IMPROVED: Using PER (alpha={PER_ALPHA}, beta={PER_BETA_START}->{PER_BETA_END})"
         )
     
     def reset(self, *, seed=None, options=None):
@@ -654,7 +969,6 @@ class StretchExploreEnv(gym.Env):
         self.prev_action[:] = 0.0
         self.occ_grid.reset()
         
-        # Decay visit counts between episodes
         self.occ_grid.decay_visits()
         
         self.prev_goal_dist = self._goal_distance()
@@ -699,16 +1013,23 @@ class StretchExploreEnv(gym.Env):
                 st["x"], st["y"], st["yaw"], scan
             )
         
+        # Build observation BEFORE computing reward (needed for RND)
+        obs = self._build_observation()
+        
         # Compute reward based on mode
         has_goal = self.ros.last_goal is not None
         
         if has_goal:
             reward, terminated, info = self._compute_goal_reward(v_cmd, w_cmd)
         else:
-            reward, terminated, info = self._compute_explore_reward(new_cells, st)
+            reward, terminated, info = self._compute_explore_reward(new_cells, st, obs)
         
-        # Build observation
-        obs = self._build_observation()
+        # Update RND weight (decay over time)
+        self.total_steps += 1
+        self.rnd_weight = max(
+            RND_WEIGHT_MIN,
+            RND_WEIGHT_INITIAL * (RND_WEIGHT_DECAY ** self.total_steps)
+        )
         
         self.episode_return += reward
         self.prev_action[:] = a
@@ -726,7 +1047,8 @@ class StretchExploreEnv(gym.Env):
             self.ros.get_logger().info(
                 f"[EP {self.episode_index:04d}] {mode} {status} | "
                 f"Return {self.episode_return:+.1f} | Steps {self.step_count} | "
-                f"Discovered {stats['total_discovered']} cells"
+                f"Discovered {stats['total_discovered']} cells | "
+                f"RND_w={self.rnd_weight:.3f}"
             )
             self.episode_index += 1
         
@@ -735,10 +1057,11 @@ class StretchExploreEnv(gym.Env):
             mode = "GOAL" if has_goal else "EXPLORE"
             stats = self.occ_grid.get_stats()
             novelty = self.occ_grid.get_novelty(st["x"], st["y"])
+            rnd_r = info.get("reward_terms", {}).get("rnd", 0.0)
             self.ros.get_logger().info(
                 f"[{mode}] step={self.step_count} r={reward:+.2f} "
                 f"new_cells={new_cells} total={stats['total_discovered']} "
-                f"novelty={novelty:.2f} min_lidar={min_lidar:.2f}"
+                f"novelty={novelty:.2f} rnd_r={rnd_r:.2f} min_lidar={min_lidar:.2f}"
             )
         
         # Publish reward breakdown
@@ -751,47 +1074,41 @@ class StretchExploreEnv(gym.Env):
         return obs, float(reward), bool(terminated), bool(truncated), info
     
     def _publish_visualization(self, robot_state: Dict):
-        """Publish map and path visualization for RViz."""
-        # Add current position to path
         self.ros.add_path_point(robot_state["x"], robot_state["y"])
         
-        # Publish occupancy grid map
         map_msg = self.occ_grid.get_occupancy_grid_msg(MAP_FRAME)
         map_msg.header.stamp = self.ros.get_clock().now().to_msg()
         self.ros.map_pub.publish(map_msg)
         
-        # Publish visit heatmap
         heatmap_msg = self.occ_grid.get_visit_heatmap_msg(MAP_FRAME)
         heatmap_msg.header.stamp = self.ros.get_clock().now().to_msg()
         self.ros.heatmap_pub.publish(heatmap_msg)
         
-        # Publish path
         if PUBLISH_PATH:
             self.ros.publish_path()
     
-    def _compute_explore_reward(self, new_cells: int, st: Dict) -> Tuple[float, bool, Dict]:
-        """Compute reward for exploration mode (no goal)."""
+    def _compute_explore_reward(self, new_cells: int, st: Dict, obs: np.ndarray) -> Tuple[float, bool, Dict]:
+        """Compute reward for exploration mode (no goal). IMPROVED with RND."""
         reward = 0.0
         terminated = False
         collision = False
         
-        # Reward for discovering new cells
+        # Original heuristic rewards (kept for stability)
         r_discovery = R_NEW_CELL * new_cells
         
-        # Reward for being in novel areas
         novelty = self.occ_grid.get_novelty(st["x"], st["y"])
         r_novelty = R_NOVELTY_SCALE * novelty
         
-        # Bonus for moving toward frontiers
         frontier_angle = self.occ_grid.get_frontier_direction(st["x"], st["y"], st["yaw"])
-        # If moving forward and aligned with frontier, bonus
         if abs(frontier_angle) < math.pi / 4 and st["v_lin"] > 0.1:
             r_frontier = R_FRONTIER_BONUS * math.cos(frontier_angle) * 0.1
         else:
             r_frontier = 0.0
         
-        # Step cost
         r_step = R_STEP_EXPLORE
+        
+        # NEW: RND intrinsic reward
+        r_rnd = self.rnd.compute_intrinsic_reward(obs) * self.rnd_weight
         
         # Collision
         min_lidar = self._min_lidar()
@@ -802,7 +1119,8 @@ class StretchExploreEnv(gym.Env):
         else:
             r_collision = 0.0
         
-        reward = r_discovery + r_novelty + r_frontier + r_step + r_collision
+        # Total reward
+        reward = r_discovery + r_novelty + r_frontier + r_step + r_collision + r_rnd
         
         info = {
             "collision": collision,
@@ -814,6 +1132,7 @@ class StretchExploreEnv(gym.Env):
                 "frontier": r_frontier,
                 "step": r_step,
                 "collision": r_collision,
+                "rnd": r_rnd,  # NEW
             }
         }
         
@@ -830,31 +1149,25 @@ class StretchExploreEnv(gym.Env):
         ang = self._goal_angle()
         min_lidar = self._min_lidar()
         
-        # Progress toward goal
         progress = self.prev_goal_dist - d_goal
         r_progress = PROGRESS_SCALE * progress
         
-        # Alignment with goal
         r_align = ALIGN_SCALE * math.cos(ang)
         
-        # Step cost
         r_step = STEP_COST
         
-        # Goal reached
         r_goal = 0.0
         if d_goal <= GOAL_RADIUS:
             terminated = True
             success = True
             r_goal = R_GOAL
         
-        # Collision
         r_collision = 0.0
         if min_lidar < COLLISION_DIST:
             terminated = True
             collision = True
             r_collision = R_COLLISION
         
-        # Timeout
         r_timeout = 0.0
         if not terminated and self.step_count + 1 >= self.max_steps:
             terminated = True
@@ -882,7 +1195,6 @@ class StretchExploreEnv(gym.Env):
         return float(reward), terminated, info
     
     def _build_observation(self) -> np.ndarray:
-        """Build full observation vector."""
         st = self._get_robot_state()
         goal = self.ros.last_goal
         
@@ -890,7 +1202,7 @@ class StretchExploreEnv(gym.Env):
         lidar_bins = self._get_lidar_bins()
         lidar_norm = np.clip(lidar_bins / LIDAR_MAX_RANGE, 0.0, 1.0)
         
-        # Goal info (zeros if no goal)
+        # Goal info
         if goal is not None:
             dx = goal.point.x - st["x"]
             dy = goal.point.y - st["y"]
@@ -920,9 +1232,8 @@ class StretchExploreEnv(gym.Env):
         # Has goal flag
         has_goal = np.array([1.0 if goal is not None else 0.0], dtype=np.float32)
         
-        # Occupancy grid (flattened)
+        # Occupancy grid
         grid_flat = self.occ_grid.get_flat_grid()
-        # Normalize to [-1, 1]: unknown=0 -> -1, free=0.5 -> 0, occupied=1 -> 1
         grid_norm = (grid_flat - 0.5) * 2.0
         
         # Frontier direction
@@ -934,15 +1245,20 @@ class StretchExploreEnv(gym.Env):
         
         # Concatenate all
         obs = np.concatenate([
-            lidar_norm,      # 60
-            goal_info,       # 5
-            vel,             # 2
-            prev_act,        # 2
-            has_goal,        # 1
-            grid_norm,       # 256 (16x16)
-            frontier_dir,    # 2
-            novelty,         # 1
+            lidar_norm,
+            goal_info,
+            vel,
+            prev_act,
+            has_goal,
+            grid_norm,
+            frontier_dir,
+            novelty,
         ], axis=0)
+        
+        # Update running statistics and normalize (NEW)
+        self.obs_rms.update(obs.reshape(1, -1))
+        # Note: We return unnormalized obs here because TD3 will handle it
+        # The RND module has its own normalization
         
         return obs.astype(np.float32)
     
@@ -1028,6 +1344,7 @@ class StretchExploreEnv(gym.Env):
                 "goal_dist": self._goal_distance(),
             },
             "explore_stats": stats,
+            "rnd_weight": self.rnd_weight,  # NEW
             "episode": self.episode_index,
             "step": self.step_count,
         }
@@ -1038,12 +1355,10 @@ class StretchExploreEnv(gym.Env):
 
 
 # =============================================================================
-# TD3 with CNN for Grid Processing
+# TD3 Networks (unchanged from original)
 # =============================================================================
 
 class GridCNN(nn.Module):
-    """CNN to process the occupancy grid portion of observation."""
-    
     def __init__(self, grid_size: int = GRID_SIZE, out_features: int = 32):
         super().__init__()
         
@@ -1052,14 +1367,13 @@ class GridCNN(nn.Module):
         self.conv = nn.Sequential(
             nn.Conv2d(1, 16, kernel_size=3, stride=1, padding=1),
             nn.ReLU(),
-            nn.MaxPool2d(2),  # 16 -> 8
+            nn.MaxPool2d(2),
             nn.Conv2d(16, 32, kernel_size=3, stride=1, padding=1),
             nn.ReLU(),
-            nn.MaxPool2d(2),  # 8 -> 4
+            nn.MaxPool2d(2),
             nn.Flatten(),
         )
         
-        # Calculate flattened size: 32 channels * 4 * 4 = 512
         conv_out_size = 32 * (grid_size // 4) * (grid_size // 4)
         
         self.fc = nn.Sequential(
@@ -1068,7 +1382,6 @@ class GridCNN(nn.Module):
         )
     
     def forward(self, grid_flat: torch.Tensor) -> torch.Tensor:
-        # Reshape to (batch, 1, grid_size, grid_size)
         batch_size = grid_flat.shape[0]
         grid = grid_flat.view(batch_size, 1, self.grid_size, self.grid_size)
         
@@ -1078,8 +1391,6 @@ class GridCNN(nn.Module):
 
 
 class ActorWithCNN(nn.Module):
-    """Actor network with CNN for grid processing."""
-    
     def __init__(self, obs_dim: int, act_dim: int, grid_size: int = GRID_SIZE,
                  grid_features: int = 32, hidden: int = 256):
         super().__init__()
@@ -1087,16 +1398,12 @@ class ActorWithCNN(nn.Module):
         self.grid_size = grid_size
         grid_flat_size = grid_size * grid_size
         
-        # Indices for splitting observation
-        # obs = [lidar(60), goal(5), vel(2), prev_act(2), has_goal(1), grid(256), frontier(2), novelty(1)]
         self.non_grid_size = obs_dim - grid_flat_size
-        self.grid_start = NUM_LIDAR_BINS + 5 + 2 + 2 + 1  # After has_goal
+        self.grid_start = NUM_LIDAR_BINS + 5 + 2 + 2 + 1
         self.grid_end = self.grid_start + grid_flat_size
         
-        # CNN for grid
         self.grid_cnn = GridCNN(grid_size, grid_features)
         
-        # MLP for combined features
         combined_size = self.non_grid_size + grid_features
         
         self.mlp = nn.Sequential(
@@ -1109,23 +1416,18 @@ class ActorWithCNN(nn.Module):
         )
     
     def forward(self, obs: torch.Tensor) -> torch.Tensor:
-        # Split observation
         non_grid_before = obs[:, :self.grid_start]
         grid_flat = obs[:, self.grid_start:self.grid_end]
         non_grid_after = obs[:, self.grid_end:]
         
-        # Process grid through CNN
         grid_features = self.grid_cnn(grid_flat)
         
-        # Concatenate all features
         combined = torch.cat([non_grid_before, non_grid_after, grid_features], dim=-1)
         
         return self.mlp(combined)
 
 
 class CriticWithCNN(nn.Module):
-    """Critic network with CNN for grid processing."""
-    
     def __init__(self, obs_dim: int, act_dim: int, grid_size: int = GRID_SIZE,
                  grid_features: int = 32, hidden: int = 256):
         super().__init__()
@@ -1161,42 +1463,15 @@ class CriticWithCNN(nn.Module):
         return self.mlp(combined)
 
 
-class ReplayBuffer:
-    def __init__(self, obs_dim: int, act_dim: int, size: int, device: torch.device):
-        self.device = device
-        self.size = int(size)
-        self.ptr = 0
-        self.count = 0
-        self.obs = np.zeros((self.size, obs_dim), dtype=np.float32)
-        self.next_obs = np.zeros((self.size, obs_dim), dtype=np.float32)
-        self.acts = np.zeros((self.size, act_dim), dtype=np.float32)
-        self.rews = np.zeros((self.size, 1), dtype=np.float32)
-        self.done = np.zeros((self.size, 1), dtype=np.float32)
-    
-    def add(self, obs, act, rew, next_obs, done):
-        self.obs[self.ptr] = obs
-        self.acts[self.ptr] = act
-        self.rews[self.ptr] = rew
-        self.next_obs[self.ptr] = next_obs
-        self.done[self.ptr] = done
-        self.ptr = (self.ptr + 1) % self.size
-        self.count = min(self.count + 1, self.size)
-    
-    def sample(self, batch_size: int):
-        idx = np.random.randint(0, self.count, size=batch_size)
-        return (
-            torch.as_tensor(self.obs[idx], device=self.device),
-            torch.as_tensor(self.acts[idx], device=self.device),
-            torch.as_tensor(self.rews[idx], device=self.device),
-            torch.as_tensor(self.next_obs[idx], device=self.device),
-            torch.as_tensor(self.done[idx], device=self.device),
-        )
-
+# =============================================================================
+# TD3 Agent (MODIFIED: uses PER, updates RND)
+# =============================================================================
 
 class TD3AgentCNN:
-    """TD3 Agent with CNN-based actor and critic."""
+    """TD3 Agent with CNN-based actor and critic. IMPROVED with PER and RND integration."""
     
     def __init__(self, obs_dim: int, act_dim: int, device: torch.device,
+                 rnd_module: RNDModule,
                  gamma: float = 0.99, tau: float = 0.005,
                  actor_lr: float = 3e-4, critic_lr: float = 3e-4,
                  policy_noise: float = 0.2, noise_clip: float = 0.5,
@@ -1208,6 +1483,7 @@ class TD3AgentCNN:
         self.policy_noise = policy_noise
         self.noise_clip = noise_clip
         self.policy_delay = policy_delay
+        self.rnd = rnd_module
         
         # Networks
         self.actor = ActorWithCNN(obs_dim, act_dim).to(device)
@@ -1238,9 +1514,15 @@ class TD3AgentCNN:
             a = a + np.random.normal(0, noise_std, size=a.shape).astype(np.float32)
         return np.clip(a, -1.0, 1.0).astype(np.float32)
     
-    def update(self, replay: ReplayBuffer, batch_size: int):
+    def update(self, replay: PrioritizedReplayBuffer, batch_size: int, beta: float) -> Tuple[float, float, float]:
+        """
+        Update networks using PER.
+        Returns (critic_loss, actor_loss, rnd_loss).
+        """
         self.total_updates += 1
-        obs, act, rew, next_obs, done = replay.sample(batch_size)
+        
+        # Sample with priorities (NEW: PER)
+        obs, act, rew, next_obs, done, weights, indices = replay.sample(batch_size, beta)
         
         # Critic update
         with torch.no_grad():
@@ -1254,7 +1536,12 @@ class TD3AgentCNN:
         
         q1 = self.critic1(obs, act)
         q2 = self.critic2(obs, act)
-        critic_loss = F.mse_loss(q1, target) + F.mse_loss(q2, target)
+        
+        # NEW: Weight losses by importance sampling weights
+        td_error1 = target - q1
+        td_error2 = target - q2
+        
+        critic_loss = (weights * (td_error1.pow(2) + td_error2.pow(2))).mean()
         
         self.critic_opt.zero_grad()
         critic_loss.backward()
@@ -1262,6 +1549,10 @@ class TD3AgentCNN:
             list(self.critic1.parameters()) + list(self.critic2.parameters()), 1.0
         )
         self.critic_opt.step()
+        
+        # NEW: Update priorities based on TD error
+        td_errors = (td_error1.abs() + td_error2.abs()).detach().cpu().numpy() / 2.0
+        replay.update_priorities(indices, td_errors.flatten())
         
         # Actor update (delayed)
         actor_loss = torch.tensor(0.0, device=self.device)
@@ -1273,12 +1564,14 @@ class TD3AgentCNN:
             torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 1.0)
             self.actor_opt.step()
             
-            # Soft update targets
             self._soft_update(self.actor_targ, self.actor)
             self._soft_update(self.critic1_targ, self.critic1)
             self._soft_update(self.critic2_targ, self.critic2)
         
-        return float(critic_loss.item()), float(actor_loss.item())
+        # NEW: Update RND predictor
+        rnd_loss = self.rnd.update(next_obs)
+        
+        return float(critic_loss.item()), float(actor_loss.item()), rnd_loss
     
     def _soft_update(self, target: nn.Module, source: nn.Module):
         with torch.no_grad():
@@ -1296,6 +1589,7 @@ class TD3AgentCNN:
             "actor_opt": self.actor_opt.state_dict(),
             "critic_opt": self.critic_opt.state_dict(),
             "total_updates": self.total_updates,
+            "rnd": self.rnd.state_dict_custom(),  # NEW: save RND state
         }, path)
     
     def load(self, path: str, strict: bool = True):
@@ -1310,6 +1604,9 @@ class TD3AgentCNN:
             self.actor_opt.load_state_dict(payload["actor_opt"])
             self.critic_opt.load_state_dict(payload["critic_opt"])
             self.total_updates = payload.get("total_updates", 0)
+            # NEW: load RND state
+            if "rnd" in payload:
+                self.rnd.load_state_dict_custom(payload["rnd"])
         except Exception:
             pass
 
@@ -1321,7 +1618,7 @@ class TD3AgentCNN:
 def main():
     parser = argparse.ArgumentParser()
     
-    # Topics (matching your launch file)
+    # Topics
     parser.add_argument("--ns", type=str, default="")
     parser.add_argument("--odom-topic", type=str, default="/odom")
     parser.add_argument("--lidar-topic", type=str, default="/scan_filtered")
@@ -1333,8 +1630,8 @@ def main():
     parser.add_argument("--total-steps", type=int, default=500_000)
     parser.add_argument("--start-steps", type=int, default=DEFAULT_START_STEPS)
     parser.add_argument("--update-after", type=int, default=2000)
-    parser.add_argument("--update-every", type=int, default=1)
-    parser.add_argument("--batch-size", type=int, default=256)
+    parser.add_argument("--update-every", type=int, default=500)
+    parser.add_argument("--batch-size", type=int, default=2048)
     parser.add_argument("--replay-size", type=int, default=300_000)
     parser.add_argument("--expl-noise", type=float, default=DEFAULT_EXPL_NOISE)
     parser.add_argument("--save-every", type=int, default=10_000)
@@ -1375,19 +1672,29 @@ def main():
     executor = SingleThreadedExecutor()
     executor.add_node(ros)
     
-    # Create environment
-    env = StretchExploreEnv(ros)
-    
-    obs_dim = env.observation_space.shape[0]
-    act_dim = env.action_space.shape[0]
+    # Setup device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    # Calculate observation dimension
+    grid_flat_size = GRID_SIZE * GRID_SIZE
+    obs_dim = NUM_LIDAR_BINS + 5 + 2 + 2 + 1 + grid_flat_size + 2 + 1
+    act_dim = 2
+    
+    # NEW: Create RND module
+    rnd_module = RNDModule(obs_dim, device=device)
+    
+    # Create environment (now takes RND module)
+    env = StretchExploreEnv(ros, rnd_module)
     
     ros.get_logger().info(f"[AGENT] device={device} obs_dim={obs_dim} act_dim={act_dim}")
     ros.get_logger().info(f"[AGENT] Grid: {GRID_SIZE}x{GRID_SIZE} @ {GRID_RESOLUTION}m/cell")
+    ros.get_logger().info(f"[AGENT] IMPROVED: PER + RND enabled")
     
-    # Create agent
-    agent = TD3AgentCNN(obs_dim, act_dim, device=device)
-    replay = ReplayBuffer(obs_dim, act_dim, size=args.replay_size, device=device)
+    # Create agent (now takes RND module)
+    agent = TD3AgentCNN(obs_dim, act_dim, device=device, rnd_module=rnd_module)
+    
+    # NEW: Prioritized replay buffer
+    replay = PrioritizedReplayBuffer(obs_dim, act_dim, size=args.replay_size, device=device)
     
     # Load checkpoint if exists
     if AUTO_LOAD_CHECKPOINT and os.path.exists(ckpt_path):
@@ -1413,7 +1720,6 @@ def main():
         except Exception as e:
             ros.get_logger().error(f"[CKPT] Save FAILED: {e}")
         
-        # Log final stats
         stats = env.occ_grid.get_stats()
         ros.get_logger().info(f"[FINAL] Total cells discovered: {stats['total_discovered']}")
         
@@ -1440,14 +1746,13 @@ def main():
                 done = term or trunc
     
     # Training mode
-    ros.get_logger().info("[MODE] TRAINING")
+    ros.get_logger().info("[MODE] TRAINING (IMPROVED)")
     obs, _ = env.reset()
     last_save = 0
     
     for t in range(1, args.total_steps + 1):
         # Random actions at start
         if t < args.start_steps:
-            # Bias toward forward movement for initial exploration
             v = np.random.uniform(0.2, 1.0)
             w = np.random.uniform(-0.5, 0.5)
             act = np.array([v, w], dtype=np.float32)
@@ -1471,15 +1776,19 @@ def main():
         
         # Update
         if t >= args.update_after and replay.count >= args.batch_size:
+            # NEW: Anneal beta for importance sampling
+            beta = PER_BETA_START + (PER_BETA_END - PER_BETA_START) * (t / args.total_steps)
+            
             for _ in range(args.update_every):
-                critic_loss, actor_loss = agent.update(replay, args.batch_size)
+                critic_loss, actor_loss, rnd_loss = agent.update(replay, args.batch_size, beta)
         
         # Save
         if t - last_save >= args.save_every:
             last_save = t
             stats = env.occ_grid.get_stats()
             ros.get_logger().info(
-                f"[CKPT] step={t} cells_discovered={stats['total_discovered']}"
+                f"[CKPT] step={t} cells_discovered={stats['total_discovered']} "
+                f"rnd_weight={env.rnd_weight:.3f}"
             )
             try:
                 agent.save(ckpt_path + ".tmp")

@@ -96,7 +96,7 @@ async def lifespan(app: FastAPI):
         dummy = Image.new("RGB", (256, 256), (0, 0, 0))
         with torch.inference_mode():
             st = processor.set_image(dummy)
-            _ = processor.set_text_prompt(state=st, prompt="object")
+            _ = processor.set_text_prompt(state=st, prompt="hand")
     except Exception:
         pass
 

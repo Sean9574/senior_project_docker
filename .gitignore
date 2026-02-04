@@ -1,26 +1,34 @@
-cat > .gitignore << 'EOF'
-# ROS2 colcon outputs
+# ROS / colcon artifacts
 build/
 install/
 log/
 
 # Python
 __pycache__/
-*.pyc
+*.py[cod]
+*.pyd
+*.so
 .venv/
 venv/
 
-# VSCode / IDE
+# Training / runtime outputs
+models/
+checkpoints/
+multi_robot_checkpoints/
+runs/
+logs/
+MUJOCO_LOG.TXT
+nn_exports/
+
+# IDE / editor
 .vscode/
-**/.vscode/
-**/browse.vc.db
 .idea/
 
 # OS junk
 .DS_Store
 Thumbs.db
 
-# Huge artifacts / archives (do NOT commit)
+# Large archives
 *.tar
 *.tar.gz
 *.tgz
@@ -28,18 +36,7 @@ Thumbs.db
 *.7z
 *.iso
 
-# Common big ML artifacts (use LFS if you truly need these)
-*.pt
-*.pth
-*.onnx
-*.engine
-*.ckpt
-
-# Your currently-not-needed folders (customize as you like)
-**/models/
-**/checkpoints/
-**/logs/
-
-# Never commit nested git directories
-**/.git/
-EOF
+# Optional: keep local secrets out if you ever add them
+.env
+*.key
+*.pem

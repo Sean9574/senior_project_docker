@@ -309,6 +309,7 @@ def generate_launch_description():
         ],
         output="screen",
         condition=IfCondition(LaunchConfiguration("run_rl")),
+        
     )
 
     # Delay slightly so sim is alive first
