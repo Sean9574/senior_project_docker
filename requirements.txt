@@ -33,7 +33,7 @@ pyttsx3==2.99
 pyusb==1.3.1
 quaternion==3.5.2.post4
 renamed_opencv_python_inference_engine==2022.1.5
-Requests==2.32.5
+requests==2.32.5
 robosuite_models==1.0.0
 rspy==0.0.3
 simpleaudio==1.0.4

@@ -254,10 +254,11 @@ RUN pip3 install --no-cache-dir \
     uvicorn \
     pillow \
     pydantic \
-    numpy \
+    numpy==1.23.5 \
     decord \
     pycocotools \
-    urchin
+    urchin \
+    pyquaternion 
 
 
 RUN pip3 install --no-deps \
