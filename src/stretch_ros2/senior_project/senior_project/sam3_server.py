@@ -33,7 +33,6 @@ from pydantic import BaseModel
 from sam3.model.sam3_image_processor import Sam3Processor
 from sam3.model_builder import build_sam3_image_model
 import os
-from huggingface_hub import HfFolder
 # ============== GLOBAL STATE ==============
 model = None
 processor = None
