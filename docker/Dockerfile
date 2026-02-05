@@ -134,7 +134,16 @@ RUN pip3 install --upgrade pip wheel
 RUN pip3 install "numpy<2"
 
 # Step 3: Install PyTorch with CUDA
-RUN pip3 install --ignore-installed --no-deps torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+# ---- Fix distutils/apt SymPy conflict (required for pip torch install) ----
+RUN apt-get update && apt-get remove -y --purge python3-sympy \
+ && rm -rf /var/lib/apt/lists/*
+
+# ---- PyTorch (clean install, CUDA 12.1 wheels) ----
+RUN pip3 uninstall -y torch torchvision torchaudio "nvidia-*" || true \
+ && pip3 install --no-cache-dir --index-url https://download.pytorch.org/whl/cu121 \
+    torch torchvision torchaudio
+
+
 RUN pip3 install filelock fsspec jinja2 networkx sympy typing-extensions
 
 # Step 4: Core ML/RL packages (--ignore-installed for distutils conflicts)
@@ -236,8 +245,19 @@ USER root
 
 # SAM3 server dependencies
 RUN pip3 install --ignore-installed uvicorn fastapi pydantic ftfy huggingface_hub iopath regex timm
-RUN pip3 install git+https://github.com/facebookresearch/sam3.git
+RUN pip3 install --no-deps git+https://github.com/facebookresearch/sam3.git
 
+# SAM3 runtime deps (since we install sam3 with --no-deps to avoid torch/CUDA conflicts)
+RUN pip3 install --no-cache-dir \
+    einops \
+    fastapi \
+    uvicorn \
+    pillow \
+    pydantic \
+    numpy \
+    decord \
+    pycocotools \
+    urchin
 
 
 RUN pip3 install --no-deps \

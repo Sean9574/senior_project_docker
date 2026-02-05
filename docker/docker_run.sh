@@ -29,6 +29,7 @@ docker rm -f $CONTAINER_NAME 2>/dev/null
 echo "Starting container..."
 docker run -it --rm \
     --gpus all \
+    --env-file "$HOME/.hf.env" \
     --name $CONTAINER_NAME \
     -p 8100:8100 \
     -p 8101:8101 \

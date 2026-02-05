@@ -32,12 +32,21 @@ from PIL import Image
 from pydantic import BaseModel
 from sam3.model.sam3_image_processor import Sam3Processor
 from sam3.model_builder import build_sam3_image_model
-
+import os
+from huggingface_hub import HfFolder
 # ============== GLOBAL STATE ==============
 model = None
 processor = None
 CURRENT_PROMPT = "object"
 # ==========================================
+
+# Ensure HF auth token is available to huggingface_hub
+tok = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_HUB_TOKEN")
+try:
+    model = build_sam3_image_model(token=tok) if tok else build_sam3_image_model()
+except TypeError:
+    # If this sam3 version doesn't accept token=, fall back to env var auth
+    model = build_sam3_image_model()
 
 
 class SegmentRequest(BaseModel):
