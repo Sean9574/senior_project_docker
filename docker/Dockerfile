@@ -205,9 +205,13 @@ RUN mkdir -p $AMENT_WS/src && chown -R $USERNAME:$USERNAME /home/$USERNAME
 USER $USERNAME
 WORKDIR $AMENT_WS/src
 
-RUN git clone https://github.com/hello-robot/stretch_ros2.git
 RUN git clone https://github.com/hello-robot/stretch_mujoco.git
 RUN git clone https://github.com/hello-robot/stretch_urdf.git
+
+# Clone your repo and move src contents
+RUN git clone https://github.com/Sean9574/senior_project_docker.git /tmp/senior_project && \
+    cp -r /tmp/senior_project/src/* . && \
+    rm -rf /tmp/senior_project
 
 # =============================================================================
 # Install stretch_mujoco Python package
@@ -247,6 +251,28 @@ RUN pip3 install pyrealsense2 || true
 # Re-pin setuptools after any installs
 RUN pip3 install setuptools==58.2.0
 
+RUN apt-get update && apt-get install -y \
+    libgstreamer1.0-dev \
+    libgstreamer-plugins-base1.0-dev \
+    gstreamer1.0-plugins-base \
+    gstreamer1.0-plugins-good \
+    libasound2-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+    # --- Intel RealSense SDK (librealsense) userspace (no DKMS inside Docker) ---
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl gnupg2 lsb-release ca-certificates \
+ && mkdir -p /etc/apt/keyrings \
+ && curl -sSfL https://librealsense.intel.com/Debian/librealsense.pgp \
+    | gpg --dearmor -o /etc/apt/keyrings/librealsense.gpg \
+ && echo "deb [signed-by=/etc/apt/keyrings/librealsense.gpg] https://librealsense.intel.com/Debian/apt-repo $(lsb_release -cs) main" \
+    > /etc/apt/sources.list.d/librealsense.list \
+ && apt-get update && apt-get install -y --no-install-recommends \
+    librealsense2-dev \
+    librealsense2-utils \
+ && rm -rf /var/lib/apt/lists/*
+
+
 RUN chown -R $USERNAME:$USERNAME $AMENT_WS
 RUN chown -R $USERNAME:$USERNAME /home/$USERNAME
 
@@ -272,7 +298,8 @@ RUN find $AMENT_WS/src -name "setup.py" | xargs -I {} sh -c \
 # Build workspace
 RUN /bin/bash -c "source /opt/ros/humble/setup.bash && \
     export RMW_IMPLEMENTATION=rmw_fastrtps_cpp && \
-    colcon build --symlink-install --cmake-args -DCMAKE_BUILD_TYPE=Release"
+    colcon build --symlink-install --cmake-args -DCMAKE_BUILD_TYPE=Release \
+    --packages-skip "
 
 # Copy URDF file to expected location
 RUN mkdir -p $AMENT_WS/install/stretch_description/share/stretch_description/urdf && \
