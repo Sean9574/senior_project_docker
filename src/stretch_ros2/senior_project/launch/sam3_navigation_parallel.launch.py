@@ -115,22 +115,22 @@ def _start_sam3_server(context):
     """Start the shared SAM3 server in its dedicated domain."""
     import os
     home = os.path.expanduser("~")
-    
+
     sam3_domain = LaunchConfiguration("sam3_domain").perform(context)
-    
+
     return [
         LogInfo(msg=f"[SAM3] Starting shared SAM3 server in domain {sam3_domain}"),
         ExecuteProcess(
-            cmd=['bash', '-c',
-                f'source {home}/miniconda3/etc/profile.d/conda.sh && '
-                f'conda activate sam3 && '
-                f'python {home}/ament_ws/src/stretch_ros2/senior_project/senior_project/sam3_server.py'
+            cmd=[
+                "bash", "-c",
+                f"python3 {home}/ament_ws/src/stretch_ros2/senior_project/senior_project/sam3_server.py"
             ],
-            output='screen',
-            name='sam3_server_shared',
+            output="screen",
+            name="sam3_server_shared",
             additional_env={"ROS_DOMAIN_ID": str(sam3_domain)},
         ),
     ]
+
 
 def _start_parallel_runner_delayed(context):
     """Start the parallel runner after SAM3 server has initialized."""
