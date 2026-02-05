@@ -162,7 +162,7 @@ RUN pip3 install --ignore-installed \
 
 # Numba with compatible coverage
 RUN pip3 install "coverage<7"
-RUN pip3 install numba
+RUN pip3 install numba==0.59.1
 
 # Step 5: MuJoCo
 RUN pip3 install mujoco
