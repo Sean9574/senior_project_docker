@@ -170,14 +170,16 @@ def _configure_launch(context):
         # - No conda
         # - No exporting tokens here (we want to inherit env from docker --env-file)
         # - Pass the port explicitly
+        
         sam3_server = ExecuteProcess(
-            cmd=[
-                "bash", "-lc",
-                f"python3 /home/stretch/ament_ws/src/stretch_ros2/senior_project/senior_project/sam3_server.py --port {sam3_port}"
-            ],
-            output="screen",
-            name="sam3_server",
-        )
+        cmd=['bash', '-lc',
+            # make sure token env vars exist (your --env-file already does this)
+            'python3 -m senior_project.sam3_server --port ' + sam3_port
+        ],
+        output='screen',
+        name='sam3_server',
+    )
+
         actions.append(sam3_server)
 
         # Set SAM3 prompt after server starts
