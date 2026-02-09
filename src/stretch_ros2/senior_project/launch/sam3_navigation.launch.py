@@ -132,7 +132,7 @@ def _configure_launch(context):
     pkg_dir = get_package_share_directory("senior_project")
 
     # Runtime values
-    sim_id = LaunchConfiguration("sim_id").perform(context)
+    sim_id = int(LaunchConfiguration("sim_id").perform(context))
     start_sam3 = LaunchConfiguration("start_sam3_server").perform(context).lower() in ("true", "1", "yes")
     sam3_host = LaunchConfiguration("sam3_server_host").perform(context)
     sam3_port = LaunchConfiguration("sam3_server_port").perform(context)
@@ -161,35 +161,34 @@ def _configure_launch(context):
     actions.append(LogInfo(msg="    bbox  - bounding box size heuristic"))
     actions.append(LogInfo(msg=""))
 
-    # ===================== SAM3 SERVER (NO CONDA) =====================
+    # ===================== SAM3 SERVER =====================
 
     if start_sam3:
         actions.append(LogInfo(msg=f"  [0s]  SAM3 server starting on port {sam3_port}"))
 
-        # IMPORTANT:
-        # - No conda
-        # - No exporting tokens here (we want to inherit env from docker --env-file)
-        # - Pass the port explicitly
-        
+        # FIXED: Proper ROS environment sourcing and correct workspace path
         sam3_server = ExecuteProcess(
-        cmd=['bash', '-lc',
-            # make sure token env vars exist (your --env-file already does this)
-            'python3 -m senior_project.sam3_server --port ' + sam3_port
-        ],
-        output='screen',
-        name='sam3_server',
-    )
+            cmd=[
+                'bash', '-c',
+                f'source /opt/ros/humble/setup.bash && '
+                f'source /ws/install/setup.bash && '
+                f'python3 -m senior_project.sam3_server --port {sam3_port}'
+            ],
+            output='screen',
+            name='sam3_server',
+            shell=True,  # ADDED: Ensure shell interprets the command
+        )
 
         actions.append(sam3_server)
 
         # Set SAM3 prompt after server starts
+        target_val = LaunchConfiguration("target").perform(context)
         set_prompt = ExecuteProcess(
             cmd=[
-                "bash", "-lc",
-                f"sleep 15 && curl -sS -X POST \"{sam3_url}/prompt/$(echo \\\"$TARGET\\\" | sed 's/ /%20/g')\""
+                "bash", "-c",
+                f"sleep 15 && curl -sS -X POST '{sam3_url}/prompt/{target_val}'"
             ],
             output="screen",
-            additional_env={"TARGET": LaunchConfiguration("target")},
         )
         actions.append(LogInfo(msg="  [15s] SAM3 prompt being set"))
         actions.append(set_prompt)
@@ -198,30 +197,35 @@ def _configure_launch(context):
         actions.append(LogInfo(msg=f"  [---] Using shared SAM3 server at {sam3_url}"))
 
         # Still set prompt on shared server
+        target_val = LaunchConfiguration("target").perform(context)
         set_prompt = ExecuteProcess(
             cmd=[
-                "bash", "-lc",
-                f"sleep 5 && curl -sS -X POST \"{sam3_url}/prompt/$(echo \\\"$TARGET\\\" | sed 's/ /%20/g')\""
+                "bash", "-c",
+                f"sleep 5 && curl -sS -X POST '{sam3_url}/prompt/{target_val}'"
             ],
             output="screen",
-            additional_env={"TARGET": LaunchConfiguration("target")},
         )
         actions.append(set_prompt)
 
-    # ===================== MONO DEPTH SERVER (NO CONDA) =====================
+    # ===================== MONO DEPTH SERVER =====================
 
     if use_mono and start_mono:
         actions.append(LogInfo(msg=f"  [0s]  Mono depth server starting on port {mono_port}"))
 
+        mono_model = LaunchConfiguration("mono_depth_model").perform(context)
+        
+        # FIXED: Proper ROS environment sourcing and correct workspace path
         mono_depth_server = ExecuteProcess(
             cmd=[
-                "bash", "-lc",
-                f"python3 /home/stretch/ament_ws/src/stretch_ros2/senior_project/senior_project/mono_depth_server.py "
-                f"--model \"$MONO_MODEL\" --port {mono_port}"
+                "bash", "-c",
+                f"source /opt/ros/humble/setup.bash && "
+                f"source /ws/install/setup.bash && "
+                f"python3 /ws/src/senior_project/senior_project/mono_depth_server.py "
+                f"--model {mono_model} --port {mono_port}"
             ],
             output="screen",
             name="mono_depth_server",
-            additional_env={"MONO_MODEL": LaunchConfiguration("mono_depth_model")},
+            shell=True,  # ADDED: Ensure shell interprets the command
         )
         actions.append(mono_depth_server)
 

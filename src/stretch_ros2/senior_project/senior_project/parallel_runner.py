@@ -4,7 +4,7 @@ Parallel Simulation Runner for SAM3 Navigation
 
 Spawns multiple simulations in parallel, each with its own:
   - ROS_DOMAIN_ID (sim_base_domain + sim_id)
-  - Server ports
+  - Server ports (with offsets)
   - Checkpoint directory
 
 All simulations connect to a SHARED SAM3 server running in sam3_domain.
@@ -97,6 +97,11 @@ class ParallelRunner:
         """Build the ros2 launch command for a simulation."""
         ckpt_dir = os.path.join(self.base_ckpt_dir, f"sim_{sim_id}")
 
+        # CRITICAL FIX: Calculate unique port for each sim (in case they need local servers)
+        # Base port 8100, each sim gets 100 port offset
+        sam3_port = 8100 + (sim_id * 100)
+        mono_port = 8101 + (sim_id * 100)
+
         cmd = [
             "ros2", "launch", self.package, self.launch_file,
             f"sim_id:={sim_id}",
@@ -105,20 +110,24 @@ class ParallelRunner:
             f"rollout_steps:={self.rollout_steps}",
             f"ckpt_dir:={ckpt_dir}",
             f"headless:={str(self.headless).lower()}",
-            # Pass SAM3 domain so the sim knows where to connect
+            # CRITICAL FIX: Tell child simulations NOT to start their own SAM3 server
+            "start_sam3_server:=false",
+            # Point to the shared SAM3 server (domain agnostic, uses HTTP)
+            f"sam3_server_port:=8100",  # Shared server is on port 8100
+            f"sam3_server_host:=localhost",
+            # Also disable local mono depth server (unless explicitly requested)
+            "start_mono_depth_server:=false",
+            # Pass the SAM3 domain for reference (though HTTP is domain-agnostic)
             f"sam3_domain:={self.sam3_domain}",
         ]
-        
-        
-        
-        
-        
-        
 
-        # Add any extra arguments (but never allow extra to override headless or sam3_domain)
+        # Add any extra arguments (but never allow extra to override critical settings)
+        forbidden_keys = {"headless", "sam3_domain", "start_sam3_server", 
+                          "sam3_server_port", "start_mono_depth_server", "sim_id"}
         for key, value in self.extra_args.items():
             key_lower = key.strip().lower()
-            if key_lower in ("headless", "sam3_domain"):
+            if key_lower in forbidden_keys:
+                print(f"[Runner] WARNING: Ignoring extra arg '{key}' (reserved)")
                 continue
             cmd.append(f"{key}:={value}")
 
@@ -144,7 +153,7 @@ class ParallelRunner:
         print(
             f"[Runner] Starting sim {sim_id} "
             f"(DOMAIN_ID={sim_domain}, SAM3_DOMAIN={self.sam3_domain}, "
-            f"ports={8100 + sim_id*10}+, headless={self.headless})"
+            f"SAM3_PORT=8100 [shared], headless={self.headless})"
         )
 
         proc = subprocess.Popen(
@@ -173,8 +182,9 @@ class ParallelRunner:
         print(f"  Headless: {self.headless}")
         print(f"  Checkpoint Dir: {self.base_ckpt_dir}")
         print(f"  Merge on Exit: {self.merge_on_exit}")
-        print(f"  SAM3 Server Domain: {self.sam3_domain}")
+        print(f"  SAM3 Server Domain: {self.sam3_domain} (shared, port 8100)")
         print(f"  Sim Domains: {self.sim_base_domain} - {self.sim_base_domain + self.num_sims - 1}")
+        print(f"  NOTE: All sims use SHARED SAM3 server (not starting their own)")
         print(f"{'='*60}\n")
 
         for sim_id in range(self.num_sims):
@@ -205,6 +215,18 @@ class ParallelRunner:
             except Exception as e:
                 print(f"[Runner] Could not stop sim {i}: {e}")
 
+        # Wait a bit for graceful shutdown
+        time.sleep(3)
+
+        # Force kill any remaining
+        for i, proc in enumerate(self.processes):
+            try:
+                if proc.poll() is None:  # Still running
+                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                    print(f"[Runner] Force killed sim {i}")
+            except Exception:
+                pass
+
         # Close log files
         for proc in self.processes:
             try:
@@ -227,10 +249,14 @@ class ParallelRunner:
         merge_script = os.path.join(os.path.dirname(__file__), "merge_checkpoints.py")
         output_path = os.path.join(self.base_ckpt_dir, "merged.pt")
 
+        if not os.path.exists(merge_script):
+            print(f"[Runner] Warning: Merge script not found at {merge_script}")
+            return
+
         try:
             result = subprocess.run(
                 [
-                    "python", merge_script,
+                    "python3", merge_script,
                     "--input_dir", self.base_ckpt_dir,
                     "--output", output_path,
                 ],
@@ -285,7 +311,7 @@ class ParallelRunner:
         print(f"  Total Time: {elapsed/60:.1f} minutes")
         print(f"  Simulations: {self.num_sims}")
         print(f"  Headless: {self.headless}")
-        print(f"  SAM3 Server Domain: {self.sam3_domain}")
+        print(f"  SAM3 Server Domain: {self.sam3_domain} (shared)")
         print(f"  Sim Domains: {self.sim_base_domain} - {self.sim_base_domain + self.num_sims - 1}")
         print(f"  Checkpoints: {self.base_ckpt_dir}/sim_*/")
         if self.merge_on_exit:
@@ -317,7 +343,7 @@ def main():
     )
     parser.add_argument(
         "--ckpt_dir", type=str,
-        default="~/ament_ws/src/stretch_ros2/senior_project/parallel_training",
+        default="/ws/src/senior_project/parallel_training",  # FIXED: Updated path for Docker
         help="Base checkpoint directory"
     )
     parser.add_argument(

@@ -78,7 +78,7 @@ def generate_launch_description():
     ))
     ld.add_action(DeclareLaunchArgument(
         "ckpt_dir",
-        default_value="~/ament_ws/src/stretch_ros2/senior_project/parallel_training",
+        default_value="/ws/src/senior_project/parallel_training",  # FIXED: Updated path for Docker
         description="Base checkpoint directory"
     ))
     ld.add_action(DeclareLaunchArgument(
@@ -113,21 +113,22 @@ def generate_launch_description():
 
 def _start_sam3_server(context):
     """Start the shared SAM3 server in its dedicated domain."""
-    import os
-    home = os.path.expanduser("~")
-
     sam3_domain = LaunchConfiguration("sam3_domain").perform(context)
 
+    # FIXED: Proper path and ROS environment setup
     return [
         LogInfo(msg=f"[SAM3] Starting shared SAM3 server in domain {sam3_domain}"),
         ExecuteProcess(
             cmd=[
                 "bash", "-c",
-                f"python3 {home}/ament_ws/src/stretch_ros2/senior_project/senior_project/sam3_server.py"
+                "source /opt/ros/humble/setup.bash && "
+                "source /ws/install/setup.bash && "
+                "python3 -m senior_project.sam3_server --port 8100"
             ],
             output="screen",
             name="sam3_server_shared",
             additional_env={"ROS_DOMAIN_ID": str(sam3_domain)},
+            shell=True,  # ADDED: Ensure shell interprets the command properly
         ),
     ]
 
@@ -149,7 +150,7 @@ def _start_parallel_runner_delayed(context):
     extra = LaunchConfiguration("extra").perform(context).strip()
 
     cmd = [
-    "ros2", "run", "senior_project", "parallel_runner",
+        "ros2", "run", "senior_project", "parallel_runner",
         "--num_sims", str(num_sims),
         "--target", str(target),
         "--total_steps", str(total_steps),

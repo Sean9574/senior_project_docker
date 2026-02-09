@@ -13,12 +13,13 @@ Main speed features:
 - Top-K + min-area filtering to reduce noise and unnecessary work.
 
 Usage:
-    conda activate sam3
-    python sam3_server.py
+    python sam3_server.py --port 8100
 """
 
+import argparse
 import base64
 import io
+import os
 import time
 from contextlib import asynccontextmanager
 from typing import Literal, Optional
@@ -32,20 +33,13 @@ from PIL import Image
 from pydantic import BaseModel
 from sam3.model.sam3_image_processor import Sam3Processor
 from sam3.model_builder import build_sam3_image_model
-import os
+
 # ============== GLOBAL STATE ==============
 model = None
 processor = None
 CURRENT_PROMPT = "object"
+SERVER_PORT = 8100  # Default, can be overridden by CLI arg
 # ==========================================
-
-# Ensure HF auth token is available to huggingface_hub
-tok = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_HUB_TOKEN")
-try:
-    model = build_sam3_image_model(token=tok) if tok else build_sam3_image_model()
-except TypeError:
-    # If this sam3 version doesn't accept token=, fall back to env var auth
-    model = build_sam3_image_model()
 
 
 class SegmentRequest(BaseModel):
@@ -91,7 +85,15 @@ async def lifespan(app: FastAPI):
         torch.backends.cudnn.benchmark = True
 
     start = time.time()
-    model = build_sam3_image_model()
+    
+    # Ensure HF auth token is available to huggingface_hub
+    tok = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_HUB_TOKEN")
+    try:
+        model = build_sam3_image_model(token=tok) if tok else build_sam3_image_model()
+    except TypeError:
+        # If this sam3 version doesn't accept token=, fall back to env var auth
+        model = build_sam3_image_model()
+    
     if torch.cuda.is_available():
         model = model.cuda().eval()
     else:
@@ -112,7 +114,7 @@ async def lifespan(app: FastAPI):
     print(f"✓ SAM3 loaded in {time.time() - start:.1f}s")
     print(f"✓ Device: {device_str}")
     print(f"✓ Default prompt: '{CURRENT_PROMPT}'")
-    print("✓ Server ready at http://0.0.0.0:8100")
+    print(f"✓ Server ready at http://0.0.0.0:{SERVER_PORT}")
     print("=" * 60)
 
     yield
@@ -211,6 +213,7 @@ async def health_check():
         "model_loaded": model is not None,
         "cuda_available": torch.cuda.is_available(),
         "cuda_device": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,
+        "port": SERVER_PORT,
     }
 
 
@@ -372,5 +375,27 @@ async def segment_image(request: SegmentRequest):
         )
 
 
+def main():
+    global SERVER_PORT
+    
+    # FIXED: Proper argument parsing for port
+    parser = argparse.ArgumentParser(description="SAM3 Segmentation Server")
+    parser.add_argument(
+        "--port", type=int, default=8100,
+        help="Server port (default: 8100)"
+    )
+    args = parser.parse_args()
+    
+    SERVER_PORT = args.port
+    
+    uvicorn.run(
+        "sam3_server:app",
+        host="0.0.0.0",
+        port=SERVER_PORT,  # FIXED: Use the parsed port
+        reload=False,
+        workers=1
+    )
+
+
 if __name__ == "__main__":
-    uvicorn.run("sam3_server:app", host="0.0.0.0", port=8100, reload=False, workers=1)
+    main()
