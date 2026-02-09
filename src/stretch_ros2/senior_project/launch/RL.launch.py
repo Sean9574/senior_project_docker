@@ -177,14 +177,16 @@ def generate_launch_description():
     ) / 'urdf' / 'stretch.urdf'
 
 
-
+    mesh_root = get_package_share_directory('stretch_description')
+    
     with open(robot_description_file, "r") as f:
         robot_description_content = f.read()
 
-    # Fix relative mesh paths used by this URDF
     robot_description_content = robot_description_content.replace(
-    'filename="./meshes/', 'filename="package://stretch_description/meshes/'
-)
+        'filename="./meshes/', f'filename="file://{mesh_root}/meshes/'
+    )
+
+  
 
 
     # Robot state publisher (namespaced; TF frames still global)
