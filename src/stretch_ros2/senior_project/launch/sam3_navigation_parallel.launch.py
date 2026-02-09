@@ -78,7 +78,7 @@ def generate_launch_description():
     ))
     ld.add_action(DeclareLaunchArgument(
         "ckpt_dir",
-        default_value="/ws/src/senior_project/parallel_training",  # FIXED: Updated path for Docker
+        default_value=os.path.expanduser("~/ament_ws/src/stretch_ros2/senior_project/parallel_training"),
         description="Base checkpoint directory"
     ))
     ld.add_action(DeclareLaunchArgument(
@@ -114,21 +114,22 @@ def generate_launch_description():
 def _start_sam3_server(context):
     """Start the shared SAM3 server in its dedicated domain."""
     sam3_domain = LaunchConfiguration("sam3_domain").perform(context)
+    home = os.path.expanduser("~")
 
-    # FIXED: Proper path and ROS environment setup
+    # Build command as single string for bash -c
+    cmd_string = (
+        f"source /opt/ros/humble/setup.bash && "
+        f"source {home}/ament_ws/install/setup.bash && "
+        f"python3 -m senior_project.sam3_server --port 8100"
+    )
+
     return [
         LogInfo(msg=f"[SAM3] Starting shared SAM3 server in domain {sam3_domain}"),
         ExecuteProcess(
-            cmd=[
-                "bash", "-c",
-                "source /opt/ros/humble/setup.bash && "
-                "source /ws/install/setup.bash && "
-                "python3 -m senior_project.sam3_server --port 8100"
-            ],
+            cmd=["bash", "-c", cmd_string],
             output="screen",
             name="sam3_server_shared",
             additional_env={"ROS_DOMAIN_ID": str(sam3_domain)},
-            shell=True,  # ADDED: Ensure shell interprets the command properly
         ),
     ]
 

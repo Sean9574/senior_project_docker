@@ -167,16 +167,17 @@ def _configure_launch(context):
         actions.append(LogInfo(msg=f"  [0s]  SAM3 server starting on port {sam3_port}"))
 
         # FIXED: Proper ROS environment sourcing and correct workspace path
+        home = os.path.expanduser("~")
+        cmd_string = (
+            f"source /opt/ros/humble/setup.bash && "
+            f"source {home}/ament_ws/install/setup.bash && "
+            f"python3 -m senior_project.sam3_server --port {sam3_port}"
+        )
+        
         sam3_server = ExecuteProcess(
-            cmd=[
-                'bash', '-c',
-                f'source /opt/ros/humble/setup.bash && '
-                f'source /ws/install/setup.bash && '
-                f'python3 -m senior_project.sam3_server --port {sam3_port}'
-            ],
+            cmd=["bash", "-c", cmd_string],
             output='screen',
             name='sam3_server',
-            shell=True,  # ADDED: Ensure shell interprets the command
         )
 
         actions.append(sam3_server)
@@ -215,17 +216,18 @@ def _configure_launch(context):
         mono_model = LaunchConfiguration("mono_depth_model").perform(context)
         
         # FIXED: Proper ROS environment sourcing and correct workspace path
+        home = os.path.expanduser("~")
+        cmd_string = (
+            f"source /opt/ros/humble/setup.bash && "
+            f"source {home}/ament_ws/install/setup.bash && "
+            f"python3 {home}/ament_ws/src/stretch_ros2/senior_project/senior_project/mono_depth_server.py "
+            f"--model {mono_model} --port {mono_port}"
+        )
+        
         mono_depth_server = ExecuteProcess(
-            cmd=[
-                "bash", "-c",
-                f"source /opt/ros/humble/setup.bash && "
-                f"source /ws/install/setup.bash && "
-                f"python3 /ws/src/senior_project/senior_project/mono_depth_server.py "
-                f"--model {mono_model} --port {mono_port}"
-            ],
+            cmd=["bash", "-c", cmd_string],
             output="screen",
             name="mono_depth_server",
-            shell=True,  # ADDED: Ensure shell interprets the command
         )
         actions.append(mono_depth_server)
 

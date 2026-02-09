@@ -343,7 +343,7 @@ def main():
     )
     parser.add_argument(
         "--ckpt_dir", type=str,
-        default="/ws/src/senior_project/parallel_training",  # FIXED: Updated path for Docker
+        default=os.path.expanduser("~/ament_ws/src/stretch_ros2/senior_project/parallel_training"),
         help="Base checkpoint directory"
     )
     parser.add_argument(

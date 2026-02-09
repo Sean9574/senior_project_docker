@@ -86,13 +86,31 @@ async def lifespan(app: FastAPI):
 
     start = time.time()
     
-    # Ensure HF auth token is available to huggingface_hub
+    # FIXED: Handle different SAM3 versions
+    # Some versions accept token parameter, some don't
+    # Try to use HF token from environment
     tok = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_HUB_TOKEN")
+    if tok:
+        print(f"✓ Found HuggingFace token (length: {len(tok)})")
+        # Set it in the environment for huggingface_hub to use
+        os.environ["HUGGINGFACE_HUB_TOKEN"] = tok
+    
     try:
-        model = build_sam3_image_model(token=tok) if tok else build_sam3_image_model()
-    except TypeError:
-        # If this sam3 version doesn't accept token=, fall back to env var auth
-        model = build_sam3_image_model()
+        # Try with token parameter first (newer versions)
+        if tok:
+            try:
+                model = build_sam3_image_model(token=tok)
+                print("✓ Loaded model using token parameter")
+            except TypeError:
+                # If token parameter not supported, fall back to environment variable
+                print("✓ Token parameter not supported, using environment variable")
+                model = build_sam3_image_model()
+        else:
+            model = build_sam3_image_model()
+            print("✓ Loaded model without token")
+    except Exception as e:
+        print(f"✗ Error loading model: {e}")
+        raise
     
     if torch.cuda.is_available():
         model = model.cuda().eval()
@@ -107,8 +125,8 @@ async def lifespan(app: FastAPI):
         with torch.inference_mode():
             st = processor.set_image(dummy)
             _ = processor.set_text_prompt(state=st, prompt="hand")
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"Warning: Warmup failed: {e}")
 
     device_str = "cuda:0" if torch.cuda.is_available() else "cpu"
     print(f"✓ SAM3 loaded in {time.time() - start:.1f}s")
