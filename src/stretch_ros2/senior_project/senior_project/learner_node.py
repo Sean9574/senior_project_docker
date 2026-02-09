@@ -7,6 +7,7 @@ IMPROVEMENTS OVER ORIGINAL:
 2. Random Network Distillation (RND) - learned intrinsic motivation replaces heuristics
 3. Observation normalization - stabilizes training
 4. Reward normalization - handles reward scale mismatch between modes
+5. SMART COLLISION AVOIDANCE - navigates around obstacles instead of stopping (NEW!)
 
 Original behaviors preserved:
 - Agent receives ego-centric occupancy grid as part of observation
@@ -47,7 +48,7 @@ from visualization_msgs.msg import Marker, MarkerArray
 # CONFIG
 # =============================================================================
 
-CHECKPOINT_FILENAME = "td3_explore_agent_v2.pt"  # New filename for improved version
+CHECKPOINT_FILENAME = "td3_explore_agent_v2.pt"
 AUTO_LOAD_CHECKPOINT = True
 
 EPISODE_SECONDS = 60.0
@@ -62,8 +63,8 @@ V_MAX = 1.25
 W_MAX = 7.0
 V_MIN_REVERSE = -0.05
 
-# --- Collision/Safety ---
-COLLISION_DIST = 0.40
+# --- Collision/Safety --- UPDATED VALUES
+COLLISION_DIST = 0.25  # Reduced from 0.40 - closer threshold with smart avoidance
 SAFE_DIST = 0.80
 
 # --- Goal Seeking Rewards (when goal is set) ---
@@ -77,25 +78,24 @@ ALIGN_SCALE = 3.0
 STEP_COST = -0.05
 
 # --- Exploration Rewards (when NO goal) ---
-# NOTE: These are now supplemented by RND intrinsic reward
 R_NEW_CELL = 2.0
 R_NOVELTY_SCALE = 0.5
 R_FRONTIER_BONUS = 5.0
 R_COLLISION_EXPLORE = -500.0
 R_STEP_EXPLORE = -0.02
 
-# --- RND Config (NEW) ---
-RND_WEIGHT_INITIAL = 1.0      # Initial weight for intrinsic reward
-RND_WEIGHT_DECAY = 0.99995    # Decay per step (reaches ~0.6 at 100k steps)
-RND_WEIGHT_MIN = 0.1          # Minimum intrinsic reward weight
-RND_FEATURE_DIM = 64          # RND embedding dimension
-RND_LR = 1e-4                 # RND predictor learning rate
+# --- RND Config ---
+RND_WEIGHT_INITIAL = 1.0
+RND_WEIGHT_DECAY = 0.99995
+RND_WEIGHT_MIN = 0.1
+RND_FEATURE_DIM = 64
+RND_LR = 1e-4
 
-# --- PER Config (NEW) ---
-PER_ALPHA = 0.6               # Priority exponent (0 = uniform, 1 = full prioritization)
-PER_BETA_START = 0.4          # Initial importance sampling correction
-PER_BETA_END = 1.0            # Final beta (annealed over training)
-PER_EPSILON = 1e-6            # Small constant to avoid zero priorities
+# --- PER Config ---
+PER_ALPHA = 0.6
+PER_BETA_START = 0.4
+PER_BETA_END = 1.0
+PER_EPSILON = 1e-6
 
 # Visit tracking
 VISIT_DECAY = 0.995
@@ -144,7 +144,7 @@ def set_seed(seed: int):
 
 
 # =============================================================================
-# NEW: Running Mean/Std for Normalization
+# Running Mean/Std for Normalization
 # =============================================================================
 
 class RunningMeanStd:
@@ -205,19 +205,11 @@ class RewardNormalizer:
 
 
 # =============================================================================
-# NEW: Random Network Distillation (RND)
+# Random Network Distillation (RND)
 # =============================================================================
 
 class RNDModule(nn.Module):
-    """
-    Random Network Distillation for intrinsic motivation.
-    
-    The intrinsic reward is the prediction error between:
-    - A fixed, randomly initialized target network
-    - A predictor network that learns to match the target
-    
-    Novel states have high prediction error = high intrinsic reward.
-    """
+    """Random Network Distillation for intrinsic motivation."""
     
     def __init__(self, obs_dim: int, hidden: int = 256, 
                  feature_dim: int = RND_FEATURE_DIM, device: torch.device = None):
@@ -247,53 +239,38 @@ class RNDModule(nn.Module):
             nn.Linear(hidden, feature_dim)
         ).to(self.device)
         
-        # Optimizer for predictor only
         self.optimizer = torch.optim.Adam(self.predictor.parameters(), lr=RND_LR)
         
-        # Running stats for observation normalization (RND-specific)
         self.obs_rms = RunningMeanStd(shape=(obs_dim,))
-        
-        # Running stats for intrinsic reward normalization
         self.reward_rms = RunningMeanStd(shape=())
     
     def normalize_obs(self, obs: np.ndarray) -> np.ndarray:
-        """Normalize observation for RND (separate from main obs norm)."""
+        """Normalize observation for RND."""
         return np.clip(self.obs_rms.normalize(obs), -5.0, 5.0)
     
     @torch.no_grad()
     def compute_intrinsic_reward(self, obs: np.ndarray) -> float:
-        """
-        Compute intrinsic reward as prediction error.
-        Higher error = more novel state = higher reward.
-        """
-        # Update observation statistics
+        """Compute intrinsic reward as prediction error."""
         self.obs_rms.update(obs.reshape(1, -1))
         
-        # Normalize observation
         obs_norm = self.normalize_obs(obs)
         obs_tensor = torch.as_tensor(obs_norm, dtype=torch.float32, device=self.device)
         
         if obs_tensor.dim() == 1:
             obs_tensor = obs_tensor.unsqueeze(0)
         
-        # Compute prediction error
         target_features = self.target(obs_tensor)
         predictor_features = self.predictor(obs_tensor)
         
         intrinsic_reward = (target_features - predictor_features).pow(2).mean().item()
         
-        # Normalize intrinsic reward
         self.reward_rms.update(np.array([intrinsic_reward]))
         normalized_reward = intrinsic_reward / np.sqrt(self.reward_rms.var + 1e-8)
         
         return float(normalized_reward)
     
     def update(self, obs_batch: torch.Tensor) -> float:
-        """
-        Update predictor network to better match target.
-        Returns the loss value for logging.
-        """
-        # Normalize observations
+        """Update predictor network."""
         obs_np = obs_batch.cpu().numpy()
         obs_norm = np.clip(
             (obs_np - self.obs_rms.mean) / np.sqrt(self.obs_rms.var + 1e-8),
@@ -301,16 +278,12 @@ class RNDModule(nn.Module):
         )
         obs_norm_tensor = torch.as_tensor(obs_norm, dtype=torch.float32, device=self.device)
         
-        # Forward pass
         with torch.no_grad():
             target_features = self.target(obs_norm_tensor)
         
         predictor_features = self.predictor(obs_norm_tensor)
-        
-        # MSE loss
         loss = F.mse_loss(predictor_features, target_features)
         
-        # Update predictor
         self.optimizer.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(self.predictor.parameters(), 1.0)
@@ -346,14 +319,11 @@ class RNDModule(nn.Module):
 
 
 # =============================================================================
-# NEW: Prioritized Experience Replay (PER)
+# Prioritized Experience Replay (PER)
 # =============================================================================
 
 class SumTree:
-    """
-    Binary sum tree for efficient priority-based sampling.
-    Allows O(log n) updates and sampling.
-    """
+    """Binary sum tree for efficient priority-based sampling."""
     
     def __init__(self, capacity: int):
         self.capacity = capacity
@@ -365,7 +335,6 @@ class SumTree:
         change = priority - self.tree[tree_idx]
         self.tree[tree_idx] = priority
         
-        # Propagate change up the tree
         while tree_idx != 0:
             tree_idx = (tree_idx - 1) // 2
             self.tree[tree_idx] += change
@@ -381,10 +350,7 @@ class SumTree:
         return data_idx
     
     def get(self, value: float) -> Tuple[int, int, float]:
-        """
-        Get leaf index, data index, and priority for a value.
-        Used for proportional sampling.
-        """
+        """Get leaf index, data index, and priority for a value."""
         parent_idx = 0
         
         while True:
@@ -410,12 +376,7 @@ class SumTree:
 
 
 class PrioritizedReplayBuffer:
-    """
-    Prioritized Experience Replay buffer.
-    
-    Samples transitions with probability proportional to their TD error,
-    focusing learning on "surprising" or informative transitions.
-    """
+    """Prioritized Experience Replay buffer."""
     
     def __init__(self, obs_dim: int, act_dim: int, size: int, 
                  device: torch.device, alpha: float = PER_ALPHA):
@@ -425,26 +386,23 @@ class PrioritizedReplayBuffer:
         self.ptr = 0
         self.count = 0
         
-        # Data storage
         self.obs = np.zeros((self.size, obs_dim), dtype=np.float32)
         self.next_obs = np.zeros((self.size, obs_dim), dtype=np.float32)
         self.acts = np.zeros((self.size, act_dim), dtype=np.float32)
         self.rews = np.zeros((self.size, 1), dtype=np.float32)
         self.done = np.zeros((self.size, 1), dtype=np.float32)
         
-        # Priority tree
         self.tree = SumTree(self.size)
         self.max_priority = 1.0
     
     def add(self, obs, act, rew, next_obs, done):
-        """Add transition with max priority (will be updated after first sample)."""
+        """Add transition with max priority."""
         self.obs[self.ptr] = obs
         self.acts[self.ptr] = act
         self.rews[self.ptr] = rew
         self.next_obs[self.ptr] = next_obs
         self.done[self.ptr] = done
         
-        # New transitions get max priority
         priority = self.max_priority ** self.alpha
         self.tree.add(priority)
         
@@ -452,24 +410,13 @@ class PrioritizedReplayBuffer:
         self.count = min(self.count + 1, self.size)
     
     def sample(self, batch_size: int, beta: float = PER_BETA_START) -> Tuple:
-        """
-        Sample batch with importance sampling weights.
-        
-        Args:
-            batch_size: Number of transitions to sample
-            beta: Importance sampling exponent (annealed from 0.4 to 1.0)
-        
-        Returns:
-            obs, acts, rews, next_obs, done, weights, indices
-        """
+        """Sample batch with importance sampling weights."""
         indices = np.zeros(batch_size, dtype=np.int32)
         priorities = np.zeros(batch_size, dtype=np.float32)
         
-        # Divide total priority into segments for stratified sampling
         segment = self.tree.total_priority / batch_size
         
         for i in range(batch_size):
-            # Sample from segment
             low = segment * i
             high = segment * (i + 1)
             value = np.random.uniform(low, high)
@@ -478,13 +425,9 @@ class PrioritizedReplayBuffer:
             indices[i] = data_idx
             priorities[i] = priority
         
-        # Compute importance sampling weights
-        # P(i) = priority_i / sum(priorities)
         probs = priorities / self.tree.total_priority
-        
-        # w_i = (N * P(i))^(-beta) / max(w)
         weights = (self.count * probs) ** (-beta)
-        weights = weights / weights.max()  # Normalize
+        weights = weights / weights.max()
         
         return (
             torch.as_tensor(self.obs[indices], device=self.device),
@@ -508,16 +451,11 @@ class PrioritizedReplayBuffer:
 
 
 # =============================================================================
-# Ego-Centric Occupancy Grid (unchanged from original)
+# Ego-Centric Occupancy Grid (unchanged)
 # =============================================================================
 
 class EgoOccupancyGrid:
-    """
-    Ego-centric occupancy grid that rotates with the robot.
-    - Robot is always at center
-    - "Forward" is always up (+y in grid)
-    - Grid values: 0 = unknown, 0.5 = free, 1.0 = occupied
-    """
+    """Ego-centric occupancy grid that rotates with the robot."""
     
     def __init__(self, size: int = GRID_SIZE, resolution: float = GRID_RESOLUTION):
         self.size = size
@@ -525,7 +463,6 @@ class EgoOccupancyGrid:
         self.half_size = size // 2
         
         self.grid = np.zeros((size, size), dtype=np.float32)
-        
         self.world_grid: Dict[Tuple[int, int], float] = {}
         self.visit_counts: Dict[Tuple[int, int], float] = {}
         
@@ -789,7 +726,7 @@ class EgoOccupancyGrid:
 
 
 # =============================================================================
-# ROS Interface (unchanged from original)
+# ROS Interface (unchanged)
 # =============================================================================
 
 class StretchRosInterface(Node):
@@ -890,7 +827,7 @@ class StretchRosInterface(Node):
 
 
 # =============================================================================
-# Gym Environment (MODIFIED: adds RND intrinsic reward)
+# Gym Environment (MODIFIED: Smart Collision Avoidance)
 # =============================================================================
 
 class StretchExploreEnv(gym.Env):
@@ -901,6 +838,7 @@ class StretchExploreEnv(gym.Env):
     - RND module provides learned intrinsic reward
     - Observation normalization for stable training
     - Reward normalization for consistent scales
+    - SMART collision avoidance - navigates around obstacles instead of stopping!
     """
     
     def __init__(self, ros: StretchRosInterface, rnd_module: RNDModule,
@@ -913,8 +851,8 @@ class StretchExploreEnv(gym.Env):
         # Occupancy grid
         self.occ_grid = EgoOccupancyGrid()
         
-        # Normalization (NEW)
-        self.obs_rms = None  # Will be initialized after we know obs_dim
+        # Normalization
+        self.obs_rms = None
         self.reward_normalizer = RewardNormalizer()
         
         # RND weight (decays over time)
@@ -922,7 +860,7 @@ class StretchExploreEnv(gym.Env):
         
         # State
         self.step_count = 0
-        self.total_steps = 0  # Global step count for RND weight decay
+        self.total_steps = 0
         self.max_steps = int(EPISODE_SECONDS / control_dt)
         self.episode_index = 1
         self.episode_return = 0.0
@@ -955,10 +893,10 @@ class StretchExploreEnv(gym.Env):
             f"grid={GRID_SIZE}x{GRID_SIZE}={grid_flat_size})"
         )
         self.ros.get_logger().info(
-            f"[ENV] IMPROVED: Using RND (weight={RND_WEIGHT_INITIAL}, decay={RND_WEIGHT_DECAY})"
+            f"[ENV] IMPROVED: Using RND + PER + Smart Collision Avoidance"
         )
         self.ros.get_logger().info(
-            f"[ENV] IMPROVED: Using PER (alpha={PER_ALPHA}, beta={PER_BETA_START}->{PER_BETA_END})"
+            f"[ENV] Collision threshold: {COLLISION_DIST}m (navigates around instead of stopping)"
         )
     
     def reset(self, *, seed=None, options=None):
@@ -990,11 +928,41 @@ class StretchExploreEnv(gym.Env):
         if v_cmd < V_MIN_REVERSE:
             v_cmd = V_MIN_REVERSE
         
-        # Safety check
+        # ============================================================
+        # NEW: SMART COLLISION AVOIDANCE
+        # ============================================================
         min_lidar = self._min_lidar()
+        obstacle_angle = self._get_obstacle_angle()
+        
         if min_lidar < COLLISION_DIST:
-            v_cmd = 0.0
-            w_cmd = 0.0
+            # Calculate danger factor (0 = at safe distance, 1 = at collision)
+            danger_factor = 1.0 - (min_lidar / COLLISION_DIST)
+            
+            # Strategy 1: Obstacle is to the side - turn away from it
+            if abs(obstacle_angle) > 0.1:  # Obstacle not directly ahead
+                # Turn away from obstacle
+                turn_away = -np.sign(obstacle_angle) * W_MAX * danger_factor
+                w_cmd = turn_away
+                
+                # Reduce forward velocity but don't stop completely
+                v_cmd = v_cmd * (1.0 - danger_factor * 0.7)
+                
+            # Strategy 2: Obstacle directly ahead and moving forward - back up and turn
+            elif v_cmd > 0:
+                # Move backwards proportional to danger
+                v_cmd = -V_MAX * 0.5 * danger_factor
+                
+                # Turn toward more open space
+                w_cmd = w_cmd + self._get_escape_direction() * W_MAX * 0.5
+            
+            # Strategy 3: Already reversing - allow it but guide the turn
+            else:
+                # Keep backing up, adjust turn toward open space
+                w_cmd = w_cmd + self._get_escape_direction() * W_MAX * 0.3
+        
+        # ============================================================
+        # END SMART COLLISION AVOIDANCE
+        # ============================================================
         
         # Send command
         self.ros.send_cmd(v_cmd, w_cmd)
@@ -1013,7 +981,7 @@ class StretchExploreEnv(gym.Env):
                 st["x"], st["y"], st["yaw"], scan
             )
         
-        # Build observation BEFORE computing reward (needed for RND)
+        # Build observation
         obs = self._build_observation()
         
         # Compute reward based on mode
@@ -1024,7 +992,7 @@ class StretchExploreEnv(gym.Env):
         else:
             reward, terminated, info = self._compute_explore_reward(new_cells, st, obs)
         
-        # Update RND weight (decay over time)
+        # Update RND weight
         self.total_steps += 1
         self.rnd_weight = max(
             RND_WEIGHT_MIN,
@@ -1088,12 +1056,11 @@ class StretchExploreEnv(gym.Env):
             self.ros.publish_path()
     
     def _compute_explore_reward(self, new_cells: int, st: Dict, obs: np.ndarray) -> Tuple[float, bool, Dict]:
-        """Compute reward for exploration mode (no goal). IMPROVED with RND."""
+        """Compute reward for exploration mode."""
         reward = 0.0
         terminated = False
         collision = False
         
-        # Original heuristic rewards (kept for stability)
         r_discovery = R_NEW_CELL * new_cells
         
         novelty = self.occ_grid.get_novelty(st["x"], st["y"])
@@ -1107,7 +1074,7 @@ class StretchExploreEnv(gym.Env):
         
         r_step = R_STEP_EXPLORE
         
-        # NEW: RND intrinsic reward
+        # RND intrinsic reward
         r_rnd = self.rnd.compute_intrinsic_reward(obs) * self.rnd_weight
         
         # Collision
@@ -1119,7 +1086,6 @@ class StretchExploreEnv(gym.Env):
         else:
             r_collision = 0.0
         
-        # Total reward
         reward = r_discovery + r_novelty + r_frontier + r_step + r_collision + r_rnd
         
         info = {
@@ -1132,7 +1098,7 @@ class StretchExploreEnv(gym.Env):
                 "frontier": r_frontier,
                 "step": r_step,
                 "collision": r_collision,
-                "rnd": r_rnd,  # NEW
+                "rnd": r_rnd,
             }
         }
         
@@ -1193,6 +1159,77 @@ class StretchExploreEnv(gym.Env):
         }
         
         return float(reward), terminated, info
+    
+    # ============================================================
+    # NEW HELPER FUNCTIONS FOR SMART COLLISION AVOIDANCE
+    # ============================================================
+    
+    def _get_obstacle_angle(self) -> float:
+        """
+        Find the angle to the closest obstacle.
+        Returns angle in radians (-pi to pi) where obstacle is located.
+        0 = directly ahead, positive = left, negative = right
+        """
+        scan = self.ros.last_scan
+        if scan is None:
+            return 0.0
+        
+        ranges = np.array(scan.ranges, dtype=np.float32)
+        if ranges.size == 0:
+            return 0.0
+        
+        # Filter invalid readings
+        max_r = scan.range_max if scan.range_max > 0 else LIDAR_MAX_RANGE
+        min_r = max(scan.range_min, 0.01)
+        valid = ~(np.isnan(ranges) | np.isinf(ranges) | (ranges < min_r) | (ranges > max_r))
+        
+        if not np.any(valid):
+            return 0.0
+        
+        # Find closest point
+        ranges[~valid] = max_r
+        closest_idx = np.argmin(ranges)
+        
+        # Convert to angle (accounting for LIDAR_FORWARD_OFFSET)
+        angle_min = scan.angle_min
+        angle_inc = scan.angle_increment
+        obstacle_angle = angle_min + closest_idx * angle_inc
+        
+        # Normalize to robot frame (0 = forward)
+        obstacle_angle = wrap_to_pi(obstacle_angle + LIDAR_FORWARD_OFFSET_RAD)
+        
+        return float(obstacle_angle)
+    
+    def _get_escape_direction(self) -> float:
+        """
+        Determine which direction has more free space.
+        Returns -1 (turn right) or +1 (turn left).
+        """
+        scan = self.ros.last_scan
+        if scan is None:
+            return 1.0
+        
+        ranges = np.array(scan.ranges, dtype=np.float32)
+        if ranges.size == 0:
+            return 1.0
+        
+        # Filter valid readings
+        max_r = scan.range_max if scan.range_max > 0 else LIDAR_MAX_RANGE
+        min_r = max(scan.range_min, 0.01)
+        valid = ~(np.isnan(ranges) | np.isinf(ranges) | (ranges < min_r) | (ranges > max_r))
+        ranges[~valid] = 0.0
+        
+        # Split into left and right halves
+        mid = len(ranges) // 2
+        left_space = np.mean(ranges[:mid])
+        right_space = np.mean(ranges[mid:])
+        
+        # Turn toward more open space
+        return 1.0 if left_space > right_space else -1.0
+    
+    # ============================================================
+    # END NEW HELPER FUNCTIONS
+    # ============================================================
     
     def _build_observation(self) -> np.ndarray:
         st = self._get_robot_state()
@@ -1255,10 +1292,8 @@ class StretchExploreEnv(gym.Env):
             novelty,
         ], axis=0)
         
-        # Update running statistics and normalize (NEW)
+        # Update running statistics
         self.obs_rms.update(obs.reshape(1, -1))
-        # Note: We return unnormalized obs here because TD3 will handle it
-        # The RND module has its own normalization
         
         return obs.astype(np.float32)
     
@@ -1344,7 +1379,7 @@ class StretchExploreEnv(gym.Env):
                 "goal_dist": self._goal_distance(),
             },
             "explore_stats": stats,
-            "rnd_weight": self.rnd_weight,  # NEW
+            "rnd_weight": self.rnd_weight,
             "episode": self.episode_index,
             "step": self.step_count,
         }
@@ -1355,7 +1390,7 @@ class StretchExploreEnv(gym.Env):
 
 
 # =============================================================================
-# TD3 Networks (unchanged from original)
+# TD3 Networks (unchanged)
 # =============================================================================
 
 class GridCNN(nn.Module):
@@ -1464,11 +1499,11 @@ class CriticWithCNN(nn.Module):
 
 
 # =============================================================================
-# TD3 Agent (MODIFIED: uses PER, updates RND)
+# TD3 Agent (uses PER and RND)
 # =============================================================================
 
 class TD3AgentCNN:
-    """TD3 Agent with CNN-based actor and critic. IMPROVED with PER and RND integration."""
+    """TD3 Agent with CNN. Improved with PER and RND integration."""
     
     def __init__(self, obs_dim: int, act_dim: int, device: torch.device,
                  rnd_module: RNDModule,
@@ -1515,13 +1550,10 @@ class TD3AgentCNN:
         return np.clip(a, -1.0, 1.0).astype(np.float32)
     
     def update(self, replay: PrioritizedReplayBuffer, batch_size: int, beta: float) -> Tuple[float, float, float]:
-        """
-        Update networks using PER.
-        Returns (critic_loss, actor_loss, rnd_loss).
-        """
+        """Update networks using PER. Returns (critic_loss, actor_loss, rnd_loss)."""
         self.total_updates += 1
         
-        # Sample with priorities (NEW: PER)
+        # Sample with priorities
         obs, act, rew, next_obs, done, weights, indices = replay.sample(batch_size, beta)
         
         # Critic update
@@ -1537,7 +1569,7 @@ class TD3AgentCNN:
         q1 = self.critic1(obs, act)
         q2 = self.critic2(obs, act)
         
-        # NEW: Weight losses by importance sampling weights
+        # Weight losses by importance sampling weights
         td_error1 = target - q1
         td_error2 = target - q2
         
@@ -1550,7 +1582,7 @@ class TD3AgentCNN:
         )
         self.critic_opt.step()
         
-        # NEW: Update priorities based on TD error
+        # Update priorities based on TD error
         td_errors = (td_error1.abs() + td_error2.abs()).detach().cpu().numpy() / 2.0
         replay.update_priorities(indices, td_errors.flatten())
         
@@ -1568,7 +1600,7 @@ class TD3AgentCNN:
             self._soft_update(self.critic1_targ, self.critic1)
             self._soft_update(self.critic2_targ, self.critic2)
         
-        # NEW: Update RND predictor
+        # Update RND predictor
         rnd_loss = self.rnd.update(next_obs)
         
         return float(critic_loss.item()), float(actor_loss.item()), rnd_loss
@@ -1589,7 +1621,7 @@ class TD3AgentCNN:
             "actor_opt": self.actor_opt.state_dict(),
             "critic_opt": self.critic_opt.state_dict(),
             "total_updates": self.total_updates,
-            "rnd": self.rnd.state_dict_custom(),  # NEW: save RND state
+            "rnd": self.rnd.state_dict_custom(),
         }, path)
     
     def load(self, path: str, strict: bool = True):
@@ -1604,7 +1636,6 @@ class TD3AgentCNN:
             self.actor_opt.load_state_dict(payload["actor_opt"])
             self.critic_opt.load_state_dict(payload["critic_opt"])
             self.total_updates = payload.get("total_updates", 0)
-            # NEW: load RND state
             if "rnd" in payload:
                 self.rnd.load_state_dict_custom(payload["rnd"])
         except Exception:
@@ -1680,20 +1711,20 @@ def main():
     obs_dim = NUM_LIDAR_BINS + 5 + 2 + 2 + 1 + grid_flat_size + 2 + 1
     act_dim = 2
     
-    # NEW: Create RND module
+    # Create RND module
     rnd_module = RNDModule(obs_dim, device=device)
     
-    # Create environment (now takes RND module)
+    # Create environment
     env = StretchExploreEnv(ros, rnd_module)
     
     ros.get_logger().info(f"[AGENT] device={device} obs_dim={obs_dim} act_dim={act_dim}")
     ros.get_logger().info(f"[AGENT] Grid: {GRID_SIZE}x{GRID_SIZE} @ {GRID_RESOLUTION}m/cell")
-    ros.get_logger().info(f"[AGENT] IMPROVED: PER + RND enabled")
+    ros.get_logger().info(f"[AGENT] IMPROVED: PER + RND + Smart Collision Avoidance")
     
-    # Create agent (now takes RND module)
+    # Create agent
     agent = TD3AgentCNN(obs_dim, act_dim, device=device, rnd_module=rnd_module)
     
-    # NEW: Prioritized replay buffer
+    # Prioritized replay buffer
     replay = PrioritizedReplayBuffer(obs_dim, act_dim, size=args.replay_size, device=device)
     
     # Load checkpoint if exists
@@ -1776,7 +1807,7 @@ def main():
         
         # Update
         if t >= args.update_after and replay.count >= args.batch_size:
-            # NEW: Anneal beta for importance sampling
+            # Anneal beta for importance sampling
             beta = PER_BETA_START + (PER_BETA_END - PER_BETA_START) * (t / args.total_steps)
             
             for _ in range(args.update_every):

@@ -130,9 +130,6 @@ RUN apt-get update && apt-get install -y \
 # Step 1: Upgrade pip only
 RUN pip3 install --upgrade pip wheel
 
-# Step 2: Pin numpy (must be <2 for compatibility)
-RUN pip3 install "numpy<2.0,>=1.24.0"
-
 # Step 3: Install PyTorch with CUDA
 # ---- Fix distutils/apt SymPy conflict (required for pip torch install) ----
 RUN apt-get update && apt-get remove -y --purge python3-sympy \
@@ -146,10 +143,16 @@ RUN pip3 uninstall -y torch torchvision torchaudio "nvidia-*" || true \
 
 RUN pip3 install filelock fsspec jinja2 networkx sympy typing-extensions
 
-# Step 4: Core ML/RL packages (--ignore-installed for distutils conflicts)
-RUN pip3 install --ignore-installed \
+RUN pip3 install --no-cache-dir --ignore-installed --force-reinstall "blinker>=1.6"
+
+RUN apt-get update && apt-get remove -y python3-scipy && rm -rf /var/lib/apt/lists/*
+
+RUN pip3 install --no-cache-dir --force-reinstall "scipy>=1.11,<1.13"
+
+
+# Step 4: Core ML/RL packages
+RUN pip3 install \
     gymnasium \
-    scipy \
     matplotlib \
     pandas \
     tensorboard \
@@ -158,14 +161,14 @@ RUN pip3 install --ignore-installed \
     opencv-python-headless \
     Pillow \
     flask \
-    flask-socketio
+    flask-socketio \
+    termcolor
 
 # Numba with compatible coverage
 RUN pip3 install "coverage<7"
-RUN pip3 install numba==0.59.1
 
 # Step 5: MuJoCo
-RUN pip3 install mujoco
+RUN pip3 install 'mujoco==3.2.6'
 
 # Step 6: ROS2 Python extras
 RUN pip3 install \
@@ -174,20 +177,14 @@ RUN pip3 install \
     lark \
     catkin_pkg
 
-
-
-
-
 # Step 7: Robosuite (required by stretch_mujoco)
-RUN pip3 install robosuite
-
-# Step 8: Robocasa from source (not on PyPI)
-RUN pip3 install git+https://github.com/robocasa/robocasa.git || echo "Robocasa source install attempted"
+RUN pip3 install --no-deps robosuite
+RUN pip3 install --no-deps git+https://github.com/robocasa/robocasa.git || echo "Robocasa source install attempted"
 
 # Step 9: CRITICAL - Pin setuptools LAST for ROS2/colcon compatibility
 RUN pip3 install setuptools==58.2.0
 
-# =============================================================================
+    # =============================================================================
 # Create Non-Root User
 # =============================================================================
 
@@ -246,7 +243,7 @@ RUN mkdir -p /home/stretch/logs && chown stretch:stretch /home/stretch/logs
 USER root
 
 # SAM3 server dependencies
-RUN pip3 install --ignore-installed uvicorn fastapi pydantic ftfy huggingface_hub iopath regex timm
+RUN pip3 install  uvicorn fastapi pydantic ftfy huggingface_hub iopath regex timm
 RUN pip3 install --no-deps git+https://github.com/facebookresearch/sam3.git
 
 # SAM3 runtime deps (since we install sam3 with --no-deps to avoid torch/CUDA conflicts)
@@ -259,7 +256,8 @@ RUN pip3 install --no-cache-dir \
     decord \
     pycocotools \
     urchin \
-    pyquaternion 
+    pyquaternion \
+    requests
 
 
 RUN pip3 install --no-deps \
@@ -294,6 +292,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     librealsense2-utils \
  && rm -rf /var/lib/apt/lists/*
 
+ RUN pip3 uninstall -y numba llvmlite numpy || true && \
+    pip3 install --no-cache-dir --force-reinstall \
+      numpy==1.23.5 \
+      llvmlite==0.42.0 \
+      numba==0.59.1
 
 RUN chown -R $USERNAME:$USERNAME $AMENT_WS
 RUN chown -R $USERNAME:$USERNAME /home/$USERNAME
