@@ -131,7 +131,7 @@ RUN apt-get update && apt-get install -y \
 RUN pip3 install --upgrade pip wheel
 
 # Step 2: Pin numpy (must be <2 for compatibility)
-RUN pip3 install "numpy<2"
+RUN pip3 install "numpy<2.0,>=1.24.0"
 
 # Step 3: Install PyTorch with CUDA
 # ---- Fix distutils/apt SymPy conflict (required for pip torch install) ----
@@ -256,7 +256,6 @@ RUN pip3 install --no-cache-dir \
     uvicorn \
     pillow \
     pydantic \
-    numpy==1.23.5 \
     decord \
     pycocotools \
     urchin \

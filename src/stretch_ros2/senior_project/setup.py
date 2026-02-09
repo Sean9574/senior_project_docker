@@ -15,6 +15,7 @@ setup(
         (f'share/{package_name}/launch', glob('launch/*.launch.py')),
         (f'share/{package_name}/modules', glob('modules/*.py')),
         (f'share/{package_name}/scripts', glob('scripts/*.py')),
+        (f'share/{package_name}/meshes', glob('meshes/*')),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
