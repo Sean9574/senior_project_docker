@@ -217,6 +217,8 @@ WORKDIR $AMENT_WS/src
 RUN git clone https://github.com/hello-robot/stretch_mujoco.git
 RUN git clone https://github.com/hello-robot/stretch_urdf.git
 
+ARG CACHEBUST=1
+RUN echo "Cache busting: $CACHEBUST"
 # Clone your repo and move src contents
 RUN git clone https://github.com/Sean9574/senior_project_docker.git /tmp/senior_project && \
     cp -r /tmp/senior_project/src/* . && \

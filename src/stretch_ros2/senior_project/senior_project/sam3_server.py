@@ -407,7 +407,7 @@ def main():
     SERVER_PORT = args.port
     
     uvicorn.run(
-        "sam3_server:app",
+        app,
         host="0.0.0.0",
         port=SERVER_PORT,  # FIXED: Use the parsed port
         reload=False,
