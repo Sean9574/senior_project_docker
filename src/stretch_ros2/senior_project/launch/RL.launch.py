@@ -102,9 +102,9 @@ def generate_launch_description():
     )
     ld.add_action(DeclareLaunchArgument("load_ckpt", default_value=""))
 
-    ld.add_action(DeclareLaunchArgument("odom_topic", default_value="odom"))
-    ld.add_action(DeclareLaunchArgument("cmd_topic", default_value="cmd_vel"))
-    ld.add_action(DeclareLaunchArgument("lidar_topic", default_value="scan"))
+    ld.add_action(DeclareLaunchArgument("odom_topic", default_value="/stretch/odom"))
+    ld.add_action(DeclareLaunchArgument("cmd_topic", default_value="/stretch/cmd_vel"))
+    ld.add_action(DeclareLaunchArgument("lidar_topic", default_value="/stretch/scan"))
     ld.add_action(DeclareLaunchArgument("imu_topic", default_value="imu"))
     ld.add_action(
         DeclareLaunchArgument(

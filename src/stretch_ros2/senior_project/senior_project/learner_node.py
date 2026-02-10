@@ -1651,8 +1651,8 @@ def main():
     
     # Topics
     parser.add_argument("--ns", type=str, default="")
-    parser.add_argument("--odom-topic", type=str, default="/odom")
-    parser.add_argument("--lidar-topic", type=str, default="/scan_filtered")
+    parser.add_argument("--odom-topic", type=str, default="/stretch/odom")
+    parser.add_argument("--lidar-topic", type=str, default="/stretch/scan")
     parser.add_argument("--imu-topic", type=str, default="/imu_mobile_base")
     parser.add_argument("--goal-topic", type=str, default="/goal")
     parser.add_argument("--cmd-topic", type=str, default="/stretch/cmd_vel")
