@@ -122,7 +122,7 @@ class SAM3GoalGeneratorV2(Node):
         self.declare_parameter('mono_depth_url', 'http://localhost:8101')
         self.declare_parameter('target', 'cup')
         self.declare_parameter('confidence_threshold', 0.2)
-        self.declare_parameter('rate', 2.0)
+        self.declare_parameter('rate', 0.5)
         self.declare_parameter('ns', 'stretch')
         self.declare_parameter('min_distance', 0.5)
         self.declare_parameter('max_distance', 5.0)
@@ -282,7 +282,9 @@ class SAM3GoalGeneratorV2(Node):
 
         # ==================== Timer ====================
         self.timer = self.create_timer(1.0 / max(self.rate, 0.1), self.process_callback)
-
+        self._sam3_lock = threading.Lock()
+        self._sam3_busy = False
+        
         # ==================== Initialize ====================
         self.set_sam3_prompt(self.target)
         self.check_mono_depth_server()
@@ -824,19 +826,34 @@ class SAM3GoalGeneratorV2(Node):
         _, buf = cv2.imencode('.jpg', rgb, [cv2.IMWRITE_JPEG_QUALITY, 70])
         img_b64 = base64.b64encode(buf).decode()
 
-        try:
-            r = self.session.post(
-                f"{self.server_url}/segment",
-                json={"image_base64": img_b64, "confidence_threshold": self.confidence},
-                timeout=10
-            )
-            result = r.json()
-        except Exception as e:
-            self.get_logger().warn(f'SAM3 request failed: {e}')
+
+        # Skip if previous request still running
+        if self._sam3_busy:
             return
 
-        if not result.get('success'):
+        def run_sam3():
+            self._sam3_busy = True
+            try:
+                r = self.session.post(
+                    f"{self.server_url}/segment",
+                    json={"image_base64": img_b64, "confidence_threshold": self.confidence},
+                    timeout=10
+                )
+                with self._sam3_lock:
+                    self._last_sam3_result = r.json()
+            except Exception as e:
+                self.get_logger().warn(f'SAM3 request failed: {e}')
+            finally:
+                self._sam3_busy = False
+
+        threading.Thread(target=run_sam3, daemon=True).start()
+
+        # Use cached result
+        with self._sam3_lock:
+            result = getattr(self, '_last_sam3_result', None)
+        if result is None or not result.get('success'):
             return
+
 
         boxes = result.get('boxes', [])
         scores = result.get('scores', [])

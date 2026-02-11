@@ -240,7 +240,7 @@ def generate_launch_description():
     # MuJoCo driver
     driver_params = [
         {
-            "rate": 300.0,  # 10x faster simulation
+            "rate": 100.0,  # 10x faster simulation
             "timeout": 0.5,
             "broadcast_odom_tf": LaunchConfiguration("broadcast_odom_tf"),
             "fail_out_of_range_goal": LaunchConfiguration(

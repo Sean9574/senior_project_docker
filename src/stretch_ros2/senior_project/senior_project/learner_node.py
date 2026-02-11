@@ -115,7 +115,7 @@ DEBUG_EVERY_N = 50
 
 # --- Visualization ---
 PUBLISH_MAP = True
-PUBLISH_MAP_EVERY_N = 10
+PUBLISH_MAP_EVERY_N = 50
 PUBLISH_PATH = True
 PATH_HISTORY_LENGTH = 1000
 MAP_FRAME = "odom"
@@ -1661,8 +1661,8 @@ def main():
     parser.add_argument("--total-steps", type=int, default=500_000)
     parser.add_argument("--start-steps", type=int, default=DEFAULT_START_STEPS)
     parser.add_argument("--update-after", type=int, default=2000)
-    parser.add_argument("--update-every", type=int, default=500)
-    parser.add_argument("--batch-size", type=int, default=2048)
+    parser.add_argument("--update-every", type=int, default=1)
+    parser.add_argument("--batch-size", type=int, default=512)
     parser.add_argument("--replay-size", type=int, default=300_000)
     parser.add_argument("--expl-noise", type=float, default=DEFAULT_EXPL_NOISE)
     parser.add_argument("--save-every", type=int, default=10_000)
@@ -1805,14 +1805,14 @@ def main():
         if done:
             obs, _ = env.reset()
         
+        
         # Update
-        if t >= args.update_after and replay.count >= args.batch_size:
+        if t >= args.update_after and t % args.update_every == 0 and replay.count >= args.batch_size:
             # Anneal beta for importance sampling
             beta = PER_BETA_START + (PER_BETA_END - PER_BETA_START) * (t / args.total_steps)
             
-            for _ in range(args.update_every):
-                critic_loss, actor_loss, rnd_loss = agent.update(replay, args.batch_size, beta)
-        
+            critic_loss, actor_loss, rnd_loss = agent.update(replay, args.batch_size, beta)
+                
         # Save
         if t - last_save >= args.save_every:
             last_save = t
