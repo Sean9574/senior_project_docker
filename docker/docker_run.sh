@@ -33,6 +33,7 @@ docker run -it --rm \
     --name $CONTAINER_NAME \
     -p 8100:8100 \
     -p 8101:8101 \
+    -p 8765:8765 \
     -e DISPLAY=$DISPLAY \
     -v /tmp/.X11-unix:/tmp/.X11-unix \
     $IMAGE_NAME \
