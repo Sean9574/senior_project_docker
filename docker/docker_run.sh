@@ -3,29 +3,26 @@
 IMAGE_NAME="senior_project:humble"
 CONTAINER_NAME="senior_project"
 
-# Change to the directory where this script is located
 cd "$(dirname "$0")"
 
-# Check if Dockerfile exists
 if [ ! -f "Dockerfile" ]; then
     echo "ERROR: Dockerfile not found in $(pwd)"
     exit 1
 fi
 
-# Build from parent directory (ament_ws) but use Dockerfile in docker/
-echo "Building Docker image..."
-docker build -t $IMAGE_NAME -f Dockerfile ..
+# Extract HF token from env file
+HF_TOKEN=$(grep -E "^(HUGGINGFACE_HUB_TOKEN|HF_TOKEN)=" "$HOME/.hf.env" 2>/dev/null | head -1 | cut -d'=' -f2)
 
-# Check if build succeeded
+echo "Building Docker image..."
+docker build --build-arg HF_TOKEN="$HF_TOKEN" -t $IMAGE_NAME -f Dockerfile ..
+
 if [ $? -ne 0 ]; then
     echo "ERROR: Docker build failed"
     exit 1
 fi
 
-# Remove existing container with same name if it exists
 docker rm -f $CONTAINER_NAME 2>/dev/null
 
-# Run the container
 echo "Starting container..."
 docker run -it --rm \
     --gpus all \
@@ -35,6 +32,7 @@ docker run -it --rm \
     -p 8101:8101 \
     -p 8765:8765 \
     -e DISPLAY=$DISPLAY \
+    -e ROS_DOMAIN_ID=10 \
     -v /tmp/.X11-unix:/tmp/.X11-unix \
     $IMAGE_NAME \
     bash
