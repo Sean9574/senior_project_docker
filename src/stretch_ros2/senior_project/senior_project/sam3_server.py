@@ -95,22 +95,18 @@ async def lifespan(app: FastAPI):
         # Set it in the environment for huggingface_hub to use
         os.environ["HUGGINGFACE_HUB_TOKEN"] = tok
     
-    try:
-        # Try with token parameter first (newer versions)
-        if tok:
-            try:
-                model = build_sam3_image_model(token=tok)
-                print("✓ Loaded model using token parameter")
-            except TypeError:
-                # If token parameter not supported, fall back to environment variable
-                print("✓ Token parameter not supported, using environment variable")
-                model = build_sam3_image_model()
-        else:
-            model = build_sam3_image_model()
-            print("✓ Loaded model without token")
-    except Exception as e:
-        print(f"✗ Error loading model: {e}")
-        raise
+   
+   
+    # Token is provided via env; sam3 versions vary and many do NOT accept token=...
+    tok = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_HUB_TOKEN")
+    if tok:
+        print(f"✓ Found HuggingFace token (length: {len(tok)})")
+        os.environ["HUGGINGFACE_HUB_TOKEN"] = tok
+        os.environ["HF_TOKEN"] = tok  # extra compatibility
+
+    model = build_sam3_image_model()
+    print("✓ Loaded model")
+
     
     if torch.cuda.is_available():
         model = model.cuda().eval()
