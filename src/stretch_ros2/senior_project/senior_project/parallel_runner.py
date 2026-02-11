@@ -111,7 +111,7 @@ class ParallelRunner:
             f"ckpt_dir:={ckpt_dir}",
             f"headless:={str(self.headless).lower()}",
             # CRITICAL FIX: Tell child simulations NOT to start their own SAM3 server
-            "start_sam3_server:=false",
+            "start_sam3_server:=true",
             # Point to the shared SAM3 server (domain agnostic, uses HTTP)
             f"sam3_server_port:=8100",  # Shared server is on port 8100
             f"sam3_server_host:=localhost",
