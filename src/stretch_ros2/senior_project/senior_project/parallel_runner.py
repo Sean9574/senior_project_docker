@@ -147,8 +147,8 @@ class ParallelRunner:
         os.makedirs(log_dir, exist_ok=True)
 
         # Open log files
-        stdout_log = open(os.path.join(log_dir, "stdout.log"), "w")
-        stderr_log = open(os.path.join(log_dir, "stderr.log"), "w")
+        stdout_log = None
+        stderr_log = None
 
         print(
             f"[Runner] Starting sim {sim_id} "
