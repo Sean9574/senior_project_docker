@@ -284,7 +284,7 @@ def _configure_launch(context):
             "camera_info_topic": LaunchConfiguration("camera_info_topic"),
         }],
     )
-    actions.append(TimerAction(period=25.0, actions=[sam3_goal_node]))
+    actions.append(TimerAction(period=35.0, actions=[sam3_goal_node]))
 
     # ===================== HELP =====================
 

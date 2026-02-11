@@ -259,6 +259,9 @@ RUN pip3 install --no-cache-dir \
     pyquaternion \
     requests
 
+ARG HF_TOKEN
+ENV HUGGINGFACE_HUB_TOKEN=${HF_TOKEN}
+RUN python3 -c "from sam3.model_builder import build_sam3_image_model; build_sam3_image_model()" || echo "SAM3 model download failed - will retry at runtime"
 
 RUN pip3 install --no-deps \
     hello-robot-stretch-body \

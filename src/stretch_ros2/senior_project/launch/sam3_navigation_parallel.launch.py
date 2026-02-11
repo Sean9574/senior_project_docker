@@ -61,7 +61,7 @@ def generate_launch_description():
     # Simulation / training configuration
     # ─────────────────────────────────────────────────────────────────────────
     ld.add_action(DeclareLaunchArgument(
-        "num_sims", default_value="1",
+        "num_sims", default_value="3",
         description="Number of parallel simulations"
     ))
     ld.add_action(DeclareLaunchArgument(

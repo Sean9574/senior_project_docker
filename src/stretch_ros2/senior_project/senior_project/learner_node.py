@@ -64,7 +64,7 @@ W_MAX = 7.0
 V_MIN_REVERSE = -0.05
 
 # --- Collision/Safety --- UPDATED VALUES
-COLLISION_DIST = 0.25  # Reduced from 0.40 - closer threshold with smart avoidance
+COLLISION_DIST = 0.10 # Reduced from 0.40 - closer threshold with smart avoidance
 SAFE_DIST = 0.80
 
 # --- Goal Seeking Rewards (when goal is set) ---
@@ -934,7 +934,7 @@ class StretchExploreEnv(gym.Env):
         min_lidar = self._min_lidar()
         obstacle_angle = self._get_obstacle_angle()
         
-        if min_lidar < COLLISION_DIST:
+        if min_lidar < COLLISION_DIST and self.step_count > 10:
             # Calculate danger factor (0 = at safe distance, 1 = at collision)
             danger_factor = 1.0 - (min_lidar / COLLISION_DIST)
             
@@ -1079,7 +1079,7 @@ class StretchExploreEnv(gym.Env):
         
         # Collision
         min_lidar = self._min_lidar()
-        if min_lidar < COLLISION_DIST:
+        if min_lidar < COLLISION_DIST and self.step_count > 10:
             terminated = True
             collision = True
             r_collision = R_COLLISION_EXPLORE
@@ -1129,7 +1129,7 @@ class StretchExploreEnv(gym.Env):
             r_goal = R_GOAL
         
         r_collision = 0.0
-        if min_lidar < COLLISION_DIST:
+        if min_lidar < COLLISION_DIST and self.step_count > 10:
             terminated = True
             collision = True
             r_collision = R_COLLISION
