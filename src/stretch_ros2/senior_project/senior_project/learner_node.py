@@ -1812,6 +1812,7 @@ def main():
             beta = PER_BETA_START + (PER_BETA_END - PER_BETA_START) * (t / args.total_steps)
             
             critic_loss, actor_loss, rnd_loss = agent.update(replay, args.batch_size, beta)
+        
                 
         # Save
         if t - last_save >= args.save_every:

@@ -15,7 +15,6 @@ Usage:
 
 import os
 
-from launch import LaunchDescription
 from launch.actions import (
     DeclareLaunchArgument,
     ExecuteProcess,
@@ -24,6 +23,8 @@ from launch.actions import (
     TimerAction,
 )
 from launch.substitutions import LaunchConfiguration
+
+from launch import LaunchDescription
 
 
 def generate_launch_description():
@@ -61,7 +62,7 @@ def generate_launch_description():
     # Simulation / training configuration
     # ─────────────────────────────────────────────────────────────────────────
     ld.add_action(DeclareLaunchArgument(
-        "num_sims", default_value="3",
+        "num_sims", default_value="1",
         description="Number of parallel simulations"
     ))
     ld.add_action(DeclareLaunchArgument(
