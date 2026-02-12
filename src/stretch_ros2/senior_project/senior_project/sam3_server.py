@@ -104,7 +104,7 @@ async def lifespan(app: FastAPI):
         os.environ["HUGGINGFACE_HUB_TOKEN"] = tok
         os.environ["HF_TOKEN"] = tok  # extra compatibility
 
-    model = build_sam3_image_model(checkpoint_path="/home/stretch/.cache/huggingface/hub/<PATH_TO_SAM3_CKPT_FILE>")
+    model = build_sam3_image_model()
     print("✓ Loaded model")
 
     

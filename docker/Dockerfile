@@ -260,13 +260,20 @@ RUN pip3 install --no-cache-dir \
     requests
 
 # Pre-download SAM3 model as stretch user (so cache is in right place)
+# Pre-download SAM3 model weights only (no GPU needed)
 ARG HF_TOKEN=""
 ENV HF_HOME=/home/stretch/.cache/huggingface
 RUN mkdir -p /home/stretch/.cache/huggingface && \
     chown -R stretch:stretch /home/stretch/.cache
 
 USER stretch
-RUN HUGGINGFACE_HUB_TOKEN=$HF_TOKEN python3 -c "from sam3.model_builder import build_sam3_image_model; build_sam3_image_model()"
+RUN HUGGINGFACE_HUB_TOKEN=$HF_TOKEN python3 -c "\
+from huggingface_hub import hf_hub_download; \
+import os; \
+os.makedirs('/home/stretch/.cache/huggingface', exist_ok=True); \
+path = hf_hub_download(repo_id='facebook/sam3', filename='sam3.pt'); \
+print(f'Downloaded SAM3 to: {path}')"
+
 USER root
 
 
