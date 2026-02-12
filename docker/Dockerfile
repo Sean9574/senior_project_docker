@@ -1,6 +1,7 @@
 # =============================================================================
 # Stretch 2 RL Training Docker Container
 # ROS2 Humble + MuJoCo (headless) + PyTorch CUDA + RViz
+# PERFORMANCE OPTIMIZED VERSION
 # =============================================================================
 
 FROM nvidia/cuda:12.1.1-cudnn8-devel-ubuntu22.04
@@ -60,7 +61,7 @@ RUN rosdep init || true
 RUN rosdep update --rosdistro humble
 
 # =============================================================================
-# ROS2 Additional Packages
+# ROS2 Additional Packages + Cyclone DDS (PERFORMANCE FIX)
 # =============================================================================
 
 RUN apt-get update && apt-get install -y \
@@ -87,6 +88,7 @@ RUN apt-get update && apt-get install -y \
     ros-humble-sensor-msgs-py \
     ros-humble-rosbag2 \
     ros-humble-rosbridge-suite \
+    ros-humble-rmw-cyclonedds-cpp \
     && rm -rf /var/lib/apt/lists/*
 
 # =============================================================================
@@ -339,7 +341,7 @@ RUN find $AMENT_WS/src -name "setup.py" | xargs -I {} sh -c \
 
 # Build workspace
 RUN /bin/bash -c "source /opt/ros/humble/setup.bash && \
-    export RMW_IMPLEMENTATION=rmw_fastrtps_cpp && \
+    export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp && \
     colcon build --symlink-install --cmake-args -DCMAKE_BUILD_TYPE=Release \
     --packages-skip "
 
@@ -349,16 +351,19 @@ RUN mkdir -p $AMENT_WS/install/stretch_description/share/stretch_description/urd
        $AMENT_WS/install/stretch_description/share/stretch_description/urdf/stretch.urdf || true
 
 # =============================================================================
-# Environment Setup
+# Environment Setup - PERFORMANCE OPTIMIZED
 # =============================================================================
 
 RUN echo "source /opt/ros/humble/setup.bash" >> /home/$USERNAME/.bashrc
 RUN echo "source $AMENT_WS/install/setup.bash 2>/dev/null || true" >> /home/$USERNAME/.bashrc
 RUN echo "export ROS_DOMAIN_ID=0" >> /home/$USERNAME/.bashrc
-RUN echo "export RMW_IMPLEMENTATION=rmw_fastrtps_cpp" >> /home/$USERNAME/.bashrc
+# USE CYCLONE DDS FOR BETTER DOCKER PERFORMANCE
+RUN echo "export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp" >> /home/$USERNAME/.bashrc
 RUN echo "export MUJOCO_GL=egl" >> /home/$USERNAME/.bashrc
 RUN echo "export PATH=/usr/local/cuda/bin:\$PATH" >> /home/$USERNAME/.bashrc
 RUN echo "export LD_LIBRARY_PATH=/usr/local/cuda/lib64:\$LD_LIBRARY_PATH" >> /home/$USERNAME/.bashrc
+# CUDNN BENCHMARK MODE FOR FASTER REPEATED OPERATIONS
+RUN echo "export CUDNN_BENCHMARK=1" >> /home/$USERNAME/.bashrc
 
 # =============================================================================
 # Create directories for checkpoints and data

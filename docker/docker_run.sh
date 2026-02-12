@@ -1,5 +1,7 @@
 #!/bin/bash
-# Improved docker_run.sh with performance optimizations for ROS2/MuJoCo
+# =============================================================================
+# PERFORMANCE OPTIMIZED docker_run.sh
+# =============================================================================
 
 IMAGE_NAME="senior_project:humble"
 CONTAINER_NAME="senior_project"
@@ -24,7 +26,10 @@ fi
 
 docker rm -f $CONTAINER_NAME 2>/dev/null
 
-echo "Starting container with performance optimizations..."
+echo ""
+echo "=== Starting container with performance optimizations ==="
+echo ""
+
 docker run -it --rm \
   --gpus all \
   --pid=host \
@@ -39,12 +44,11 @@ docker run -it --rm \
   --name $CONTAINER_NAME \
   -e DISPLAY=$DISPLAY \
   -e ROS_DOMAIN_ID=10 \
-  -e RMW_IMPLEMENTATION=rmw_fastrtps_cpp \
+  -e RMW_IMPLEMENTATION=rmw_cyclonedds_cpp \
   -e NVIDIA_DRIVER_CAPABILITIES=all \
   -e CUDA_CACHE_DISABLE=0 \
   -e CUDA_CACHE_MAXSIZE=2147483648 \
-  -e MALLOC_TRIM_THRESHOLD_=131072 \
-  -e MALLOC_MMAP_THRESHOLD_=131072 \
+  -e CUDNN_BENCHMARK=1 \
   -v /tmp/.X11-unix:/tmp/.X11-unix \
   -v /dev/dri:/dev/dri \
   $IMAGE_NAME bash
