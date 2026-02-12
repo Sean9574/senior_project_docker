@@ -25,14 +25,14 @@ docker rm -f $CONTAINER_NAME 2>/dev/null
 
 echo "Starting container..."
 docker run -it --rm \
-    --gpus all \
-    --env-file "$HOME/.hf.env" \
-    --name $CONTAINER_NAME \
-    -p 8100:8100 \
-    -p 8101:8101 \
-    -p 8765:8765 \
-    -e DISPLAY=$DISPLAY \
-    -e ROS_DOMAIN_ID=10 \
-    -v /tmp/.X11-unix:/tmp/.X11-unix \
-    $IMAGE_NAME \
-    bash
+  --gpus all \
+  --ipc=host \
+  --shm-size=4g \
+  --network host \
+  --env-file "$HOME/.hf.env" \
+  --name $CONTAINER_NAME \
+  -e DISPLAY=$DISPLAY \
+  -e ROS_DOMAIN_ID=10 \
+  -e RMW_IMPLEMENTATION=rmw_fastrtps_cpp \
+  -v /tmp/.X11-unix:/tmp/.X11-unix \
+  $IMAGE_NAME bash
