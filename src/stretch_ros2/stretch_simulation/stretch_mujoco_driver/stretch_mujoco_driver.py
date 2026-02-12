@@ -130,7 +130,7 @@ class StretchMujocoDriver(Node):
             model=model,
             camera_hz=10,
             cameras_to_use=(
-                StretchCameras.all() if use_cameras else StretchCameras.none()
+                [StretchCameras.cam_d435i_rgb,StretchCameras.cam_d435i_depth] if use_cameras else StretchCameras.none()
             ),
         )
 
