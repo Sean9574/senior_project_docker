@@ -214,6 +214,11 @@ USER $USERNAME
 WORKDIR $AMENT_WS/src
 
 RUN git clone https://github.com/hello-robot/stretch_mujoco.git
+
+# PERFORMANCE PATCH: Reduce camera resolution for Docker (424x240 -> 212x120)
+RUN sed -i 's/width=424/width=212/g; s/height=240/height=120/g' \
+    $AMENT_WS/src/stretch_mujoco/stretch_mujoco/enums/stretch_cameras.py
+
 RUN git clone https://github.com/hello-robot/stretch_urdf.git
 
 ARG CACHEBUST=1

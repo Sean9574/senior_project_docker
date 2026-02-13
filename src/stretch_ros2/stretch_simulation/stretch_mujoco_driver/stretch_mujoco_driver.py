@@ -128,7 +128,7 @@ class StretchMujocoDriver(Node):
 
         sim = StretchMujocoSimulator(
             model=model,
-            camera_hz=10,
+            camera_hz=2,
             cameras_to_use=(
                 [StretchCameras.cam_d435i_rgb,StretchCameras.cam_d435i_depth] if use_cameras else StretchCameras.none()
             ),
