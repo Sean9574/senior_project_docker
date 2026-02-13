@@ -728,28 +728,31 @@ class StretchMujocoDriver(Node):
             ros_image_compressed.header.frame_id = get_camera_frame(camera)
             self.camera_compressed_publishers[camera.name].publish(ros_image_compressed)
 
+            # Disabeled for performace 
+
             if camera.is_depth:
-                if camera == StretchCameras.cam_d405_depth:
-                    pointcloud_msg = create_pointcloud_rgb_msg(
-                        camera_info_msg=camera_info,
-                        rgb_image=camera_data.get_camera_data(
-                            StretchCameras.cam_d405_rgb
-                        ),
-                        depth_image=frame,
-                    )
-                elif camera == StretchCameras.cam_d435i_depth:
-                    pointcloud_msg = create_pointcloud_rgb_msg(
-                        camera_info_msg=camera_info,
-                        rgb_image=camera_data.get_camera_data(
-                            StretchCameras.cam_d435i_rgb, auto_rotate=False
-                        ),
-                        depth_image=camera_data.get_camera_data(
-                            StretchCameras.cam_d435i_depth, auto_rotate=False
-                        ),
-                    )
-                else:
-                    pointcloud_msg = create_pointcloud_msg(camera_info, frame)
-                self.pointcloud_publishers[camera.name].publish(pointcloud_msg)
+                 pass
+            #     if camera == StretchCameras.cam_d405_depth:
+            #         pointcloud_msg = create_pointcloud_rgb_msg(
+            #             camera_info_msg=camera_info,
+            #             rgb_image=camera_data.get_camera_data(
+            #                 StretchCameras.cam_d405_rgb
+            #             ),
+            #             depth_image=frame,
+            #         )
+            #     elif camera == StretchCameras.cam_d435i_depth:
+            #         pointcloud_msg = create_pointcloud_rgb_msg(
+            #             camera_info_msg=camera_info,
+            #             rgb_image=camera_data.get_camera_data(
+            #                 StretchCameras.cam_d435i_rgb, auto_rotate=False
+            #             ),
+            #             depth_image=camera_data.get_camera_data(
+            #                 StretchCameras.cam_d435i_depth, auto_rotate=False
+            #             ),
+            #         )
+            #     else:
+            #         pointcloud_msg = create_pointcloud_msg(camera_info, frame)
+            #     self.pointcloud_publishers[camera.name].publish(pointcloud_msg)
 
     # CHANGE MODES ################
     def change_mode(self, new_mode, code_to_run=None):
