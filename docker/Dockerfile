@@ -339,11 +339,10 @@ RUN find $AMENT_WS/src -name "setup.py" | xargs -I {} sh -c \
     'sed -i "s/with open.*README.md.*as fh:/long_description = \"\"/g; s/long_description = fh.read()//g" {}'
 
 
-# Build workspace
+# Build workspace with FastRTPS (default) so realsense compiles
+# We switch to Cyclone DDS at RUNTIME in entrypoint.sh for better Docker performance
 RUN /bin/bash -c "source /opt/ros/humble/setup.bash && \
-    export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp && \
-    colcon build --symlink-install --cmake-args -DCMAKE_BUILD_TYPE=Release \
-    --packages-skip "
+    colcon build --symlink-install --cmake-args -DCMAKE_BUILD_TYPE=Release"
 
 # Copy URDF file to expected location
 RUN mkdir -p $AMENT_WS/install/stretch_description/share/stretch_description/urdf && \

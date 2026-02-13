@@ -1,7 +1,4 @@
 #!/bin/bash
-# =============================================================================
-# PERFORMANCE OPTIMIZED docker_run.sh
-# =============================================================================
 
 IMAGE_NAME="senior_project:humble"
 CONTAINER_NAME="senior_project"

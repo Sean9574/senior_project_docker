@@ -3,10 +3,18 @@ set -e
 
 # =============================================================================
 # PERFORMANCE OPTIMIZED Entrypoint for ROS2 in Docker
+# 
+# Default: Cyclone DDS (better Docker performance)
+# For real robot: set USE_FASTRTPS=1 before running container
 # =============================================================================
 
-# Create optimized Cyclone DDS config
-cat > /tmp/cyclonedds.xml << 'CYCLONE_EOF'
+# Check if user wants FastRTPS (for real robot compatibility)
+if [ "$USE_FASTRTPS" = "1" ]; then
+    echo "=== Using FastRTPS (real robot mode) ==="
+    export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+else
+    # Create optimized Cyclone DDS config
+    cat > /tmp/cyclonedds.xml << 'CYCLONE_EOF'
 <?xml version="1.0" encoding="UTF-8"?>
 <CycloneDDS xmlns="https://cdds.io/config" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
     xsi:schemaLocation="https://cdds.io/config https://raw.githubusercontent.com/eclipse-cyclonedds/cyclonedds/master/etc/cyclonedds.xsd">
@@ -31,9 +39,11 @@ cat > /tmp/cyclonedds.xml << 'CYCLONE_EOF'
 </CycloneDDS>
 CYCLONE_EOF
 
-# Set Cyclone DDS as the RMW implementation (faster in Docker than FastRTPS)
-export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
-export CYCLONEDDS_URI=file:///tmp/cyclonedds.xml
+    # Set Cyclone DDS as the RMW implementation (faster in Docker than FastRTPS)
+    export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
+    export CYCLONEDDS_URI=file:///tmp/cyclonedds.xml
+    echo "=== Using Cyclone DDS (simulation mode) ==="
+fi
 
 # Enable cuDNN benchmark mode for faster repeated operations
 export CUDNN_BENCHMARK=1
@@ -54,11 +64,10 @@ fi
 ros2 daemon start 2>/dev/null || true
 
 # Print diagnostic info on startup
-echo "=== Docker Performance Optimized ==="
+echo "===================================="
 echo "RMW: $RMW_IMPLEMENTATION"
-echo "Cyclone DDS config: $CYCLONEDDS_URI"
-echo "CUDNN_BENCHMARK: $CUDNN_BENCHMARK"
 echo "MUJOCO_GL: $MUJOCO_GL"
+echo "CUDNN_BENCHMARK: $CUDNN_BENCHMARK"
 echo "===================================="
 
 # Execute the command passed to docker run
