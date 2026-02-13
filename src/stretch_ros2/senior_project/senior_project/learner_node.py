@@ -115,7 +115,7 @@ DEBUG_EVERY_N = 50
 
 # --- Visualization ---
 PUBLISH_MAP = True
-PUBLISH_MAP_EVERY_N = 50
+PUBLISH_MAP_EVERY_N = 100
 PUBLISH_PATH = True
 PATH_HISTORY_LENGTH = 1000
 MAP_FRAME = "odom"
@@ -968,10 +968,11 @@ class StretchExploreEnv(gym.Env):
         self.ros.send_cmd(v_cmd, w_cmd)
         
         # Wait for control period
-        t_end = time.time() + self.control_dt
-        while time.time() < t_end:
-            rclpy.spin_once(self.ros, timeout_sec=0.01)
-        
+        self.rate = self.ros.create_rate(1.0 / self.control_dt)
+        # In step:
+        self.ros.send_cmd(v_cmd, w_cmd)
+        self.rate.sleep()
+                
         # Update occupancy grid
         st = self._get_robot_state()
         scan = self.ros.last_scan
@@ -1700,7 +1701,7 @@ def main():
         goal_topic=args.goal_topic,
         cmd_topic=args.cmd_topic,
     )
-    executor = SingleThreadedExecutor()
+    executor = SingleThreadedExecutor(num_threads=1)
     executor.add_node(ros)
     
     # Setup device
