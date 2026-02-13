@@ -13,6 +13,7 @@ depth estimation methods:
 import os
 
 from ament_index_python.packages import get_package_share_directory
+from launch import LaunchDescription
 from launch.actions import (
     DeclareLaunchArgument,
     ExecuteProcess,
@@ -24,7 +25,6 @@ from launch.actions import (
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
-from launch import LaunchDescription
 
 
 def generate_launch_description():
@@ -102,6 +102,11 @@ def generate_launch_description():
     ld.add_action(DeclareLaunchArgument("use_rviz", default_value="true"))
     ld.add_action(DeclareLaunchArgument("use_mujoco_viewer", default_value="false"))
     ld.add_action(DeclareLaunchArgument("use_cameras", default_value="true"))
+    ld.add_action(DeclareLaunchArgument(
+    "mujoco_xml",
+    default_value="/home/stretch/ament_ws/src/stretch_ros2/senior_project/map/map.xml",
+    description="Path to MuJoCo MJCF/XML scene"
+))
     ld.add_action(DeclareLaunchArgument("use_reward_monitor", default_value="false"))
     ld.add_action(DeclareLaunchArgument("total_steps", default_value="200000"))
     ld.add_action(DeclareLaunchArgument("rollout_steps", default_value="2048"))
@@ -124,7 +129,7 @@ def generate_launch_description():
 
     # Configure at runtime
     ld.add_action(OpaqueFunction(function=_configure_launch))
-    
+
     
     
     
@@ -252,6 +257,7 @@ def _configure_launch(context):
             "use_rviz": LaunchConfiguration("use_rviz"),
             "use_mujoco_viewer": LaunchConfiguration("use_mujoco_viewer"),
             "use_cameras": LaunchConfiguration("use_cameras"),
+            "mujoco_xml": LaunchConfiguration("mujoco_xml"),
             "use_reward_monitor": LaunchConfiguration("use_reward_monitor"),
             "total_steps": LaunchConfiguration("total_steps"),
             "rollout_steps": LaunchConfiguration("rollout_steps"),

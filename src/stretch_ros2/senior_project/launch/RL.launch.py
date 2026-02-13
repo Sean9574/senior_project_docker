@@ -44,6 +44,13 @@ def generate_launch_description():
         )
     )
     
+    ld.add_action(
+        DeclareLaunchArgument(
+            "mujoco_xml",
+            default_value="/home/sean/ament_ws/src/stretch_ros2/senior_project/map/map.xml",
+            description="Path to map"
+        )
+    )
     # ---- NEW: Reward Monitor Argument ----
     ld.add_action(
         DeclareLaunchArgument(
@@ -274,13 +281,6 @@ def generate_launch_description():
         )
     )
 
-    ld.add_action(
-        DeclareLaunchArgument(
-            "mujoco_xml",
-            default_value="/home/sean/ament_ws/src/stretch_ros2/senior_project/map/map.xml",
-            description="Path to map"
-        )
-    )
 
 
     # --- START THE PPO LEARNER ---

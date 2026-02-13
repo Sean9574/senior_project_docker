@@ -4,7 +4,7 @@ import array
 import copy
 import threading
 from functools import cache
-
+import os
 import cv2
 import numpy as np
 import rclpy
@@ -73,10 +73,9 @@ DEFAULT_SIM_TOOL = "eoa_wrist_dw3_tool_sg3"
 
 
 class StretchMujocoDriver(Node):
-
     def __init__(self):
-
         super().__init__("stretch_mujoco_driver")
+
         self.declare_parameter("use_cameras", False)
         self.declare_parameter("use_mujoco_viewer", True)
         self.declare_parameter("use_robocasa", True)
@@ -84,11 +83,26 @@ class StretchMujocoDriver(Node):
         self.declare_parameter("robocasa_layout", None)
         self.declare_parameter("robocasa_style", None)
 
+        # Declare ONCE
+        self.declare_parameter("mujoco_xml", "")
+
         use_cameras = self.get_parameter("use_cameras").value
         use_mujoco_viewer = self.get_parameter("use_mujoco_viewer").value
 
-        model = None
+        # Read ONCE (safe)
+        self._mujoco_xml = (self.get_parameter("mujoco_xml").value or "").strip()
 
+        if self._mujoco_xml and not os.path.isfile(self._mujoco_xml):
+            self.get_logger().error(f"[mujoco_xml] File not found: {self._mujoco_xml}")
+            self._mujoco_xml = ""
+
+        if self._mujoco_xml:
+            self.get_logger().info(f"[mujoco_xml] Using custom MJCF/XML: {self._mujoco_xml}")
+        else:
+            self.get_logger().info("[mujoco_xml] Not set; using default world/layout")
+
+        model = None
+        
         use_robocasa = self.get_parameter("use_robocasa").value
         # Handle string "true"/"false" from launch file
         if isinstance(use_robocasa, str):
