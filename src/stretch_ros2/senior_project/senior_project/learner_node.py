@@ -111,7 +111,7 @@ DEFAULT_START_STEPS = 10000
 DEFAULT_EXPL_NOISE = 0.3
 
 # --- Debug ---
-DEBUG_EVERY_N = 50
+DEBUG_EVERY_N = 100
 
 # --- Visualization ---
 PUBLISH_MAP = True
@@ -968,11 +968,10 @@ class StretchExploreEnv(gym.Env):
         self.ros.send_cmd(v_cmd, w_cmd)
         
         # Wait for control period
-        self.rate = self.ros.create_rate(1.0 / self.control_dt)
-        # In step:
-        self.ros.send_cmd(v_cmd, w_cmd)
-        self.rate.sleep()
-                
+        t_end = time.time() + self.control_dt
+        while time.time() < t_end:
+            rclpy.spin_once(self.ros, timeout_sec=0.01)
+        
         # Update occupancy grid
         st = self._get_robot_state()
         scan = self.ros.last_scan
@@ -1701,7 +1700,7 @@ def main():
         goal_topic=args.goal_topic,
         cmd_topic=args.cmd_topic,
     )
-    executor = SingleThreadedExecutor(num_threads=1)
+    executor = SingleThreadedExecutor()
     executor.add_node(ros)
     
     # Setup device

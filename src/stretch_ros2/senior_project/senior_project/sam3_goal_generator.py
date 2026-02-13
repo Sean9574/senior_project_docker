@@ -47,7 +47,7 @@ from visualization_msgs.msg import Marker
 # =============================================================================
 # EDIT THIS DEFAULT (no terminal args needed)
 # =============================================================================
-DEFAULT_SHOW_GUI = False         # <--- set True/False here
+DEFAULT_SHOW_GUI = False          # <--- set True/False here
 DEFAULT_GUI_SCALE = 1.0          # e.g. 0.75 smaller
 DEFAULT_GUI_FPS_OVERLAY = True   # show FPS overlay text
 DEFAULT_GUI_SAVE_DIR = "/tmp"    # screenshots go here
@@ -424,7 +424,7 @@ class SAM3GoalGeneratorV2(Node):
             r = self.session.get(f"{self.mono_depth_url}/health", timeout=2)
             self.mono_depth_available = (r.status_code == 200)
             if self.mono_depth_available:
-                self.get_logger().info('✓ Monocular depth server available')
+                self.get_logger().info('âœ“ Monocular depth server available')
         except Exception:
             self.mono_depth_available = False
             self.get_logger().warn('Monocular depth server not available')
@@ -476,8 +476,7 @@ class SAM3GoalGeneratorV2(Node):
 
     def rgb_callback(self, msg: Image):
         with self.lock:
-            img = self.bridge.imgmsg_to_cv2(msg, 'bgr8')
-            self.latest_rgb = cv2.rotate(img, cv2.ROTATE_90_CLOCKWISE)
+            self.latest_rgb = self.bridge.imgmsg_to_cv2(msg, 'bgr8')
 
     def depth_callback(self, msg: Image):
         with self.lock:
@@ -814,10 +813,9 @@ class SAM3GoalGeneratorV2(Node):
         if self.depth_camera_available and (current_time - self._last_depth_msg_time) > self.depth_stale_sec:
             self.depth_camera_available = False
 
-        # Skip if previous request still running
+        # Skip if previous request still running - CHECK FIRST before expensive operations
         if self._sam3_busy:
             return
-
 
         if current_time - self.last_depth_check > self.depth_check_interval:
             self.check_mono_depth_server()
@@ -829,11 +827,9 @@ class SAM3GoalGeneratorV2(Node):
             rgb = self.latest_rgb.copy()
             depth = self.latest_depth.copy() if self.latest_depth is not None else None
 
+        # Only encode after we know we're not busy (saves CPU when SAM3 is processing)
         _, buf = cv2.imencode('.jpg', rgb, [cv2.IMWRITE_JPEG_QUALITY, 70])
         img_b64 = base64.b64encode(buf).decode()
-
-
-        
 
         def run_sam3():
             self._sam3_busy = True
@@ -974,6 +970,9 @@ class SAM3GoalGeneratorV2(Node):
     def _update_gui(self, viz_bgr: np.ndarray):
         if not self.gui_ready or viz_bgr is None:
             return
+
+        # Rotate 90 degrees clockwise to correct camera orientation
+        viz_bgr = cv2.rotate(viz_bgr, cv2.ROTATE_90_CLOCKWISE)
 
         now = time.time()
         dt = max(now - self._last_gui_time, 1e-6)
