@@ -249,6 +249,7 @@ def generate_launch_description():
             "mode": LaunchConfiguration("mode"),
             "use_mujoco_viewer": LaunchConfiguration("use_mujoco_viewer"),
             "use_cameras": LaunchConfiguration("use_cameras"),
+            "model_path": LaunchConfiguration("mujoco_xml"),
 
             # Robocasa off
             "use_robocasa": False,
@@ -272,6 +273,15 @@ def generate_launch_description():
             parameters=driver_params,
         )
     )
+
+    ld.add_action(
+        DeclareLaunchArgument(
+            "mujoco_xml",
+            default_value="/home/sean/ament_ws/src/stretch_ros2/senior_project/map/map.xml",
+            description="Path to map"
+        )
+    )
+
 
     # --- START THE PPO LEARNER ---
     learner_proc = ExecuteProcess(
