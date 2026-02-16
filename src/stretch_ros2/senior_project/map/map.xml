@@ -1,5 +1,5 @@
 <mujoco model="explore_arena">
-  <include file="/home/sean/ament_ws/src/stretch_mujoco/stretch_mujoco/models/stretch.xml"/>
+  <include file="/home/stretch/ament_ws/src/stretch_mujoco/stretch_mujoco/models/stretch.xml"/>
   
   <statistic center="0 0 .75" extent="1.2" meansize="0.05"/>
   <visual>

@@ -105,8 +105,10 @@ def generate_launch_description():
     
     ld.add_action(DeclareLaunchArgument(
     "mujoco_xml",
-    default_value=os.path.expanduser("~/ament_ws/src/stretch_ros2/senior_project/map/map.xml")
-    )),
+    default_value="",
+    description="Path to custom MuJoCo world XML (empty = use default)"
+    ))
+    
     
     ld.add_action(DeclareLaunchArgument("use_reward_monitor", default_value="false"))
     ld.add_action(DeclareLaunchArgument("total_steps", default_value="200000"))
