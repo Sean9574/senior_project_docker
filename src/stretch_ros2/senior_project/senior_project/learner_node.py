@@ -1,19 +1,25 @@
 #!/usr/bin/env python3
 """
-Stretch Robot RL Environment + Learner (IMPROVED VERSION)
+Stretch Robot RL Environment + Learner with GRADUATED SAFETY SYSTEM
 
-IMPROVEMENTS OVER ORIGINAL:
-1. Prioritized Experience Replay (PER) - focuses learning on important transitions
-2. Random Network Distillation (RND) - learned intrinsic motivation replaces heuristics
-3. Observation normalization - stabilizes training
-4. Reward normalization - handles reward scale mismatch between modes
-5. SMART COLLISION AVOIDANCE - navigates around obstacles instead of stopping (NEW!)
+KEY FEATURES:
+1. Graduated Safety Blender - smooth transition from RL control to safety override
+2. Potential Field Avoidance - continuous repulsive forces from obstacles
+3. Shaped Rewards - RL learns to avoid, not just react
+4. Safety-Aware Training - RL experiences consequences without destruction
 
-Original behaviors preserved:
-- Agent receives ego-centric occupancy grid as part of observation
-- When no goal: rewarded for discovering new areas (now with RND bonus)
-- When goal set: rewarded for reaching goal (progress, alignment)
-- Same network learns both behaviors via "has_goal" flag in observation
+SAFETY ZONES (based on 13" robot width + 2ft desired clearance):
+- FREE:      > 1.5m   - Full RL control
+- AWARE:    1.5-1.0m  - Gentle safety influence (10%)
+- CAUTION:  1.0-0.6m  - Blended control (40% safety)
+- DANGER:   0.6-0.35m - Safety dominant (70%)  
+- EMERGENCY: < 0.35m  - Hard override (100% safety)
+
+The RL agent still learns because:
+1. It experiences the "resistance" from safety as environment dynamics
+2. Shaped rewards penalize getting into danger zones
+3. Near-misses still happen, teaching avoidance
+4. Reward includes penalty for safety intervention amount
 """
 
 import argparse
@@ -25,7 +31,8 @@ import signal
 import sys
 import time
 from collections import deque
-from typing import Dict, Optional, Tuple
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
 
 import gymnasium as gym
 import numpy as np
@@ -35,7 +42,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from geometry_msgs.msg import Point, PointStamped, Twist
 from gymnasium import spaces
-from nav_msgs.msg import MapMetaData, OccupancyGrid, Odometry
+from nav_msgs.msg import OccupancyGrid, Odometry
 from rclpy.executors import SingleThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
@@ -45,29 +52,68 @@ from std_msgs.msg import String as StringMsg
 from visualization_msgs.msg import Marker, MarkerArray
 
 # =============================================================================
-# CONFIG
+# ROBOT PHYSICAL PARAMETERS
 # =============================================================================
 
-CHECKPOINT_FILENAME = "td3_explore_agent_v2.pt"
+ROBOT_WIDTH_M = 0.33  # 13 inches in meters
+ROBOT_HALF_WIDTH_M = 0.165
+DESIRED_CLEARANCE_M = 0.61  # 2 feet in meters
+MIN_SAFE_DISTANCE = ROBOT_HALF_WIDTH_M + DESIRED_CLEARANCE_M  # ~0.77m
+
+# =============================================================================
+# SAFETY ZONE THRESHOLDS (from LIDAR/center of robot)
+# =============================================================================
+
+ZONE_FREE = 1.5         # Full RL control
+ZONE_AWARE = 1.0        # Gentle safety influence begins
+ZONE_CAUTION = 0.6      # Blended control (around 2ft clearance)
+ZONE_DANGER = 0.35      # Safety takes priority
+ZONE_EMERGENCY = 0.20   # Hard override (robot half-width + small buffer)
+
+# Safety blend ratios at each zone boundary
+BLEND_FREE = 0.0        # 0% safety
+BLEND_AWARE = 0.10      # 10% safety
+BLEND_CAUTION = 0.40    # 40% safety  
+BLEND_DANGER = 0.70     # 70% safety
+BLEND_EMERGENCY = 1.0   # 100% safety
+
+# =============================================================================
+# POTENTIAL FIELD PARAMETERS
+# =============================================================================
+
+REPULSIVE_GAIN = 2.0           # Strength of obstacle repulsion
+REPULSIVE_INFLUENCE = 1.5      # Distance at which repulsion starts
+ATTRACTIVE_GAIN = 0.5          # Strength of goal attraction (when goal exists)
+
+# =============================================================================
+# REWARD SHAPING PARAMETERS
+# =============================================================================
+
+# Proximity penalties (graduated)
+R_PROXIMITY_SCALE = -50.0      # Max penalty per step when very close
+R_CLEARANCE_BONUS = 0.5        # Bonus for maintaining good clearance
+R_SAFETY_INTERVENTION = -10.0  # Penalty scaled by how much safety overrode RL
+
+# =============================================================================
+# EXISTING CONFIG (preserved from original)
+# =============================================================================
+
+CHECKPOINT_FILENAME = "td3_safe_rl_agent.pt"
 AUTO_LOAD_CHECKPOINT = True
 
 EPISODE_SECONDS = 60.0
 
-# --- Occupancy Grid ---
+# Occupancy Grid
 GRID_SIZE = 24
 GRID_RESOLUTION = 0.5
 GRID_MAX_RANGE = 12.0
 
-# --- Movement Limits ---
+# Movement Limits
 V_MAX = 1.25
 W_MAX = 7.0
 V_MIN_REVERSE = -0.05
 
-# --- Collision/Safety --- UPDATED VALUES
-COLLISION_DIST = 0.10 # Reduced from 0.40 - closer threshold with smart avoidance
-SAFE_DIST = 0.80
-
-# --- Goal Seeking Rewards (when goal is set) ---
+# Goal Seeking Rewards
 R_GOAL = 2500.0
 R_COLLISION = -2000.0
 R_TIMEOUT = -100.0
@@ -77,21 +123,21 @@ PROGRESS_SCALE = 500.0
 ALIGN_SCALE = 3.0
 STEP_COST = -0.05
 
-# --- Exploration Rewards (when NO goal) ---
+# Exploration Rewards
 R_NEW_CELL = 2.0
 R_NOVELTY_SCALE = 0.5
 R_FRONTIER_BONUS = 5.0
 R_COLLISION_EXPLORE = -500.0
 R_STEP_EXPLORE = -0.02
 
-# --- RND Config ---
+# RND Config
 RND_WEIGHT_INITIAL = 1.0
 RND_WEIGHT_DECAY = 0.99995
 RND_WEIGHT_MIN = 0.1
 RND_FEATURE_DIM = 64
 RND_LR = 1e-4
 
-# --- PER Config ---
+# PER Config
 PER_ALPHA = 0.6
 PER_BETA_START = 0.4
 PER_BETA_END = 1.0
@@ -101,19 +147,22 @@ PER_EPSILON = 1e-6
 VISIT_DECAY = 0.995
 NOVELTY_RADIUS = 1.0
 
-# --- LiDAR ---
+# LiDAR
 LIDAR_FORWARD_OFFSET_RAD = math.pi
 NUM_LIDAR_BINS = 60
 LIDAR_MAX_RANGE = 20.0
 
-# --- Training ---
+# Number of angular sectors for safety analysis
+NUM_SAFETY_SECTORS = 12
+
+# Training
 DEFAULT_START_STEPS = 10000
 DEFAULT_EXPL_NOISE = 0.3
 
-# --- Debug ---
+# Debug
 DEBUG_EVERY_N = 100
 
-# --- Visualization ---
+# Visualization
 PUBLISH_MAP = True
 PUBLISH_MAP_EVERY_N = 100
 PUBLISH_PATH = True
@@ -143,8 +192,315 @@ def set_seed(seed: int):
         torch.cuda.manual_seed_all(seed)
 
 
+def lerp(a: float, b: float, t: float) -> float:
+    """Linear interpolation between a and b by factor t."""
+    return a + (b - a) * np.clip(t, 0.0, 1.0)
+
+
 # =============================================================================
-# Running Mean/Std for Normalization
+# SAFETY SYSTEM: Graduated Safety Blender + Potential Fields
+# =============================================================================
+
+@dataclass
+class SafetyState:
+    """Current safety assessment."""
+    min_distance: float
+    zone: str
+    safety_blend: float  # 0.0 = full RL, 1.0 = full safety
+    repulsive_v: float   # Suggested linear velocity from potential field
+    repulsive_w: float   # Suggested angular velocity from potential field
+    sector_distances: np.ndarray  # Distance to obstacle in each sector
+    danger_direction: float  # Angle to closest obstacle (radians)
+
+
+class GraduatedSafetyBlender:
+    """
+    Blends RL actions with safety actions based on proximity to obstacles.
+    
+    Key features:
+    - Smooth, graduated response (no sudden jumps)
+    - Potential field for natural obstacle avoidance
+    - RL still experiences consequences through blended dynamics
+    - Shaped rewards based on safety state
+    """
+    
+    def __init__(self, num_sectors: int = NUM_SAFETY_SECTORS):
+        self.num_sectors = num_sectors
+        self.sector_angles = np.linspace(-np.pi, np.pi, num_sectors + 1)[:-1]
+        self.sector_width = 2 * np.pi / num_sectors
+        
+        # Logging
+        self.last_safety_state: Optional[SafetyState] = None
+        self.intervention_history = deque(maxlen=100)
+    
+    def analyze_scan(self, scan: LaserScan) -> SafetyState:
+        """
+        Analyze LIDAR scan and return safety state.
+        """
+        if scan is None:
+            return SafetyState(
+                min_distance=LIDAR_MAX_RANGE,
+                zone="FREE",
+                safety_blend=0.0,
+                repulsive_v=0.0,
+                repulsive_w=0.0,
+                sector_distances=np.full(self.num_sectors, LIDAR_MAX_RANGE),
+                danger_direction=0.0
+            )
+        
+        ranges = np.array(scan.ranges, dtype=np.float32)
+        n_rays = len(ranges)
+        
+        if n_rays == 0:
+            return SafetyState(
+                min_distance=LIDAR_MAX_RANGE,
+                zone="FREE",
+                safety_blend=0.0,
+                repulsive_v=0.0,
+                repulsive_w=0.0,
+                sector_distances=np.full(self.num_sectors, LIDAR_MAX_RANGE),
+                danger_direction=0.0
+            )
+        
+        # Clean up invalid readings
+        max_r = min(scan.range_max, LIDAR_MAX_RANGE) if scan.range_max > 0 else LIDAR_MAX_RANGE
+        min_r = max(scan.range_min, 0.01)
+        
+        invalid = np.isnan(ranges) | np.isinf(ranges) | (ranges < min_r) | (ranges > max_r)
+        ranges[invalid] = max_r
+        
+        # Calculate angle for each ray
+        angles = scan.angle_min + np.arange(n_rays) * scan.angle_increment + LIDAR_FORWARD_OFFSET_RAD
+        angles = np.array([wrap_to_pi(a) for a in angles])
+        
+        # Find minimum distance and its direction
+        min_idx = np.argmin(ranges)
+        min_distance = float(ranges[min_idx])
+        danger_direction = float(angles[min_idx])
+        
+        # Compute sector distances (minimum in each sector)
+        sector_distances = np.full(self.num_sectors, max_r, dtype=np.float32)
+        
+        for i in range(n_rays):
+            angle = angles[i]
+            # Find which sector this ray belongs to
+            sector_idx = int((angle + np.pi) / self.sector_width) % self.num_sectors
+            sector_distances[sector_idx] = min(sector_distances[sector_idx], ranges[i])
+        
+        # Determine zone and blend factor
+        zone, safety_blend = self._compute_zone_and_blend(min_distance)
+        
+        # Compute potential field repulsive velocities
+        repulsive_v, repulsive_w = self._compute_repulsive_velocity(
+            ranges, angles, min_distance
+        )
+        
+        state = SafetyState(
+            min_distance=min_distance,
+            zone=zone,
+            safety_blend=safety_blend,
+            repulsive_v=repulsive_v,
+            repulsive_w=repulsive_w,
+            sector_distances=sector_distances,
+            danger_direction=danger_direction
+        )
+        
+        self.last_safety_state = state
+        return state
+    
+    def _compute_zone_and_blend(self, min_distance: float) -> Tuple[str, float]:
+        """
+        Determine safety zone and compute smooth blend factor.
+        Uses linear interpolation within each zone for smooth transitions.
+        """
+        if min_distance >= ZONE_FREE:
+            return "FREE", 0.0
+        
+        elif min_distance >= ZONE_AWARE:
+            # Interpolate between FREE and AWARE
+            t = (ZONE_FREE - min_distance) / (ZONE_FREE - ZONE_AWARE)
+            blend = lerp(BLEND_FREE, BLEND_AWARE, t)
+            return "AWARE", blend
+        
+        elif min_distance >= ZONE_CAUTION:
+            # Interpolate between AWARE and CAUTION
+            t = (ZONE_AWARE - min_distance) / (ZONE_AWARE - ZONE_CAUTION)
+            blend = lerp(BLEND_AWARE, BLEND_CAUTION, t)
+            return "CAUTION", blend
+        
+        elif min_distance >= ZONE_DANGER:
+            # Interpolate between CAUTION and DANGER
+            t = (ZONE_CAUTION - min_distance) / (ZONE_CAUTION - ZONE_DANGER)
+            blend = lerp(BLEND_CAUTION, BLEND_DANGER, t)
+            return "DANGER", blend
+        
+        elif min_distance >= ZONE_EMERGENCY:
+            # Interpolate between DANGER and EMERGENCY
+            t = (ZONE_DANGER - min_distance) / (ZONE_DANGER - ZONE_EMERGENCY)
+            blend = lerp(BLEND_DANGER, BLEND_EMERGENCY, t)
+            return "EMERGENCY", blend
+        
+        else:
+            # Below emergency threshold - full safety
+            return "CRITICAL", 1.0
+    
+    def _compute_repulsive_velocity(
+        self, 
+        ranges: np.ndarray, 
+        angles: np.ndarray,
+        min_distance: float
+    ) -> Tuple[float, float]:
+        """
+        Compute repulsive velocity using potential field approach.
+        Returns (linear_velocity, angular_velocity) that pushes away from obstacles.
+        """
+        # Only compute if within influence range
+        if min_distance >= REPULSIVE_INFLUENCE:
+            return 0.0, 0.0
+        
+        # Accumulate repulsive force from all nearby obstacles
+        force_x = 0.0  # Forward/backward
+        force_y = 0.0  # Left/right
+        
+        for i, (r, angle) in enumerate(zip(ranges, angles)):
+            if r >= REPULSIVE_INFLUENCE:
+                continue
+            
+            # Repulsive magnitude (inverse square, clamped)
+            # Higher when closer
+            magnitude = REPULSIVE_GAIN * (1.0 / r - 1.0 / REPULSIVE_INFLUENCE) ** 2
+            magnitude = min(magnitude, 10.0)  # Clamp to prevent explosion
+            
+            # Direction away from obstacle (in robot frame)
+            # angle=0 means obstacle is ahead
+            force_x += -magnitude * math.cos(angle)  # Push backward if obstacle ahead
+            force_y += -magnitude * math.sin(angle)  # Push away laterally
+        
+        # Convert forces to velocity commands
+        # force_x negative means "go backward", positive means "go forward"
+        # force_y negative means "turn right", positive means "turn left"
+        
+        # Scale to velocity limits
+        repulsive_v = np.clip(force_x * 0.3, -V_MAX * 0.5, V_MAX * 0.3)
+        repulsive_w = np.clip(force_y * 2.0, -W_MAX * 0.7, W_MAX * 0.7)
+        
+        return float(repulsive_v), float(repulsive_w)
+    
+    def blend_action(
+        self, 
+        rl_v: float, 
+        rl_w: float, 
+        safety_state: SafetyState,
+        goal_angle: Optional[float] = None
+    ) -> Tuple[float, float, float]:
+        """
+        Blend RL action with safety action based on current safety state.
+        
+        Returns:
+            (blended_v, blended_w, intervention_amount)
+        
+        intervention_amount: How much safety overrode RL (0-1)
+        """
+        blend = safety_state.safety_blend
+        
+        # If no safety needed, return RL action directly
+        if blend < 0.01:
+            return rl_v, rl_w, 0.0
+        
+        # Compute safety action
+        safety_v = safety_state.repulsive_v
+        safety_w = safety_state.repulsive_w
+        
+        # If we have a goal and we're not in emergency, bias toward goal
+        if goal_angle is not None and safety_state.zone not in ["EMERGENCY", "CRITICAL"]:
+            # Add attractive component toward goal
+            goal_w = ATTRACTIVE_GAIN * math.sin(goal_angle) * W_MAX
+            safety_w = safety_w + goal_w * (1.0 - blend)
+        
+        # In emergency/critical, if RL wants to go forward toward danger, override
+        if safety_state.zone in ["EMERGENCY", "CRITICAL"]:
+            # Check if RL is trying to move toward the obstacle
+            danger_ahead = abs(safety_state.danger_direction) < math.pi / 3
+            
+            if danger_ahead and rl_v > 0:
+                # Force backward motion
+                safety_v = -V_MAX * 0.3
+                blend = 1.0
+            
+            # Turn away from danger
+            if safety_state.danger_direction > 0:
+                safety_w = -W_MAX * 0.5  # Turn right
+            else:
+                safety_w = W_MAX * 0.5   # Turn left
+        
+        # Blend RL and safety actions
+        blended_v = lerp(rl_v, safety_v, blend)
+        blended_w = lerp(rl_w, safety_w, blend)
+        
+        # Apply velocity limits
+        blended_v = np.clip(blended_v, V_MIN_REVERSE, V_MAX)
+        blended_w = np.clip(blended_w, -W_MAX, W_MAX)
+        
+        # Calculate how much we intervened
+        original_magnitude = math.sqrt(rl_v**2 + rl_w**2)
+        diff_magnitude = math.sqrt((rl_v - blended_v)**2 + (rl_w - blended_w)**2)
+        
+        if original_magnitude > 0.01:
+            intervention = diff_magnitude / (original_magnitude + 0.01)
+        else:
+            intervention = blend
+        
+        intervention = np.clip(intervention, 0.0, 1.0)
+        
+        # Track intervention
+        self.intervention_history.append(intervention)
+        
+        return float(blended_v), float(blended_w), float(intervention)
+    
+    def compute_proximity_reward(self, safety_state: SafetyState) -> float:
+        """
+        Compute shaped reward based on proximity to obstacles.
+        This teaches RL to maintain safe distance proactively.
+        """
+        min_dist = safety_state.min_distance
+        
+        # Good clearance bonus
+        if min_dist >= MIN_SAFE_DISTANCE:
+            # Bonus for maintaining desired clearance
+            return R_CLEARANCE_BONUS
+        
+        # Graduated penalty as we get closer
+        # Penalty increases smoothly as distance decreases
+        if min_dist >= ZONE_DANGER:
+            # Mild penalty in aware/caution zones
+            penalty_factor = 1.0 - (min_dist - ZONE_DANGER) / (MIN_SAFE_DISTANCE - ZONE_DANGER)
+            return R_PROXIMITY_SCALE * 0.2 * penalty_factor
+        
+        elif min_dist >= ZONE_EMERGENCY:
+            # Stronger penalty in danger zone
+            penalty_factor = 1.0 - (min_dist - ZONE_EMERGENCY) / (ZONE_DANGER - ZONE_EMERGENCY)
+            return R_PROXIMITY_SCALE * 0.5 * (0.5 + 0.5 * penalty_factor)
+        
+        else:
+            # Maximum penalty in emergency/critical
+            return R_PROXIMITY_SCALE
+    
+    def compute_intervention_penalty(self, intervention_amount: float) -> float:
+        """
+        Penalize RL for requiring safety intervention.
+        This teaches it to avoid situations where safety takes over.
+        """
+        return R_SAFETY_INTERVENTION * intervention_amount
+    
+    def get_average_intervention(self) -> float:
+        """Get recent average intervention rate."""
+        if len(self.intervention_history) == 0:
+            return 0.0
+        return float(np.mean(self.intervention_history))
+
+
+# =============================================================================
+# Running Mean/Std for Normalization (unchanged)
 # =============================================================================
 
 class RunningMeanStd:
@@ -156,7 +512,6 @@ class RunningMeanStd:
         self.count = epsilon
     
     def update(self, x: np.ndarray):
-        """Update statistics with a batch of data."""
         batch_mean = np.mean(x, axis=0)
         batch_var = np.var(x, axis=0)
         batch_count = x.shape[0] if x.ndim > 1 else 1
@@ -183,7 +538,6 @@ class RunningMeanStd:
         self.count = tot_count
     
     def normalize(self, x: np.ndarray) -> np.ndarray:
-        """Normalize input using running statistics."""
         return (x - self.mean) / np.sqrt(self.var + 1e-8)
 
 
@@ -195,7 +549,6 @@ class RewardNormalizer:
         self.clip = clip
     
     def normalize(self, reward: float, update: bool = True) -> float:
-        """Normalize reward and optionally update statistics."""
         if update:
             self.rms.update(np.array([reward]))
         
@@ -205,7 +558,7 @@ class RewardNormalizer:
 
 
 # =============================================================================
-# Random Network Distillation (RND)
+# Random Network Distillation (RND) - unchanged
 # =============================================================================
 
 class RNDModule(nn.Module):
@@ -217,7 +570,6 @@ class RNDModule(nn.Module):
         
         self.device = device or torch.device("cpu")
         
-        # Fixed random target network (NEVER updated)
         self.target = nn.Sequential(
             nn.Linear(obs_dim, hidden),
             nn.ReLU(),
@@ -226,11 +578,9 @@ class RNDModule(nn.Module):
             nn.Linear(hidden, feature_dim)
         ).to(self.device)
         
-        # Freeze target network
         for param in self.target.parameters():
             param.requires_grad = False
         
-        # Predictor network (trained to match target)
         self.predictor = nn.Sequential(
             nn.Linear(obs_dim, hidden),
             nn.ReLU(),
@@ -245,12 +595,10 @@ class RNDModule(nn.Module):
         self.reward_rms = RunningMeanStd(shape=())
     
     def normalize_obs(self, obs: np.ndarray) -> np.ndarray:
-        """Normalize observation for RND."""
         return np.clip(self.obs_rms.normalize(obs), -5.0, 5.0)
     
     @torch.no_grad()
     def compute_intrinsic_reward(self, obs: np.ndarray) -> float:
-        """Compute intrinsic reward as prediction error."""
         self.obs_rms.update(obs.reshape(1, -1))
         
         obs_norm = self.normalize_obs(obs)
@@ -270,7 +618,6 @@ class RNDModule(nn.Module):
         return float(normalized_reward)
     
     def update(self, obs_batch: torch.Tensor) -> float:
-        """Update predictor network."""
         obs_np = obs_batch.cpu().numpy()
         obs_norm = np.clip(
             (obs_np - self.obs_rms.mean) / np.sqrt(self.obs_rms.var + 1e-8),
@@ -292,7 +639,6 @@ class RNDModule(nn.Module):
         return float(loss.item())
     
     def state_dict_custom(self) -> Dict:
-        """Get state dict including running statistics."""
         return {
             "predictor": self.predictor.state_dict(),
             "target": self.target.state_dict(),
@@ -306,7 +652,6 @@ class RNDModule(nn.Module):
         }
     
     def load_state_dict_custom(self, state_dict: Dict):
-        """Load state dict including running statistics."""
         self.predictor.load_state_dict(state_dict["predictor"])
         self.target.load_state_dict(state_dict["target"])
         self.optimizer.load_state_dict(state_dict["optimizer"])
@@ -319,7 +664,7 @@ class RNDModule(nn.Module):
 
 
 # =============================================================================
-# Prioritized Experience Replay (PER)
+# Prioritized Experience Replay (PER) - unchanged
 # =============================================================================
 
 class SumTree:
@@ -331,7 +676,6 @@ class SumTree:
         self.data_pointer = 0
     
     def update(self, tree_idx: int, priority: float):
-        """Update priority at tree index."""
         change = priority - self.tree[tree_idx]
         self.tree[tree_idx] = priority
         
@@ -340,7 +684,6 @@ class SumTree:
             self.tree[tree_idx] += change
     
     def add(self, priority: float) -> int:
-        """Add new priority, return data index."""
         tree_idx = self.data_pointer + self.capacity - 1
         self.update(tree_idx, priority)
         
@@ -350,7 +693,6 @@ class SumTree:
         return data_idx
     
     def get(self, value: float) -> Tuple[int, int, float]:
-        """Get leaf index, data index, and priority for a value."""
         parent_idx = 0
         
         while True:
@@ -396,7 +738,6 @@ class PrioritizedReplayBuffer:
         self.max_priority = 1.0
     
     def add(self, obs, act, rew, next_obs, done):
-        """Add transition with max priority."""
         self.obs[self.ptr] = obs
         self.acts[self.ptr] = act
         self.rews[self.ptr] = rew
@@ -410,7 +751,6 @@ class PrioritizedReplayBuffer:
         self.count = min(self.count + 1, self.size)
     
     def sample(self, batch_size: int, beta: float = PER_BETA_START) -> Tuple:
-        """Sample batch with importance sampling weights."""
         indices = np.zeros(batch_size, dtype=np.int32)
         priorities = np.zeros(batch_size, dtype=np.float32)
         
@@ -440,7 +780,6 @@ class PrioritizedReplayBuffer:
         )
     
     def update_priorities(self, indices: np.ndarray, td_errors: np.ndarray):
-        """Update priorities based on TD errors."""
         for idx, td_error in zip(indices, td_errors):
             priority = (abs(td_error) + PER_EPSILON) ** self.alpha
             
@@ -451,7 +790,7 @@ class PrioritizedReplayBuffer:
 
 
 # =============================================================================
-# Ego-Centric Occupancy Grid (unchanged)
+# Ego-Centric Occupancy Grid - unchanged
 # =============================================================================
 
 class EgoOccupancyGrid:
@@ -661,8 +1000,6 @@ class EgoOccupancyGrid:
         
         msg = OccupancyGrid()
         msg.header.frame_id = frame_id
-        msg.header.stamp.sec = 0
-        msg.header.stamp.nanosec = 0
         
         msg.info.resolution = self.resolution
         msg.info.width = width
@@ -726,7 +1063,7 @@ class EgoOccupancyGrid:
 
 
 # =============================================================================
-# ROS Interface (unchanged)
+# ROS Interface
 # =============================================================================
 
 class StretchRosInterface(Node):
@@ -770,9 +1107,12 @@ class StretchRosInterface(Node):
         self.path_pub = self.create_publisher(Marker, "/robot_path", 10)
         self.frontier_pub = self.create_publisher(MarkerArray, "/frontiers", 10)
         
+        # Safety visualization
+        self.safety_zone_pub = self.create_publisher(Marker, "/safety_zone", 10)
+        
         self.path_history: deque = deque(maxlen=PATH_HISTORY_LENGTH)
         
-        self.get_logger().info("[VIZ] Publishing: /exploration_map, /visit_heatmap, /robot_path")
+        self.get_logger().info("[VIZ] Publishing: /exploration_map, /visit_heatmap, /robot_path, /safety_zone")
     
     def add_path_point(self, x: float, y: float):
         self.path_history.append((x, y))
@@ -805,6 +1145,42 @@ class StretchRosInterface(Node):
         
         self.path_pub.publish(marker)
     
+    def publish_safety_zone(self, robot_x: float, robot_y: float, safety_state: SafetyState, frame_id: str = MAP_FRAME):
+        """Publish a cylinder showing the current safety zone."""
+        marker = Marker()
+        marker.header.frame_id = frame_id
+        marker.header.stamp = self.get_clock().now().to_msg()
+        marker.ns = "safety_zone"
+        marker.id = 0
+        marker.type = Marker.CYLINDER
+        marker.action = Marker.ADD
+        
+        marker.pose.position.x = robot_x
+        marker.pose.position.y = robot_y
+        marker.pose.position.z = 0.1
+        marker.pose.orientation.w = 1.0
+        
+        # Radius shows current minimum distance
+        marker.scale.x = safety_state.min_distance * 2
+        marker.scale.y = safety_state.min_distance * 2
+        marker.scale.z = 0.1
+        
+        # Color based on zone
+        if safety_state.zone == "FREE":
+            marker.color.r, marker.color.g, marker.color.b = 0.0, 1.0, 0.0
+        elif safety_state.zone == "AWARE":
+            marker.color.r, marker.color.g, marker.color.b = 0.5, 1.0, 0.0
+        elif safety_state.zone == "CAUTION":
+            marker.color.r, marker.color.g, marker.color.b = 1.0, 1.0, 0.0
+        elif safety_state.zone == "DANGER":
+            marker.color.r, marker.color.g, marker.color.b = 1.0, 0.5, 0.0
+        else:  # EMERGENCY or CRITICAL
+            marker.color.r, marker.color.g, marker.color.b = 1.0, 0.0, 0.0
+        
+        marker.color.a = 0.3
+        
+        self.safety_zone_pub.publish(marker)
+    
     def _odom_cb(self, msg): self.last_odom = msg
     def _scan_cb(self, msg): self.last_scan = msg
     def _imu_cb(self, msg): self.last_imu = msg
@@ -827,18 +1203,18 @@ class StretchRosInterface(Node):
 
 
 # =============================================================================
-# Gym Environment (MODIFIED: Smart Collision Avoidance)
+# Gym Environment with Graduated Safety
 # =============================================================================
 
 class StretchExploreEnv(gym.Env):
     """
-    Environment that supports both exploration and goal-seeking.
+    Environment with graduated safety system.
     
-    IMPROVEMENTS:
-    - RND module provides learned intrinsic reward
-    - Observation normalization for stable training
-    - Reward normalization for consistent scales
-    - SMART collision avoidance - navigates around obstacles instead of stopping!
+    Key changes from original:
+    1. Safety blender processes all actions before execution
+    2. Shaped rewards based on proximity and safety intervention
+    3. RL experiences blended dynamics (learns from safety influence)
+    4. Additional observation features for safety awareness
     """
     
     def __init__(self, ros: StretchRosInterface, rnd_module: RNDModule,
@@ -848,6 +1224,9 @@ class StretchExploreEnv(gym.Env):
         self.control_dt = control_dt
         self.rnd = rnd_module
         
+        # Safety system
+        self.safety_blender = GraduatedSafetyBlender()
+        
         # Occupancy grid
         self.occ_grid = EgoOccupancyGrid()
         
@@ -855,7 +1234,7 @@ class StretchExploreEnv(gym.Env):
         self.obs_rms = None
         self.reward_normalizer = RewardNormalizer()
         
-        # RND weight (decays over time)
+        # RND weight
         self.rnd_weight = RND_WEIGHT_INITIAL
         
         # State
@@ -867,9 +1246,13 @@ class StretchExploreEnv(gym.Env):
         self.prev_action = np.zeros(2, dtype=np.float32)
         self.prev_goal_dist = 0.0
         
-        # Observation space
+        # Track safety interventions for logging
+        self.episode_interventions = []
+        
+        # Observation space (added safety sector distances)
         grid_flat_size = GRID_SIZE * GRID_SIZE
-        obs_dim = NUM_LIDAR_BINS + 5 + 2 + 2 + 1 + grid_flat_size + 2 + 1
+        obs_dim = (NUM_LIDAR_BINS + 5 + 2 + 2 + 1 + grid_flat_size + 2 + 1 
+                   + NUM_SAFETY_SECTORS + 2)  # +sector distances + safety blend + danger direction
         
         self.observation_space = spaces.Box(
             low=-1.0, high=1.0, shape=(obs_dim,), dtype=np.float32
@@ -884,20 +1267,18 @@ class StretchExploreEnv(gym.Env):
         # Initialize observation normalizer
         self.obs_rms = RunningMeanStd(shape=(obs_dim,))
         
+        # Store last safety state for observation building
+        self.last_safety_state: Optional[SafetyState] = None
+        
         # Wait for sensors
         self.ros.get_logger().info("[ENV] Waiting for sensors...")
         self.ros.wait_for_sensors()
         
-        self.ros.get_logger().info(
-            f"[ENV] Observation dim: {obs_dim} (lidar={NUM_LIDAR_BINS}, "
-            f"grid={GRID_SIZE}x{GRID_SIZE}={grid_flat_size})"
-        )
-        self.ros.get_logger().info(
-            f"[ENV] IMPROVED: Using RND + PER + Smart Collision Avoidance"
-        )
-        self.ros.get_logger().info(
-            f"[ENV] Collision threshold: {COLLISION_DIST}m (navigates around instead of stopping)"
-        )
+        self.ros.get_logger().info(f"[ENV] Observation dim: {obs_dim}")
+        self.ros.get_logger().info(f"[ENV] Robot width: {ROBOT_WIDTH_M:.2f}m, Clearance: {DESIRED_CLEARANCE_M:.2f}m")
+        self.ros.get_logger().info(f"[ENV] Safety zones: FREE>{ZONE_FREE}m, AWARE>{ZONE_AWARE}m, "
+                                    f"CAUTION>{ZONE_CAUTION}m, DANGER>{ZONE_DANGER}m, EMERGENCY>{ZONE_EMERGENCY}m")
+        self.ros.get_logger().info(f"[ENV] GRADUATED SAFETY BLENDING ENABLED")
     
     def reset(self, *, seed=None, options=None):
         super().reset(seed=seed)
@@ -906,66 +1287,57 @@ class StretchExploreEnv(gym.Env):
         self.episode_return = 0.0
         self.prev_action[:] = 0.0
         self.occ_grid.reset()
+        self.episode_interventions = []
         
         self.occ_grid.decay_visits()
         
         self.prev_goal_dist = self._goal_distance()
         
+        # Get initial safety state
+        self.last_safety_state = self.safety_blender.analyze_scan(self.ros.last_scan)
+        
         obs = self._build_observation()
         info = {
             "has_goal": self.ros.last_goal is not None,
-            "goal_dist": self.prev_goal_dist
+            "goal_dist": self.prev_goal_dist,
+            "safety_zone": self.last_safety_state.zone if self.last_safety_state else "UNKNOWN"
         }
         
         return obs, info
     
     def step(self, action: np.ndarray):
-        # Process action
+        # Process RL action
         a = np.clip(action, -1.0, 1.0)
-        v_cmd = float(a[0]) * V_MAX
-        w_cmd = float(a[1]) * W_MAX
+        rl_v = float(a[0]) * V_MAX
+        rl_w = float(a[1]) * W_MAX
         
-        if v_cmd < V_MIN_REVERSE:
-            v_cmd = V_MIN_REVERSE
-        
-        # ============================================================
-        # NEW: SMART COLLISION AVOIDANCE
-        # ============================================================
-        min_lidar = self._min_lidar()
-        obstacle_angle = self._get_obstacle_angle()
-        
-        if min_lidar < COLLISION_DIST and self.step_count > 10:
-            # Calculate danger factor (0 = at safe distance, 1 = at collision)
-            danger_factor = 1.0 - (min_lidar / COLLISION_DIST)
-            
-            # Strategy 1: Obstacle is to the side - turn away from it
-            if abs(obstacle_angle) > 0.1:  # Obstacle not directly ahead
-                # Turn away from obstacle
-                turn_away = -np.sign(obstacle_angle) * W_MAX * danger_factor
-                w_cmd = turn_away
-                
-                # Reduce forward velocity but don't stop completely
-                v_cmd = v_cmd * (1.0 - danger_factor * 0.7)
-                
-            # Strategy 2: Obstacle directly ahead and moving forward - back up and turn
-            elif v_cmd > 0:
-                # Move backwards proportional to danger
-                v_cmd = -V_MAX * 0.5 * danger_factor
-                
-                # Turn toward more open space
-                w_cmd = w_cmd + self._get_escape_direction() * W_MAX * 0.5
-            
-            # Strategy 3: Already reversing - allow it but guide the turn
-            else:
-                # Keep backing up, adjust turn toward open space
-                w_cmd = w_cmd + self._get_escape_direction() * W_MAX * 0.3
+        if rl_v < V_MIN_REVERSE:
+            rl_v = V_MIN_REVERSE
         
         # ============================================================
-        # END SMART COLLISION AVOIDANCE
+        # GRADUATED SAFETY BLENDING
         # ============================================================
         
-        # Send command
-        self.ros.send_cmd(v_cmd, w_cmd)
+        # Analyze current scan for safety
+        safety_state = self.safety_blender.analyze_scan(self.ros.last_scan)
+        self.last_safety_state = safety_state
+        
+        # Get goal angle for attraction (if goal exists)
+        goal_angle = self._goal_angle() if self.ros.last_goal is not None else None
+        
+        # Blend RL action with safety
+        safe_v, safe_w, intervention = self.safety_blender.blend_action(
+            rl_v, rl_w, safety_state, goal_angle
+        )
+        
+        # Track intervention
+        self.episode_interventions.append(intervention)
+        
+        # ============================================================
+        # EXECUTE SAFE ACTION
+        # ============================================================
+        
+        self.ros.send_cmd(safe_v, safe_w)
         
         # Wait for control period
         t_end = time.time() + self.control_dt
@@ -981,16 +1353,39 @@ class StretchExploreEnv(gym.Env):
                 st["x"], st["y"], st["yaw"], scan
             )
         
+        # Update safety state after movement
+        safety_state = self.safety_blender.analyze_scan(self.ros.last_scan)
+        self.last_safety_state = safety_state
+        
         # Build observation
         obs = self._build_observation()
         
-        # Compute reward based on mode
+        # ============================================================
+        # COMPUTE REWARD WITH SAFETY SHAPING
+        # ============================================================
+        
         has_goal = self.ros.last_goal is not None
         
         if has_goal:
-            reward, terminated, info = self._compute_goal_reward(v_cmd, w_cmd)
+            reward, terminated, info = self._compute_goal_reward(safe_v, safe_w)
         else:
             reward, terminated, info = self._compute_explore_reward(new_cells, st, obs)
+        
+        # Add safety-shaped rewards
+        proximity_reward = self.safety_blender.compute_proximity_reward(safety_state)
+        intervention_penalty = self.safety_blender.compute_intervention_penalty(intervention)
+        
+        reward += proximity_reward + intervention_penalty
+        
+        info["reward_terms"]["proximity"] = proximity_reward
+        info["reward_terms"]["intervention_penalty"] = intervention_penalty
+        info["safety_zone"] = safety_state.zone
+        info["safety_blend"] = safety_state.safety_blend
+        info["intervention"] = intervention
+        info["executed_v"] = safe_v
+        info["executed_w"] = safe_w
+        info["rl_v"] = rl_v
+        info["rl_w"] = rl_w
         
         # Update RND weight
         self.total_steps += 1
@@ -1012,24 +1407,22 @@ class StretchExploreEnv(gym.Env):
                 "COLLISION" if info.get("collision", False) else "TIMEOUT"
             )
             stats = self.occ_grid.get_stats()
+            avg_intervention = np.mean(self.episode_interventions) if self.episode_interventions else 0.0
             self.ros.get_logger().info(
                 f"[EP {self.episode_index:04d}] {mode} {status} | "
                 f"Return {self.episode_return:+.1f} | Steps {self.step_count} | "
                 f"Discovered {stats['total_discovered']} cells | "
-                f"RND_w={self.rnd_weight:.3f}"
+                f"Avg Intervention {avg_intervention:.1%}"
             )
             self.episode_index += 1
         
         # Debug logging
         if self.step_count % DEBUG_EVERY_N == 0:
             mode = "GOAL" if has_goal else "EXPLORE"
-            stats = self.occ_grid.get_stats()
-            novelty = self.occ_grid.get_novelty(st["x"], st["y"])
-            rnd_r = info.get("reward_terms", {}).get("rnd", 0.0)
             self.ros.get_logger().info(
-                f"[{mode}] step={self.step_count} r={reward:+.2f} "
-                f"new_cells={new_cells} total={stats['total_discovered']} "
-                f"novelty={novelty:.2f} rnd_r={rnd_r:.2f} min_lidar={min_lidar:.2f}"
+                f"[{mode}] step={self.step_count} zone={safety_state.zone} "
+                f"blend={safety_state.safety_blend:.0%} min_d={safety_state.min_distance:.2f}m "
+                f"rl=[{rl_v:.2f},{rl_w:.2f}] safe=[{safe_v:.2f},{safe_w:.2f}]"
             )
         
         # Publish reward breakdown
@@ -1037,11 +1430,11 @@ class StretchExploreEnv(gym.Env):
         
         # Publish visualization
         if PUBLISH_MAP and self.step_count % PUBLISH_MAP_EVERY_N == 0:
-            self._publish_visualization(st)
+            self._publish_visualization(st, safety_state)
         
         return obs, float(reward), bool(terminated), bool(truncated), info
     
-    def _publish_visualization(self, robot_state: Dict):
+    def _publish_visualization(self, robot_state: Dict, safety_state: SafetyState):
         self.ros.add_path_point(robot_state["x"], robot_state["y"])
         
         map_msg = self.occ_grid.get_occupancy_grid_msg(MAP_FRAME)
@@ -1054,6 +1447,9 @@ class StretchExploreEnv(gym.Env):
         
         if PUBLISH_PATH:
             self.ros.publish_path()
+        
+        # Publish safety zone visualization
+        self.ros.publish_safety_zone(robot_state["x"], robot_state["y"], safety_state)
     
     def _compute_explore_reward(self, new_cells: int, st: Dict, obs: np.ndarray) -> Tuple[float, bool, Dict]:
         """Compute reward for exploration mode."""
@@ -1077,12 +1473,12 @@ class StretchExploreEnv(gym.Env):
         # RND intrinsic reward
         r_rnd = self.rnd.compute_intrinsic_reward(obs) * self.rnd_weight
         
-        # Collision
-        min_lidar = self._min_lidar()
-        if min_lidar < COLLISION_DIST and self.step_count > 10:
-            terminated = True
-            collision = True
-            r_collision = R_COLLISION_EXPLORE
+        # Collision - now based on ZONE_EMERGENCY (hard safety should prevent this)
+        if self.last_safety_state and self.last_safety_state.min_distance < ZONE_EMERGENCY:
+            if self.step_count > 10:
+                terminated = True
+                collision = True
+                r_collision = R_COLLISION_EXPLORE
         else:
             r_collision = 0.0
         
@@ -1113,7 +1509,6 @@ class StretchExploreEnv(gym.Env):
         
         d_goal = self._goal_distance()
         ang = self._goal_angle()
-        min_lidar = self._min_lidar()
         
         progress = self.prev_goal_dist - d_goal
         r_progress = PROGRESS_SCALE * progress
@@ -1128,11 +1523,13 @@ class StretchExploreEnv(gym.Env):
             success = True
             r_goal = R_GOAL
         
+        # Collision based on safety zone
         r_collision = 0.0
-        if min_lidar < COLLISION_DIST and self.step_count > 10:
-            terminated = True
-            collision = True
-            r_collision = R_COLLISION
+        if self.last_safety_state and self.last_safety_state.min_distance < ZONE_EMERGENCY:
+            if self.step_count > 10:
+                terminated = True
+                collision = True
+                r_collision = R_COLLISION
         
         r_timeout = 0.0
         if not terminated and self.step_count + 1 >= self.max_steps:
@@ -1159,77 +1556,6 @@ class StretchExploreEnv(gym.Env):
         }
         
         return float(reward), terminated, info
-    
-    # ============================================================
-    # NEW HELPER FUNCTIONS FOR SMART COLLISION AVOIDANCE
-    # ============================================================
-    
-    def _get_obstacle_angle(self) -> float:
-        """
-        Find the angle to the closest obstacle.
-        Returns angle in radians (-pi to pi) where obstacle is located.
-        0 = directly ahead, positive = left, negative = right
-        """
-        scan = self.ros.last_scan
-        if scan is None:
-            return 0.0
-        
-        ranges = np.array(scan.ranges, dtype=np.float32)
-        if ranges.size == 0:
-            return 0.0
-        
-        # Filter invalid readings
-        max_r = scan.range_max if scan.range_max > 0 else LIDAR_MAX_RANGE
-        min_r = max(scan.range_min, 0.01)
-        valid = ~(np.isnan(ranges) | np.isinf(ranges) | (ranges < min_r) | (ranges > max_r))
-        
-        if not np.any(valid):
-            return 0.0
-        
-        # Find closest point
-        ranges[~valid] = max_r
-        closest_idx = np.argmin(ranges)
-        
-        # Convert to angle (accounting for LIDAR_FORWARD_OFFSET)
-        angle_min = scan.angle_min
-        angle_inc = scan.angle_increment
-        obstacle_angle = angle_min + closest_idx * angle_inc
-        
-        # Normalize to robot frame (0 = forward)
-        obstacle_angle = wrap_to_pi(obstacle_angle + LIDAR_FORWARD_OFFSET_RAD)
-        
-        return float(obstacle_angle)
-    
-    def _get_escape_direction(self) -> float:
-        """
-        Determine which direction has more free space.
-        Returns -1 (turn right) or +1 (turn left).
-        """
-        scan = self.ros.last_scan
-        if scan is None:
-            return 1.0
-        
-        ranges = np.array(scan.ranges, dtype=np.float32)
-        if ranges.size == 0:
-            return 1.0
-        
-        # Filter valid readings
-        max_r = scan.range_max if scan.range_max > 0 else LIDAR_MAX_RANGE
-        min_r = max(scan.range_min, 0.01)
-        valid = ~(np.isnan(ranges) | np.isinf(ranges) | (ranges < min_r) | (ranges > max_r))
-        ranges[~valid] = 0.0
-        
-        # Split into left and right halves
-        mid = len(ranges) // 2
-        left_space = np.mean(ranges[:mid])
-        right_space = np.mean(ranges[mid:])
-        
-        # Turn toward more open space
-        return 1.0 if left_space > right_space else -1.0
-    
-    # ============================================================
-    # END NEW HELPER FUNCTIONS
-    # ============================================================
     
     def _build_observation(self) -> np.ndarray:
         st = self._get_robot_state()
@@ -1280,6 +1606,27 @@ class StretchExploreEnv(gym.Env):
         # Novelty
         novelty = np.array([self.occ_grid.get_novelty(st["x"], st["y"])], dtype=np.float32)
         
+        # Safety information (NEW - helps RL learn about obstacles)
+        if self.last_safety_state is not None:
+            # Normalized sector distances (0=far, 1=close)
+            sector_obs = 1.0 - np.clip(
+                self.last_safety_state.sector_distances / ZONE_FREE, 0.0, 1.0
+            )
+            
+            # Safety blend (how much safety is intervening)
+            safety_blend = np.array([self.last_safety_state.safety_blend], dtype=np.float32)
+            
+            # Danger direction (encoded as sin/cos)
+            danger_dir = np.array([
+                math.sin(self.last_safety_state.danger_direction),
+                math.cos(self.last_safety_state.danger_direction)
+            ], dtype=np.float32)
+            
+            # Combine
+            safety_obs = np.concatenate([sector_obs, safety_blend, danger_dir])
+        else:
+            safety_obs = np.zeros(NUM_SAFETY_SECTORS + 3, dtype=np.float32)
+        
         # Concatenate all
         obs = np.concatenate([
             lidar_norm,
@@ -1290,6 +1637,7 @@ class StretchExploreEnv(gym.Env):
             grid_norm,
             frontier_dir,
             novelty,
+            safety_obs,  # NEW
         ], axis=0)
         
         # Update running statistics
@@ -1336,10 +1684,6 @@ class StretchExploreEnv(gym.Env):
         
         return bins
     
-    def _min_lidar(self) -> float:
-        bins = self._get_lidar_bins()
-        return float(max(0.01, np.min(bins)))
-    
     def _goal_distance(self) -> float:
         goal = self.ros.last_goal
         if goal is None:
@@ -1370,6 +1714,15 @@ class StretchExploreEnv(gym.Env):
             "mode": "goal" if has_goal else "explore",
             "reward": float(reward),
             "reward_terms": info.get("reward_terms", {}),
+            "safety": {
+                "zone": info.get("safety_zone", "UNKNOWN"),
+                "blend": info.get("safety_blend", 0.0),
+                "intervention": info.get("intervention", 0.0),
+                "rl_v": info.get("rl_v", 0.0),
+                "rl_w": info.get("rl_w", 0.0),
+                "executed_v": info.get("executed_v", 0.0),
+                "executed_w": info.get("executed_w", 0.0),
+            },
             "state": {
                 "x": st["x"],
                 "y": st["y"],
@@ -1390,7 +1743,7 @@ class StretchExploreEnv(gym.Env):
 
 
 # =============================================================================
-# TD3 Networks (unchanged)
+# TD3 Networks (adjusted for new observation size)
 # =============================================================================
 
 class GridCNN(nn.Module):
@@ -1499,11 +1852,11 @@ class CriticWithCNN(nn.Module):
 
 
 # =============================================================================
-# TD3 Agent (uses PER and RND)
+# TD3 Agent
 # =============================================================================
 
 class TD3AgentCNN:
-    """TD3 Agent with CNN. Improved with PER and RND integration."""
+    """TD3 Agent with CNN and RND integration."""
     
     def __init__(self, obs_dim: int, act_dim: int, device: torch.device,
                  rnd_module: RNDModule,
@@ -1520,7 +1873,6 @@ class TD3AgentCNN:
         self.policy_delay = policy_delay
         self.rnd = rnd_module
         
-        # Networks
         self.actor = ActorWithCNN(obs_dim, act_dim).to(device)
         self.actor_targ = ActorWithCNN(obs_dim, act_dim).to(device)
         self.actor_targ.load_state_dict(self.actor.state_dict())
@@ -1532,7 +1884,6 @@ class TD3AgentCNN:
         self.critic1_targ.load_state_dict(self.critic1.state_dict())
         self.critic2_targ.load_state_dict(self.critic2.state_dict())
         
-        # Optimizers
         self.actor_opt = torch.optim.Adam(self.actor.parameters(), lr=actor_lr)
         self.critic_opt = torch.optim.Adam(
             list(self.critic1.parameters()) + list(self.critic2.parameters()),
@@ -1550,13 +1901,10 @@ class TD3AgentCNN:
         return np.clip(a, -1.0, 1.0).astype(np.float32)
     
     def update(self, replay: PrioritizedReplayBuffer, batch_size: int, beta: float) -> Tuple[float, float, float]:
-        """Update networks using PER. Returns (critic_loss, actor_loss, rnd_loss)."""
         self.total_updates += 1
         
-        # Sample with priorities
         obs, act, rew, next_obs, done, weights, indices = replay.sample(batch_size, beta)
         
-        # Critic update
         with torch.no_grad():
             noise = (torch.randn_like(act) * self.policy_noise).clamp(-self.noise_clip, self.noise_clip)
             next_act = (self.actor_targ(next_obs) + noise).clamp(-1.0, 1.0)
@@ -1569,7 +1917,6 @@ class TD3AgentCNN:
         q1 = self.critic1(obs, act)
         q2 = self.critic2(obs, act)
         
-        # Weight losses by importance sampling weights
         td_error1 = target - q1
         td_error2 = target - q2
         
@@ -1582,11 +1929,9 @@ class TD3AgentCNN:
         )
         self.critic_opt.step()
         
-        # Update priorities based on TD error
         td_errors = (td_error1.abs() + td_error2.abs()).detach().cpu().numpy() / 2.0
         replay.update_priorities(indices, td_errors.flatten())
         
-        # Actor update (delayed)
         actor_loss = torch.tensor(0.0, device=self.device)
         if self.total_updates % self.policy_delay == 0:
             actor_loss = -self.critic1(obs, self.actor(obs)).mean()
@@ -1600,7 +1945,6 @@ class TD3AgentCNN:
             self._soft_update(self.critic1_targ, self.critic1)
             self._soft_update(self.critic2_targ, self.critic2)
         
-        # Update RND predictor
         rnd_loss = self.rnd.update(next_obs)
         
         return float(critic_loss.item()), float(actor_loss.item()), rnd_loss
@@ -1674,7 +2018,7 @@ def main():
     # Mode
     parser.add_argument("--inference", action="store_true")
     
-    # Compatibility args (ignored)
+    # Compatibility args
     parser.add_argument("--rollout-steps", type=int, default=2048)
     parser.add_argument("--load-ckpt", type=str, default="")
     parser.add_argument("--use-obstacle", type=int, default=1)
@@ -1686,11 +2030,9 @@ def main():
     args = parser.parse_args()
     set_seed(args.seed)
     
-    # Setup checkpoint path
     os.makedirs(args.ckpt_dir, exist_ok=True)
     ckpt_path = os.path.join(args.ckpt_dir, CHECKPOINT_FILENAME)
     
-    # Initialize ROS
     rclpy.init()
     ros = StretchRosInterface(
         ns=args.ns,
@@ -1703,12 +2045,12 @@ def main():
     executor = SingleThreadedExecutor()
     executor.add_node(ros)
     
-    # Setup device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
-    # Calculate observation dimension
+    # Observation dimension (with safety features)
     grid_flat_size = GRID_SIZE * GRID_SIZE
-    obs_dim = NUM_LIDAR_BINS + 5 + 2 + 2 + 1 + grid_flat_size + 2 + 1
+    obs_dim = (NUM_LIDAR_BINS + 5 + 2 + 2 + 1 + grid_flat_size + 2 + 1 
+               + NUM_SAFETY_SECTORS + 3)  # Added safety observations
     act_dim = 2
     
     # Create RND module
@@ -1718,23 +2060,23 @@ def main():
     env = StretchExploreEnv(ros, rnd_module)
     
     ros.get_logger().info(f"[AGENT] device={device} obs_dim={obs_dim} act_dim={act_dim}")
-    ros.get_logger().info(f"[AGENT] Grid: {GRID_SIZE}x{GRID_SIZE} @ {GRID_RESOLUTION}m/cell")
-    ros.get_logger().info(f"[AGENT] IMPROVED: PER + RND + Smart Collision Avoidance")
+    ros.get_logger().info(f"[AGENT] GRADUATED SAFETY SYSTEM ACTIVE")
+    ros.get_logger().info(f"[AGENT] Robot: {ROBOT_WIDTH_M:.2f}m wide, {DESIRED_CLEARANCE_M:.2f}m clearance")
     
     # Create agent
     agent = TD3AgentCNN(obs_dim, act_dim, device=device, rnd_module=rnd_module)
     
-    # Prioritized replay buffer
+    # Replay buffer
     replay = PrioritizedReplayBuffer(obs_dim, act_dim, size=args.replay_size, device=device)
     
-    # Load checkpoint if exists
+    # Load checkpoint
     if AUTO_LOAD_CHECKPOINT and os.path.exists(ckpt_path):
         ros.get_logger().info(f"[CKPT] Loading from {ckpt_path}")
         try:
             agent.load(ckpt_path, strict=False)
             ros.get_logger().info("[CKPT] Load SUCCESS")
         except Exception as e:
-            ros.get_logger().warn(f"[CKPT] Load FAILED: {e}")
+            ros.get_logger().warn(f"[CKPT] Load FAILED (model architecture changed?): {e}")
     
     # Shutdown handler
     def shutdown_and_save(signum=None, frame=None):
@@ -1752,7 +2094,9 @@ def main():
             ros.get_logger().error(f"[CKPT] Save FAILED: {e}")
         
         stats = env.occ_grid.get_stats()
-        ros.get_logger().info(f"[FINAL] Total cells discovered: {stats['total_discovered']}")
+        avg_intervention = env.safety_blender.get_average_intervention()
+        ros.get_logger().info(f"[FINAL] Cells discovered: {stats['total_discovered']}, "
+                               f"Avg safety intervention: {avg_intervention:.1%}")
         
         try:
             executor.shutdown()
@@ -1767,7 +2111,7 @@ def main():
     
     # Inference mode
     if args.inference:
-        ros.get_logger().info("[MODE] INFERENCE")
+        ros.get_logger().info("[MODE] INFERENCE (with safety)")
         while True:
             obs, _ = env.reset()
             done = False
@@ -1777,7 +2121,7 @@ def main():
                 done = term or trunc
     
     # Training mode
-    ros.get_logger().info("[MODE] TRAINING (IMPROVED)")
+    ros.get_logger().info("[MODE] TRAINING (with graduated safety)")
     obs, _ = env.reset()
     last_save = 0
     
@@ -1805,22 +2149,19 @@ def main():
         if done:
             obs, _ = env.reset()
         
-        
         # Update
         if t >= args.update_after and t % args.update_every == 0 and replay.count >= args.batch_size:
-            # Anneal beta for importance sampling
             beta = PER_BETA_START + (PER_BETA_END - PER_BETA_START) * (t / args.total_steps)
-            
             critic_loss, actor_loss, rnd_loss = agent.update(replay, args.batch_size, beta)
         
-                
         # Save
         if t - last_save >= args.save_every:
             last_save = t
             stats = env.occ_grid.get_stats()
+            avg_intervention = env.safety_blender.get_average_intervention()
             ros.get_logger().info(
-                f"[CKPT] step={t} cells_discovered={stats['total_discovered']} "
-                f"rnd_weight={env.rnd_weight:.3f}"
+                f"[CKPT] step={t} cells={stats['total_discovered']} "
+                f"intervention={avg_intervention:.1%}"
             )
             try:
                 agent.save(ckpt_path + ".tmp")
