@@ -110,7 +110,7 @@ def generate_launch_description():
     ))
     
     
-    ld.add_action(DeclareLaunchArgument("use_reward_monitor", default_value="false"))
+    ld.add_action(DeclareLaunchArgument("use_reward_monitor", default_value="true"))
     ld.add_action(DeclareLaunchArgument("total_steps", default_value="200000"))
     ld.add_action(DeclareLaunchArgument("rollout_steps", default_value="2048"))
     ld.add_action(DeclareLaunchArgument(
