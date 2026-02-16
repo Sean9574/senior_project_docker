@@ -352,7 +352,12 @@ RUN /bin/bash -c "source /opt/ros/humble/setup.bash && \
 # Copy URDF file to expected location
 RUN mkdir -p $AMENT_WS/install/stretch_description/share/stretch_description/urdf && \
     cp $AMENT_WS/src/stretch_urdf/stretch_urdf/RE2V0/stretch_description_RE2V0_eoa_wrist_dw3_tool_sg3.urdf \
-       $AMENT_WS/install/stretch_description/share/stretch_description/urdf/stretch.urdf || true
+       $AMENT_WS/install# Copy custom MuJoCo scene (10x10m arena with obstacles)
+
+# Copy custom MuJoCo scene into correct location
+RUN cp $AMENT_WS/src/stretch_ros2/senior_project/config/scene.xml \
+    $AMENT_WS/src/stretch_mujoco/stretch_mujoco/models/scene.xml/stretch_description/share/stretch_description/urdf/stretch.urdf || true
+
 
 # =============================================================================
 # Environment Setup - PERFORMANCE OPTIMIZED
