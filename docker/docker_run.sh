@@ -15,11 +15,8 @@ fi
 HF_TOKEN=$(grep -E "^(HUGGINGFACE_HUB_TOKEN|HF_TOKEN)=" "$HOME/.hf.env" 2>/dev/null | head -1 | cut -d'=' -f2 || true)
 
 # Flags:
-#   CLEAN=1   -> disables cache
-#   PULL=1    -> pulls latest base images
-# Examples:
-#   CLEAN=1 ./build.sh
-#   CLEAN=1 PULL=1 ./build.sh
+#   CLEAN=1 -> disables cache
+#   PULL=1  -> pulls latest base images
 CLEAN="${CLEAN:-0}"
 PULL="${PULL:-0}"
 
@@ -44,25 +41,38 @@ echo ""
 echo "=== Starting container with performance optimizations ==="
 echo ""
 
-docker run -it --rm \
-  --gpus all \
-  --pid=host \
-  --ipc=host \
-  --shm-size=8g \
-  --network host \
-  --ulimit memlock=-1:-1 \
-  --ulimit rtprio=99:99 \
-  --ulimit nofile=65536:65536 \
-  --cap-add=SYS_NICE \
-  --env-file "$HOME/.hf.env" \
-  --name "$CONTAINER_NAME" \
-  -e DISPLAY="$DISPLAY" \
-  -e ROS_DOMAIN_ID=10 \
-  -e RMW_IMPLEMENTATION=rmw_cyclonedds_cpp \
-  -e NVIDIA_DRIVER_CAPABILITIES=all \
-  -e CUDA_CACHE_DISABLE=0 \
-  -e CUDA_CACHE_MAXSIZE=2147483648 \
-  -e CUDNN_BENCHMARK=1 \
-  -v /tmp/.X11-unix:/tmp/.X11-unix \
-  -v /dev/dri:/dev/dri \
-  "$IMAGE_NAME" bash
+# If DISPLAY is not set (headless), don't pass X11 env/mounts.
+DISPLAY_VALUE="${DISPLAY:-}"
+
+DOCKER_RUN_ARGS=(
+  -it --rm
+  --gpus all
+  --pid=host
+  --ipc=host
+  --shm-size=8g
+  --network host
+  --ulimit memlock=-1:-1
+  --ulimit rtprio=99:99
+  --ulimit nofile=65536:65536
+  --cap-add=SYS_NICE
+  --env-file "$HOME/.hf.env"
+  --name "$CONTAINER_NAME"
+  -e ROS_DOMAIN_ID=10
+  -e RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
+  -e NVIDIA_DRIVER_CAPABILITIES=all
+  -e CUDA_CACHE_DISABLE=0
+  -e CUDA_CACHE_MAXSIZE=2147483648
+  -e CUDNN_BENCHMARK=1
+)
+
+if [ -n "$DISPLAY_VALUE" ]; then
+  DOCKER_RUN_ARGS+=(
+    -e DISPLAY="$DISPLAY_VALUE"
+    -v /tmp/.X11-unix:/tmp/.X11-unix
+    -v /dev/dri:/dev/dri
+  )
+else
+  echo "NOTE: DISPLAY is not set; running headless (no X11 forwarding)."
+fi
+
+docker run "${DOCKER_RUN_ARGS[@]}" "$IMAGE_NAME" bash
