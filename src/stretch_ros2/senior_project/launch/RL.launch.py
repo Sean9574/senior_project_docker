@@ -256,7 +256,7 @@ def generate_launch_description():
             "mode": LaunchConfiguration("mode"),
             "use_mujoco_viewer": LaunchConfiguration("use_mujoco_viewer"),
             "use_cameras": LaunchConfiguration("use_cameras"),
-            "model_path": LaunchConfiguration("mujoco_xml"),
+            "mujoco_xml": LaunchConfiguration("mujoco_xml"),
 
             # Robocasa off
             "use_robocasa": False,

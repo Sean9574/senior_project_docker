@@ -102,12 +102,17 @@ class StretchMujocoDriver(Node):
             self.get_logger().info("[mujoco_xml] Not set; using default world/layout")
 
         model = None
+         # Check for custom mujoco_xml first
+        if self._mujoco_xml:
+            import mujoco
+            self.get_logger().info(f"Loading custom world: {self._mujoco_xml}")
+            model = mujoco.MjModel.from_xml_path(self._mujoco_xml)
         
         use_robocasa = self.get_parameter("use_robocasa").value
         # Handle string "true"/"false" from launch file
         if isinstance(use_robocasa, str):
             use_robocasa = use_robocasa.lower() == "true"
-        if use_robocasa:
+        if model is None and use_robocasa:
             robocasa_task: str | None = self.get_parameter("robocasa_task").value
             robocasa_layout = self.get_parameter("robocasa_layout").value
             robocasa_style = self.get_parameter("robocasa_style").value

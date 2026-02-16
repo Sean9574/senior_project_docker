@@ -102,11 +102,12 @@ def generate_launch_description():
     ld.add_action(DeclareLaunchArgument("use_rviz", default_value="true"))
     ld.add_action(DeclareLaunchArgument("use_mujoco_viewer", default_value="false"))
     ld.add_action(DeclareLaunchArgument("use_cameras", default_value="true"))
+    
     ld.add_action(DeclareLaunchArgument(
     "mujoco_xml",
-    default_value="/home/stretch/ament_ws/src/stretch_ros2/senior_project/map/map.xml",
-    description="Path to MuJoCo MJCF/XML scene"
-))
+    default_value=os.path.expanduser("~/ament_ws/src/stretch_ros2/senior_project/map/map.xml")
+    )),
+    
     ld.add_action(DeclareLaunchArgument("use_reward_monitor", default_value="false"))
     ld.add_action(DeclareLaunchArgument("total_steps", default_value="200000"))
     ld.add_action(DeclareLaunchArgument("rollout_steps", default_value="2048"))
