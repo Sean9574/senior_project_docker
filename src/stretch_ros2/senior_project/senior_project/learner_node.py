@@ -830,19 +830,22 @@ class EgoOccupancyGrid:
         angle_inc = scan.angle_increment
         range_max = min(scan.range_max, GRID_MAX_RANGE)
         range_min = max(scan.range_min, 0.05)
+        sensor_max = scan.range_max if scan.range_max > 0 else LIDAR_MAX_RANGE
         
         robot_key = self.world_to_grid_key(robot_x, robot_y)
         self.visit_counts[robot_key] = self.visit_counts.get(robot_key, 0) + 1
         
         for i in range(0, n_rays, 3):
-            r = ranges[i]
+            original_r = ranges[i]
             
-            if np.isnan(r) or np.isinf(r) or r < range_min:
+            if np.isnan(original_r) or np.isinf(original_r) or original_r < range_min:
                 continue
             
-            r = min(r, range_max)
+            # Clamp for grid update, but remember original for obstacle detection
+            r = min(original_r, range_max)
             ray_angle_world = robot_yaw + angle_min + i * angle_inc + LIDAR_FORWARD_OFFSET_RAD
             
+            # Mark cells along the ray as FREE
             step = self.resolution * 0.4
             for d in np.arange(step, r, step):
                 wx = robot_x + d * math.cos(ray_angle_world)
@@ -861,7 +864,12 @@ class EgoOccupancyGrid:
                 if 0 <= gx < self.size and 0 <= gy < self.size:
                     self.grid[gy, gx] = 0.5
             
-            if r < range_max - 0.5:
+            # Only mark endpoint as OBSTACLE if:
+            # 1. Original reading was well below sensor max (actually hit something)
+            # 2. Reading is within our grid range
+            is_real_obstacle = (original_r < sensor_max * 0.95) and (original_r < range_max - 0.1)
+            
+            if is_real_obstacle:
                 wx = robot_x + r * math.cos(ray_angle_world)
                 wy = robot_y + r * math.sin(ray_angle_world)
                 
