@@ -1249,6 +1249,11 @@ class StretchExploreEnv(gym.Env):
         self.prev_action = np.zeros(2, dtype=np.float32)
         self.prev_goal_dist = 0.0
         
+        # Goal tracking to prevent instant re-success after reaching goal
+        self._goal_just_reached = False
+        self._goal_cooldown_pos = None  # Position when goal was reached
+        self._min_move_from_goal = 1.0  # Must move 1m away before new goal accepted
+        
         # Track safety interventions for logging
         self.episode_interventions = []
         
@@ -1295,6 +1300,14 @@ class StretchExploreEnv(gym.Env):
         self.episode_interventions = []
         
         self.occ_grid.decay_visits()
+        
+        # CRITICAL FIX: Clear goal after episode ends
+        # This prevents instant re-success when robot is still at goal position
+        # The goal generator will re-publish when it detects the target again
+        if hasattr(self, '_goal_just_reached') and self._goal_just_reached:
+            self.ros.last_goal = None
+            self._goal_just_reached = False
+            self._goal_cooldown_pos = self._get_robot_state()
         
         self.prev_goal_dist = self._goal_distance()
         
@@ -1370,6 +1383,20 @@ class StretchExploreEnv(gym.Env):
         # ============================================================
         
         has_goal = self.ros.last_goal is not None
+        
+        # Check if we're in cooldown after reaching a goal
+        # Robot must move away before accepting a new goal
+        if has_goal and self._goal_cooldown_pos is not None:
+            dx = st["x"] - self._goal_cooldown_pos["x"]
+            dy = st["y"] - self._goal_cooldown_pos["y"]
+            dist_from_success = math.hypot(dx, dy)
+            
+            if dist_from_success < self._min_move_from_goal:
+                # Still too close to last success position - ignore goal
+                has_goal = False
+            else:
+                # Moved far enough, clear cooldown
+                self._goal_cooldown_pos = None
         
         if has_goal:
             reward, terminated, info = self._compute_goal_reward(safe_v, safe_w)
@@ -1527,6 +1554,8 @@ class StretchExploreEnv(gym.Env):
             terminated = True
             success = True
             r_goal = R_GOAL
+            # Mark that goal was reached - reset() will clear the goal
+            self._goal_just_reached = True
         
         # Collision based on safety zone
         r_collision = 0.0

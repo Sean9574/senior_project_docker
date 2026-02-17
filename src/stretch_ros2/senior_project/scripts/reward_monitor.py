@@ -17,8 +17,14 @@ Usage:
     # Monitor domain range (e.g., sims 0-4 starting at base domain 10)
     python3 reward_visualizer_multi.py --domain-range 10 14
     
-    # Auto-discover (scans domains 0-50)
-    python3 reward_visualizer_multi.py --auto-discover
+    # Scan for active domains and continuously watch for new ones
+    python3 reward_visualizer_multi.py --scan
+    
+    # Scan a specific range continuously
+    python3 reward_visualizer_multi.py --scan --scan-range 10 20
+    
+    # Combine: start with known domains, but also scan for new ones
+    python3 reward_visualizer_multi.py --domains 10 --scan --scan-range 10 15
     
 Then open http://localhost:5555 in your browser
 """
@@ -55,8 +61,11 @@ from flask_cors import CORS
 DEFAULT_PORT = 5555
 MAX_HISTORY_LENGTH = 1000
 UPDATE_RATE_HZ = 10
-DISCOVERY_SCAN_DOMAINS = range(0, 51)  # Domains to scan during auto-discovery
 DISCOVERY_TIMEOUT = 2.0  # Seconds to wait for topics in each domain
+
+# Default scan range - covers typical simulation setups
+DEFAULT_SCAN_START = 0
+DEFAULT_SCAN_END = 30
 
 # =============================================================================
 # Data Structures
@@ -361,22 +370,26 @@ class MultiDomainManager:
                 print(f"[Manager] Failed to add domain {domain_id}: {e}")
                 return False
     
-    def discover_domains(self, domain_range: range = None) -> List[int]:
+    def discover_domains(self, scan_start: int = DEFAULT_SCAN_START, 
+                         scan_end: int = DEFAULT_SCAN_END) -> List[int]:
         """Scan for active domains with reward topics."""
-        domain_range = domain_range or DISCOVERY_SCAN_DOMAINS
         discovered = []
         
-        print(f"[Manager] Scanning domains {domain_range.start}-{domain_range.stop-1}...")
+        print(f"[Manager] Scanning domains {scan_start}-{scan_end}...")
         
         def check_domain(domain_id: int) -> Optional[int]:
             """Check if a domain has reward topics."""
+            # Skip if already monitoring
+            if domain_id in self.collectors:
+                return None
+                
             try:
                 ctx = Context()
                 rclpy.init(context=ctx, domain_id=domain_id)
                 node = rclpy.create_node(f"scanner_{domain_id}", context=ctx)
                 
                 # Wait a bit for discovery
-                time.sleep(0.5)
+                time.sleep(0.3)
                 
                 topics = node.get_topic_names_and_types()
                 has_reward = any(t[0].endswith("/reward") for t in topics)
@@ -391,8 +404,9 @@ class MultiDomainManager:
                 return None
         
         # Scan in parallel
+        scan_range = range(scan_start, scan_end + 1)
         with ThreadPoolExecutor(max_workers=10) as executor:
-            results = list(executor.map(check_domain, domain_range))
+            results = list(executor.map(check_domain, scan_range))
         
         for domain_id in results:
             if domain_id is not None and domain_id not in self.collectors:
@@ -759,28 +773,34 @@ def main():
                         help="Range of domain IDs to monitor (e.g., --domain-range 10 15)")
     parser.add_argument("--namespaces", nargs="*", default=["", "stretch"],
                         help="Namespaces to monitor in each domain")
-    parser.add_argument("--auto-discover", action="store_true",
-                        help="Auto-discover active domains")
-    parser.add_argument("--discovery-interval", type=float, default=10.0,
-                        help="Seconds between auto-discovery scans")
+    parser.add_argument("--scan", action="store_true",
+                        help="Continuously scan for new domains")
+    parser.add_argument("--scan-range", nargs=2, type=int, metavar=("START", "END"),
+                        default=[0, 30],
+                        help="Range to scan for domains (default: 0 30)")
+    parser.add_argument("--scan-interval", type=float, default=10.0,
+                        help="Seconds between scans (default: 10)")
     args = parser.parse_args()
     
-    # Determine which domains to monitor
+    # Determine which domains to monitor initially
     if args.domain_range:
         domain_ids = list(range(args.domain_range[0], args.domain_range[1] + 1))
     elif args.domains:
         domain_ids = args.domains
     else:
-        domain_ids = [10]  # Default: domain 10 (common for simulations)
+        domain_ids = []  # Will scan to find domains
+    
+    scan_start, scan_end = args.scan_range
     
     print(f"""
 +==============================================================+
 |        RL Reward Visualizer - MULTI-DOMAIN                   |
 +==============================================================+
 |  Open in browser:  http://localhost:{args.port:<5}                 |
-|  Initial domains: {str(domain_ids):<42}|
-|  Namespaces: {str(args.namespaces):<48}|
-|  Auto-discover: {str(args.auto_discover):<43}|
+|  Initial domains: {str(domain_ids) if domain_ids else '(scanning...)':<40}|
+|  Namespaces: {str(args.namespaces):<47}|
+|  Continuous scan: {str(args.scan):<40}|
+|  Scan range: {scan_start}-{scan_end:<46}|
 +==============================================================+
     """)
     
@@ -790,13 +810,14 @@ def main():
     # Create domain manager
     manager = MultiDomainManager(stats_store)
     
-    # Add initial domains
+    # Add initial domains if specified
     for domain_id in domain_ids:
         manager.add_domain(domain_id, args.namespaces.copy())
     
-    # Auto-discovery if enabled
-    if args.auto_discover:
-        manager.discover_domains()
+    # If no initial domains or scanning enabled, do initial scan
+    if not domain_ids or args.scan:
+        print(f"[Manager] Initial scan of domains {scan_start}-{scan_end}...")
+        manager.discover_domains(scan_start, scan_end)
     
     # Create Flask app
     app, socketio, background_update = create_app(stats_store)
@@ -805,19 +826,21 @@ def main():
     update_thread = threading.Thread(target=background_update, daemon=True)
     update_thread.start()
     
-    # Periodic discovery thread
-    if args.auto_discover:
-        def discovery_loop():
+    # Continuous scanning thread
+    if args.scan:
+        def scan_loop():
             while True:
-                time.sleep(args.discovery_interval)
+                time.sleep(args.scan_interval)
                 try:
-                    manager.discover_domains()
+                    new_domains = manager.discover_domains(scan_start, scan_end)
+                    if new_domains:
+                        print(f"[Manager] Found new domains: {new_domains}")
                     manager.discover_namespaces_all()
                 except Exception as e:
-                    print(f"[Discovery] Error: {e}")
+                    print(f"[Scan] Error: {e}")
         
-        discovery_thread = threading.Thread(target=discovery_loop, daemon=True)
-        discovery_thread.start()
+        scan_thread = threading.Thread(target=scan_loop, daemon=True)
+        scan_thread.start()
     
     # Shutdown handler
     def shutdown(signum=None, frame=None):
@@ -831,7 +854,7 @@ def main():
     # Run Flask server
     try:
         socketio.run(app, host='0.0.0.0', port=args.port, debug=False,
-                     use_reloader=False, log_output=False)
+                     use_reloader=False, log_output=False, allow_unsafe_werkzeug=True)
     except Exception as e:
         print(f"[VIZ] Server error: {e}")
         shutdown()
