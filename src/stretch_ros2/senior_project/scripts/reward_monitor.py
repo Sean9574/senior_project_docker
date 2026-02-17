@@ -207,7 +207,7 @@ class RewardCollectorNode(Node):
         super().__init__("reward_visualizer")
         
         self.stats = stats_store
-        self.subscriptions = {}
+        self._topic_subs = {}  # Renamed to avoid conflict with Node.subscriptions property
         self.discovered_domains: Set[str] = set()
         
         # Subscribe to specified domains
@@ -218,7 +218,7 @@ class RewardCollectorNode(Node):
     
     def _subscribe_domain(self, domain: str):
         """Subscribe to reward topics for a domain."""
-        if domain in self.subscriptions:
+        if domain in self._topic_subs:
             return
         
         # Initialize stats for this domain
@@ -246,7 +246,7 @@ class RewardCollectorNode(Node):
             10
         )
         
-        self.subscriptions[domain] = {
+        self._topic_subs[domain] = {
             "reward": reward_sub,
             "breakdown": breakdown_sub
         }

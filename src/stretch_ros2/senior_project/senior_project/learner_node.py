@@ -155,6 +155,9 @@ LIDAR_MAX_RANGE = 20.0
 # Number of angular sectors for safety analysis
 NUM_SAFETY_SECTORS = 12
 
+# Safety observation size: sectors(12) + blend(1) + danger_direction(2) = 15
+SAFETY_OBS_SIZE = NUM_SAFETY_SECTORS + 3
+
 # Training
 DEFAULT_START_STEPS = 10000
 DEFAULT_EXPL_NOISE = 0.3
@@ -1251,8 +1254,10 @@ class StretchExploreEnv(gym.Env):
         
         # Observation space (added safety sector distances)
         grid_flat_size = GRID_SIZE * GRID_SIZE
+        # Breakdown: lidar(60) + goal(5) + vel(2) + prev_act(2) + has_goal(1) + grid(576) + frontier(2) + novelty(1)
+        #            + safety_obs(15) = 664
         obs_dim = (NUM_LIDAR_BINS + 5 + 2 + 2 + 1 + grid_flat_size + 2 + 1 
-                   + NUM_SAFETY_SECTORS + 2)  # +sector distances + safety blend + danger direction
+                   + SAFETY_OBS_SIZE)
         
         self.observation_space = spaces.Box(
             low=-1.0, high=1.0, shape=(obs_dim,), dtype=np.float32
@@ -1625,7 +1630,7 @@ class StretchExploreEnv(gym.Env):
             # Combine
             safety_obs = np.concatenate([sector_obs, safety_blend, danger_dir])
         else:
-            safety_obs = np.zeros(NUM_SAFETY_SECTORS + 3, dtype=np.float32)
+            safety_obs = np.zeros(SAFETY_OBS_SIZE, dtype=np.float32)
         
         # Concatenate all
         obs = np.concatenate([
@@ -2050,7 +2055,7 @@ def main():
     # Observation dimension (with safety features)
     grid_flat_size = GRID_SIZE * GRID_SIZE
     obs_dim = (NUM_LIDAR_BINS + 5 + 2 + 2 + 1 + grid_flat_size + 2 + 1 
-               + NUM_SAFETY_SECTORS + 3)  # Added safety observations
+               + SAFETY_OBS_SIZE)
     act_dim = 2
     
     # Create RND module

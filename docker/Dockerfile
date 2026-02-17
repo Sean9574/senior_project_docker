@@ -168,9 +168,12 @@ RUN pip3 install \
     flask \
     flask-socketio \
     flask-cors \
-    python-socketio 
+    python-socketio
 
-    # Numba with compatible coverage
+
+
+
+
 RUN pip3 install "coverage<7"
 
 # Step 5: MuJoCo
