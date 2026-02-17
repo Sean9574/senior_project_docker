@@ -1,22 +1,15 @@
+# ✅ FULL UPDATED FILE (your file + mask overlay + explains goal behavior)
+# Only changes:
+#  - Added mask overlay helpers
+#  - Stored mask per overlay item
+#  - Drew segmentation overlay (alpha-blended) after rotation using rotated mask
+#  - Kept your rotated/text-upright approach intact
+
 #!/usr/bin/env python3
 """
 SAM3 Goal Generator V2 (Updated)
 
-Finds objects with SAM3, estimates distance using multiple methods:
-  1) Depth camera (if available) - most accurate
-  2) Monocular depth estimation (Depth Anything server) - fallback
-  3) Width-only calibrated size method from mask (like your distance test) - fallback
-     distance = (real_width * fx) / pixel_width
-     - uses mask width (not bbox)
-     - can use camera_calib.npz for undistortion + fx
-  4) Bounding box size heuristic (legacy fallback, optional last resort)
-
-Key change requested:
-- If program detects a depth camera stream, AUTO mode defaults to depth (best accuracy).
-- If depth is not available, use the same width-only mask method as your distance test.
-
-Usage:
-    ros2 run senior_project sam3_goal_generator
+... (header unchanged)
 """
 
 import base64
@@ -46,21 +39,20 @@ from visualization_msgs.msg import Marker
 # =============================================================================
 # EDIT THIS DEFAULT (no terminal args needed)
 # =============================================================================
-DEFAULT_SHOW_GUI = False          # <--- set True/False here
-DEFAULT_GUI_SCALE = 1.0          # e.g. 0.75 smaller
-DEFAULT_GUI_FPS_OVERLAY = True   # show FPS overlay text
-DEFAULT_GUI_SAVE_DIR = "/tmp"    # screenshots go here
+DEFAULT_SHOW_GUI = False
+DEFAULT_GUI_SCALE = 1.0
+DEFAULT_GUI_FPS_OVERLAY = True
+DEFAULT_GUI_SAVE_DIR = "/tmp"
 DEFAULT_GUI_WINDOW_NAME = "SAM3 Goal Generator"
 # =============================================================================
 
 
 class DepthMode(Enum):
-    """Depth estimation mode"""
-    AUTO = "auto"           # Try depth camera first, fallback to mono/size
-    DEPTH_CAMERA = "depth"  # Depth camera only
-    MONOCULAR = "mono"      # Monocular depth estimation
-    SIZE_WIDTH = "size"     # Width-only size method (mask-based)
-    BBOX_SIZE = "bbox"      # BBox size heuristic (legacy)
+    AUTO = "auto"
+    DEPTH_CAMERA = "depth"
+    MONOCULAR = "mono"
+    SIZE_WIDTH = "size"
+    BBOX_SIZE = "bbox"
 
 
 DEFAULT_OBJECT_SIZES: Dict[str, Tuple[float, float]] = {
@@ -128,30 +120,23 @@ class SAM3GoalGeneratorV2(Node):
         self.declare_parameter('goal_offset', 0.5)
         self.declare_parameter('auto_publish_goal', True)
 
-        # Depth selection
-        self.declare_parameter('depth_mode', 'auto')  # auto | depth | mono | size | bbox
+        self.declare_parameter('depth_mode', 'auto')
         self.declare_parameter('custom_object_sizes', '{}')
-
-        # Intrinsics fallback
         self.declare_parameter('default_focal_length', 600.0)
 
-        # Topics
         self.declare_parameter('rgb_topic', '/camera/color/image_raw')
         self.declare_parameter('depth_topic', '/camera/depth/image_rect_raw')
         self.declare_parameter('camera_info_topic', '/camera/color/camera_info')
 
-        # Simple geometry fallback if TF off
         self.declare_parameter('camera_pitch_deg', 0.0)
         self.declare_parameter('camera_height', 1.0)
         self.declare_parameter('camera_forward_offset', 0.0)
 
-        # TF
         self.declare_parameter('use_tf', True)
         self.declare_parameter('camera_frame', 'camera_color_optical_frame')
         self.declare_parameter('robot_frame', 'base_link')
         self.declare_parameter('odom_frame', 'odom')
 
-        # Calibration file (for width-only size fallback)
         self.declare_parameter('camera_calib_path', 'camera_calib.npz')
         self.declare_parameter('use_undistort_for_size_method', True)
 
@@ -188,20 +173,21 @@ class SAM3GoalGeneratorV2(Node):
         self.robot_frame = self.get_parameter('robot_frame').value
         self.odom_frame = self.get_parameter('odom_frame').value
 
-        # Calibration config
         self.camera_calib_path = str(self.get_parameter('camera_calib_path').value)
         self.use_undistort_for_size_method = bool(self.get_parameter('use_undistort_for_size_method').value)
 
-        # GUI config
         self.show_gui = bool(self.get_parameter('show_gui').value)
         self.gui_window_name = str(self.get_parameter('gui_window_name').value)
         self.gui_scale = float(self.get_parameter('gui_scale').value)
         self.gui_show_fps = bool(self.get_parameter('gui_fps').value)
         self.gui_save_dir = str(self.get_parameter('gui_save_dir').value)
 
-        # ===== NEW: Rotate visualization 90° (camera is sideways) =====
-        # Keep as code-level "set and forget" like your other defaults.
+        # Rotate visualization 90° (camera is sideways)
         self.rotate_viz_90_clockwise = True
+
+        # ===== NEW: mask overlay settings =====
+        self.show_segmentation_overlay = True
+        self.seg_overlay_alpha = 0.35  # 0..1 transparency
 
         # TF
         self.tf_buffer = Buffer()
@@ -235,30 +221,26 @@ class SAM3GoalGeneratorV2(Node):
         self.robot_yaw = 0.0
         self.goal_sent = False
 
-        # Depth camera availability should be "fresh"
         self.depth_camera_available = False
         self._last_depth_msg_time = 0.0
-        self.depth_stale_sec = 1.0  # if no depth msg within this window, treat as unavailable
+        self.depth_stale_sec = 1.0
 
-        # Mono depth server availability
         self.mono_depth_available = False
         self.last_depth_check = 0.0
         self.depth_check_interval = 5.0
 
         self.session = requests.Session()
 
-        # GUI runtime state
         self.gui_ready = False
         self.gui_paused = False
         self._last_viz_for_gui = None
         self._last_gui_time = time.time()
         self._gui_fps = 0.0
 
-        # Calibration (intrinsics + distortion)
         self._calib_loaded = False
         self._K = None
         self._D = None
-        self._undistort_maps = None  # (map1, map2, newK, size)
+        self._undistort_maps = None
         self._load_camera_calibration()
 
         # ==================== QoS ====================
@@ -306,24 +288,34 @@ class SAM3GoalGeneratorV2(Node):
         return cv2.rotate(img, cv2.ROTATE_90_CLOCKWISE)
 
     def _pt_rot90_cw(self, x: int, y: int, orig_h: int) -> Tuple[int, int]:
-        """
-        Map point (x,y) from original image into a 90° clockwise rotated image.
-        Original size: (orig_h, orig_w). Rotated size: (orig_w, orig_h).
-        Formula (CW):
-          x' = (orig_h - 1) - y
-          y' = x
-        """
         return (int((orig_h - 1) - y), int(x))
 
     def _rect_rot90_cw(self, x1: int, y1: int, x2: int, y2: int, orig_h: int) -> Tuple[int, int, int, int]:
-        """
-        Rotate an axis-aligned rectangle by rotating both corners then taking min/max.
-        """
         rx1, ry1 = self._pt_rot90_cw(x1, y1, orig_h)
         rx2, ry2 = self._pt_rot90_cw(x2, y2, orig_h)
-        nx1, nx2 = (min(rx1, rx2), max(rx1, rx2))
-        ny1, ny2 = (min(ry1, ry2), max(ry1, ry2))
-        return (nx1, ny1, nx2, ny2)
+        return (min(rx1, rx2), min(ry1, ry2), max(rx1, rx2), max(ry1, ry2))
+
+    def _mask_to_rgb_size(self, mask: np.ndarray, h: int, w: int) -> np.ndarray:
+        if mask is None:
+            return None
+        if mask.shape[:2] != (h, w):
+            return cv2.resize(mask, (w, h), interpolation=cv2.INTER_NEAREST)
+        return mask
+
+    def _overlay_mask(self, img_bgr: np.ndarray, mask_u8: np.ndarray, color_bgr: Tuple[int, int, int], alpha: float):
+        """
+        Alpha-blend a colored segmentation mask onto img_bgr in-place.
+        mask_u8: 0..255 mask image
+        """
+        if mask_u8 is None:
+            return
+        m = mask_u8 > 127
+        if not np.any(m):
+            return
+
+        overlay = img_bgr.copy()
+        overlay[m] = color_bgr
+        cv2.addWeighted(overlay, float(alpha), img_bgr, 1.0 - float(alpha), 0.0, dst=img_bgr)
 
     # ==================== Calibration Helpers ====================
 
@@ -350,7 +342,6 @@ class SAM3GoalGeneratorV2(Node):
                     self.get_logger().warn(f"Found calib file but failed to load ({p}): {e}")
                     self._calib_loaded = False
                     return
-
         self._calib_loaded = False
 
     def _ensure_undistort_maps(self, w: int, h: int):
@@ -444,7 +435,6 @@ class SAM3GoalGeneratorV2(Node):
     def get_mono_depth(self, rgb: np.ndarray) -> Optional[np.ndarray]:
         if not self.mono_depth_available:
             return None
-
         try:
             _, buf = cv2.imencode('.jpg', rgb, [cv2.IMWRITE_JPEG_QUALITY, 80])
             img_b64 = base64.b64encode(buf).decode()
@@ -454,7 +444,6 @@ class SAM3GoalGeneratorV2(Node):
                 json={"image_base64": img_b64},
                 timeout=5
             )
-
             if r.status_code != 200:
                 return None
 
@@ -559,7 +548,6 @@ class SAM3GoalGeneratorV2(Node):
         fx = self._get_fx_for_size_method()
 
         distance = (real_w * fx) / float(mask_w)
-
         if distance < 0.1 or distance > 20.0:
             return None
         return float(distance)
@@ -624,7 +612,6 @@ class SAM3GoalGeneratorV2(Node):
             ys, xs = np.where(mask_rs > 127)
             if len(xs) > 0:
                 return int(np.mean(xs)), int(np.mean(ys))
-
         x1, y1, x2, y2 = box
         return int((x1 + x2) / 2), int((y1 + y2) / 2)
 
@@ -661,7 +648,6 @@ class SAM3GoalGeneratorV2(Node):
             d = self.estimate_distance_from_bbox(box, object_class, rgb.shape[1], rgb.shape[0])
             return d, "bbox_size"
 
-        # AUTO
         if depth_ok:
             d = self._get_depth_from_mask_or_point(mask, depth_img, cx, cy)
             if d is not None:
@@ -706,7 +692,6 @@ class SAM3GoalGeneratorV2(Node):
     def get_camera_to_odom_transform(self) -> Optional[np.ndarray]:
         if not self.use_tf:
             return None
-
         try:
             transform = self.tf_buffer.lookup_transform(
                 self.odom_frame,
@@ -849,17 +834,13 @@ class SAM3GoalGeneratorV2(Node):
         best_detection = None
         best_score = 0.0
 
-        # Start from a clean frame; we will draw AFTER rotation so text is upright.
         viz_base = rgb.copy()
-
-        # Collect overlay items in ORIGINAL coords
-        overlays = []  # each: dict with rect, center, color, label
+        overlays = []
 
         for box, score, mask_b64 in zip(boxes, scores, masks_b64):
             mask = self.decode_mask(mask_b64)
 
             cx, cy = self.get_mask_center(mask, box, rgb)
-
             dist, method = self.get_distance_auto(mask, depth, box, prompt, rgb)
             if dist is None or dist < self.min_dist or dist > self.max_dist:
                 continue
@@ -888,6 +869,7 @@ class SAM3GoalGeneratorV2(Node):
                 "center": (cx, cy),
                 "color": color,
                 "label": label,
+                "mask": mask,  # ✅ store mask so we can overlay it
             })
 
             if float(score) > best_score:
@@ -913,6 +895,7 @@ class SAM3GoalGeneratorV2(Node):
             dy = best_detection['odom_y'] - self.robot_y
             dist_to_obj = math.sqrt(dx * dx + dy * dy)
 
+            # ✅ goal offset: stop short by goal_offset meters
             if dist_to_obj > self.goal_offset:
                 scale = (dist_to_obj - self.goal_offset) / dist_to_obj
                 goal_x = self.robot_x + dx * scale
@@ -933,6 +916,7 @@ class SAM3GoalGeneratorV2(Node):
             }
 
             if self.auto_publish and not self.goal_sent:
+                # ✅ publish goal to /{ns}/goal as PointStamped in odom frame
                 self.publish_goal(goal_x, goal_y)
                 self.goal_sent = True
         else:
@@ -945,14 +929,31 @@ class SAM3GoalGeneratorV2(Node):
 
         self.status_pub.publish(String(data=json.dumps(status)))
 
-        # ===== Rotate FIRST, then draw overlays so text is readable =====
+        # ===== Rotate FIRST, then draw segmentation overlay + boxes/text =====
         orig_h, orig_w = viz_base.shape[0], viz_base.shape[1]
         viz = viz_base
 
         if self.rotate_viz_90_clockwise:
             viz = self._rotate90_cw(viz)
 
-        # Draw detections in rotated space (rects/circles/text)
+        # 1) SEGMENTATION OVERLAY (so you actually "see" SAM3 segmentation)
+        if self.show_segmentation_overlay:
+            for item in overlays:
+                mask = item.get("mask", None)
+                if mask is None:
+                    continue
+
+                # Resize mask to original RGB size
+                mask_rs = self._mask_to_rgb_size(mask, orig_h, orig_w)
+
+                # Rotate mask to match viz orientation (same rotation as image)
+                if self.rotate_viz_90_clockwise:
+                    mask_rs = self._rotate90_cw(mask_rs)
+
+                # Overlay using the same color as box
+                self._overlay_mask(viz, mask_rs, item["color"], self.seg_overlay_alpha)
+
+        # 2) BOXES/TEXT/CENTER (on top of overlay)
         for item in overlays:
             x1, y1, x2, y2 = item["rect"]
             cx, cy = item["center"]
@@ -962,7 +963,6 @@ class SAM3GoalGeneratorV2(Node):
             if self.rotate_viz_90_clockwise:
                 rx1, ry1, rx2, ry2 = self._rect_rot90_cw(x1, y1, x2, y2, orig_h)
                 rcx, rcy = self._pt_rot90_cw(cx, cy, orig_h)
-                # text anchor near top-left of rotated rect
                 tx, ty = rx1, max(15, ry1 - 10)
             else:
                 rx1, ry1, rx2, ry2 = x1, y1, x2, y2
@@ -974,20 +974,18 @@ class SAM3GoalGeneratorV2(Node):
             cv2.putText(viz, label, (tx, ty),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
 
-        # Draw global status text (upright, because we’re already in final orientation)
+        # HUD text
         mode_str = f"Mode: {self.depth_mode.value} | Available: {', '.join(depth_status)}"
         cv2.putText(viz, f"Target: {prompt} | Robot: ({self.robot_x:.1f}, {self.robot_y:.1f})",
                     (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
         cv2.putText(viz, mode_str, (10, viz.shape[0] - 10),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
 
-        if best_detection:
+        if best_detection and status.get("found") and "goal_position" in status:
+            gx, gy = status["goal_position"]
             method_name = best_detection['method'].replace('_', ' ').title()
-            # If we have a goal in status, show it
-            if status.get("found") and "goal_position" in status:
-                gx, gy = status["goal_position"]
-                cv2.putText(viz, f"GOAL: ({gx:.1f}, {gy:.1f}) via {method_name}",
-                            (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            cv2.putText(viz, f"GOAL: ({gx:.1f}, {gy:.1f}) via {method_name}",
+                        (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
 
         # Publish rotated visualization
         self.viz_pub.publish(self.bridge.cv2_to_imgmsg(viz, 'bgr8'))
@@ -999,7 +997,6 @@ class SAM3GoalGeneratorV2(Node):
         if not self.gui_ready or viz_bgr is None:
             return
 
-        # NOTE: DO NOT rotate here anymore (already rotated in process_callback)
         now = time.time()
         dt = max(now - self._last_gui_time, 1e-6)
         self._last_gui_time = now

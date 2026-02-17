@@ -117,6 +117,7 @@ V_MIN_REVERSE = -0.05
 R_GOAL = 2500.0
 R_COLLISION = -2000.0
 R_TIMEOUT = -100.0
+R_MISSION_COMPLETE = 5000.0  # Bonus for fully exploring AND finding goal(s)
 GOAL_RADIUS = 0.45
 
 PROGRESS_SCALE = 500.0
@@ -955,10 +956,23 @@ class EgoOccupancyGrid:
             self.visit_counts[key] *= VISIT_DECAY
     
     def get_stats(self) -> Dict:
+        # Count frontier cells (free cells with unknown neighbors)
+        frontier_count = 0
+        for key, value in self.world_grid.items():
+            if value != 0.5:  # Not a free cell
+                continue
+            for ndx, ndy in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+                neighbor_key = (key[0] + ndx, key[1] + ndy)
+                if neighbor_key not in self.world_grid:
+                    frontier_count += 1
+                    break  # Only count cell once
+        
         return {
             'total_discovered': self.total_cells_discovered,
             'new_this_step': self.cells_discovered_this_step,
             'world_grid_size': len(self.world_grid),
+            'frontier_count': frontier_count,
+            'fully_explored': frontier_count == 0 and self.total_cells_discovered > 50,
         }
     
     def reset(self):
@@ -1249,10 +1263,10 @@ class StretchExploreEnv(gym.Env):
         self.prev_action = np.zeros(2, dtype=np.float32)
         self.prev_goal_dist = 0.0
         
-        # Goal tracking to prevent instant re-success after reaching goal
-        self._goal_just_reached = False
-        self._goal_cooldown_pos = None  # Position when goal was reached
-        self._min_move_from_goal = 1.0  # Must move 1m away before new goal accepted
+        # Goal tracking to prevent immediate re-success at same location
+        self._last_goal_reached_pos = None  # (x, y) of last reached goal
+        self._min_goal_separation = 1.5  # Must be 1.5m from last goal to accept new goal
+        self._goals_reached_this_episode = 0  # Count of goals reached
         
         # Track safety interventions for logging
         self.episode_interventions = []
@@ -1298,16 +1312,9 @@ class StretchExploreEnv(gym.Env):
         self.prev_action[:] = 0.0
         self.occ_grid.reset()
         self.episode_interventions = []
+        self._goals_reached_this_episode = 0
         
         self.occ_grid.decay_visits()
-        
-        # CRITICAL FIX: Clear goal after episode ends
-        # This prevents instant re-success when robot is still at goal position
-        # The goal generator will re-publish when it detects the target again
-        if hasattr(self, '_goal_just_reached') and self._goal_just_reached:
-            self.ros.last_goal = None
-            self._goal_just_reached = False
-            self._goal_cooldown_pos = self._get_robot_state()
         
         self.prev_goal_dist = self._goal_distance()
         
@@ -1384,19 +1391,22 @@ class StretchExploreEnv(gym.Env):
         
         has_goal = self.ros.last_goal is not None
         
-        # Check if we're in cooldown after reaching a goal
-        # Robot must move away before accepting a new goal
-        if has_goal and self._goal_cooldown_pos is not None:
-            dx = st["x"] - self._goal_cooldown_pos["x"]
-            dy = st["y"] - self._goal_cooldown_pos["y"]
-            dist_from_success = math.hypot(dx, dy)
+        # Check if new goal is too close to a recently reached goal
+        # This prevents immediate re-triggering when goal generator publishes same target
+        if has_goal and self._last_goal_reached_pos is not None:
+            goal_x = self.ros.last_goal.point.x
+            goal_y = self.ros.last_goal.point.y
+            last_x, last_y = self._last_goal_reached_pos
             
-            if dist_from_success < self._min_move_from_goal:
-                # Still too close to last success position - ignore goal
+            dist_from_last_goal = math.hypot(goal_x - last_x, goal_y - last_y)
+            
+            if dist_from_last_goal < self._min_goal_separation:
+                # New goal is same as last reached goal - ignore it
+                # Robot must explore until target moves or different target found
                 has_goal = False
             else:
-                # Moved far enough, clear cooldown
-                self._goal_cooldown_pos = None
+                # Different goal location, clear the cooldown
+                self._last_goal_reached_pos = None
         
         if has_goal:
             reward, terminated, info = self._compute_goal_reward(safe_v, safe_w)
@@ -1432,19 +1442,43 @@ class StretchExploreEnv(gym.Env):
         
         truncated = self.step_count >= self.max_steps
         
+        # Check for "mission complete" termination:
+        # Environment fully explored AND at least one goal reached
+        stats = self.occ_grid.get_stats()
+        mission_complete = False
+        if stats['fully_explored'] and self._goals_reached_this_episode > 0:
+            terminated = True
+            mission_complete = True
+            info["mission_complete"] = True
+            
+            # Add mission complete bonus
+            reward += R_MISSION_COMPLETE
+            self.episode_return += R_MISSION_COMPLETE  # Also update episode total
+            info["reward_terms"]["mission_complete"] = R_MISSION_COMPLETE
+            
+            self.ros.get_logger().info(
+                f"[MISSION COMPLETE] Explored {stats['total_discovered']} cells, "
+                f"reached {self._goals_reached_this_episode} goal(s), bonus +{R_MISSION_COMPLETE:.0f}"
+            )
+        
         # Logging
         if terminated or truncated:
             mode = "GOAL" if has_goal else "EXPLORE"
-            status = "SUCCESS" if info.get("success", False) else (
-                "COLLISION" if info.get("collision", False) else "TIMEOUT"
-            )
-            stats = self.occ_grid.get_stats()
+            if mission_complete:
+                status = "MISSION_COMPLETE"
+            elif info.get("success", False):
+                status = "SUCCESS"
+            elif info.get("collision", False):
+                status = "COLLISION"
+            else:
+                status = "TIMEOUT"
             avg_intervention = np.mean(self.episode_interventions) if self.episode_interventions else 0.0
             self.ros.get_logger().info(
                 f"[EP {self.episode_index:04d}] {mode} {status} | "
                 f"Return {self.episode_return:+.1f} | Steps {self.step_count} | "
-                f"Discovered {stats['total_discovered']} cells | "
-                f"Avg Intervention {avg_intervention:.1%}"
+                f"Cells {stats['total_discovered']} | Frontiers {stats['frontier_count']} | "
+                f"Goals {self._goals_reached_this_episode} | "
+                f"Intervention {avg_intervention:.1%}"
             )
             self.episode_index += 1
         
@@ -1454,7 +1488,8 @@ class StretchExploreEnv(gym.Env):
             self.ros.get_logger().info(
                 f"[{mode}] step={self.step_count} zone={safety_state.zone} "
                 f"blend={safety_state.safety_blend:.0%} min_d={safety_state.min_distance:.2f}m "
-                f"rl=[{rl_v:.2f},{rl_w:.2f}] safe=[{safe_v:.2f},{safe_w:.2f}]"
+                f"rl=[{rl_v:.2f},{rl_w:.2f}] safe=[{safe_v:.2f},{safe_w:.2f}] "
+                f"frontiers={stats['frontier_count']} goals={self._goals_reached_this_episode}"
             )
         
         # Publish reward breakdown
@@ -1551,11 +1586,27 @@ class StretchExploreEnv(gym.Env):
         
         r_goal = 0.0
         if d_goal <= GOAL_RADIUS:
-            terminated = True
+            # Goal reached! Give reward but DON'T terminate
+            # Robot can't reset/teleport, so continue in explore mode
             success = True
             r_goal = R_GOAL
-            # Mark that goal was reached - reset() will clear the goal
-            self._goal_just_reached = True
+            
+            # Track goals reached
+            self._goals_reached_this_episode += 1
+            
+            # Record where the goal was so we don't immediately re-trigger
+            self._last_goal_reached_pos = (self.ros.last_goal.point.x, self.ros.last_goal.point.y)
+            
+            # Clear the goal so robot transitions to explore mode
+            self.ros.last_goal = None
+            
+            # Log the goal success
+            self.ros.get_logger().info(
+                f"[GOAL REACHED #{self._goals_reached_this_episode}] dist={d_goal:.2f}m, reward={r_goal:.0f}, continuing exploration"
+            )
+            
+            # DON'T set terminated = True here
+            # Termination happens later if fully explored
         
         # Collision based on safety zone
         r_collision = 0.0
