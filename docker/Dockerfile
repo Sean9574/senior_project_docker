@@ -164,9 +164,13 @@ RUN pip3 install \
     Pillow \
     flask \
     flask-socketio \
-    termcolor
+    termcolor \
+    flask \
+    flask-socketio \
+    flask-cors \
+    python-socketio 
 
-# Numba with compatible coverage
+    # Numba with compatible coverage
 RUN pip3 install "coverage<7"
 
 # Step 5: MuJoCo
