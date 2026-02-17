@@ -1,20 +1,24 @@
 #!/usr/bin/env python3
 """
-Real-Time Reward Visualization Server
+Multi-Domain Real-Time Reward Visualization Server
 
-Collects reward data from multiple robot domains via ROS topics and serves
+Collects reward data from MULTIPLE ROS2 domains simultaneously and serves
 a real-time dashboard via localhost web interface.
 
-Features:
-- Auto-discovers robot domains or accepts manual configuration
-- Real-time WebSocket updates to browser
-- Tracks reward components breakdown
-- Shows safety intervention rates
-- Supports multiple concurrent domains
+KEY FEATURE: Monitors multiple ROS_DOMAIN_IDs at once!
+
+Each ROS2 domain is isolated, so we spawn a separate rclpy context for each
+domain we want to monitor.
 
 Usage:
-    python3 reward_visualizer.py --domains stretch1 stretch2 stretch3
-    python3 reward_visualizer.py --auto-discover
+    # Monitor specific domains
+    python3 reward_visualizer_multi.py --domains 10 11 12
+    
+    # Monitor domain range (e.g., sims 0-4 starting at base domain 10)
+    python3 reward_visualizer_multi.py --domain-range 10 14
+    
+    # Auto-discover (scans domains 0-50)
+    python3 reward_visualizer_multi.py --auto-discover
     
 Then open http://localhost:5555 in your browser
 """
@@ -28,14 +32,16 @@ import sys
 import threading
 import time
 from collections import deque
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional, Set, Tuple
+from concurrent.futures import ThreadPoolExecutor
 
 import rclpy
 from rclpy.node import Node
-from rclpy.executors import MultiThreadedExecutor
-from rclpy.qos import qos_profile_sensor_data
+from rclpy.context import Context
+from rclpy.executors import SingleThreadedExecutor
+from rclpy.qos import qos_profile_sensor_data, QoSProfile, ReliabilityPolicy, HistoryPolicy
 from std_msgs.msg import Float32, String as StringMsg
 
 from flask import Flask, render_template_string, jsonify
@@ -47,9 +53,10 @@ from flask_cors import CORS
 # =============================================================================
 
 DEFAULT_PORT = 5555
-MAX_HISTORY_LENGTH = 1000  # Points to keep per domain
-UPDATE_RATE_HZ = 10  # How often to push updates to browser
-DISCOVERY_INTERVAL = 5.0  # Seconds between auto-discovery scans
+MAX_HISTORY_LENGTH = 1000
+UPDATE_RATE_HZ = 10
+DISCOVERY_SCAN_DOMAINS = range(0, 51)  # Domains to scan during auto-discovery
+DISCOVERY_TIMEOUT = 2.0  # Seconds to wait for topics in each domain
 
 # =============================================================================
 # Data Structures
@@ -58,25 +65,19 @@ DISCOVERY_INTERVAL = 5.0  # Seconds between auto-discovery scans
 @dataclass
 class DomainStats:
     """Statistics for a single robot domain."""
-    domain: str
+    domain_id: int
+    namespace: str
+    display_name: str
     rewards: deque = field(default_factory=lambda: deque(maxlen=MAX_HISTORY_LENGTH))
     timestamps: deque = field(default_factory=lambda: deque(maxlen=MAX_HISTORY_LENGTH))
-    
-    # Reward breakdown components
     components: Dict[str, deque] = field(default_factory=dict)
-    
-    # Episode tracking
     episode_returns: deque = field(default_factory=lambda: deque(maxlen=100))
     episode_lengths: deque = field(default_factory=lambda: deque(maxlen=100))
     current_episode_return: float = 0.0
     current_episode_steps: int = 0
     episode_count: int = 0
-    
-    # Safety stats
     safety_zones: deque = field(default_factory=lambda: deque(maxlen=MAX_HISTORY_LENGTH))
     intervention_rates: deque = field(default_factory=lambda: deque(maxlen=MAX_HISTORY_LENGTH))
-    
-    # Running stats
     total_steps: int = 0
     last_update: float = 0.0
     active: bool = True
@@ -90,17 +91,14 @@ class DomainStats:
         self.last_update = time.time()
     
     def add_breakdown(self, breakdown: Dict):
-        """Add reward breakdown data."""
         timestamp = time.time()
         
-        # Extract reward terms
         reward_terms = breakdown.get("reward_terms", {})
         for key, value in reward_terms.items():
             if key not in self.components:
                 self.components[key] = deque(maxlen=MAX_HISTORY_LENGTH)
             self.components[key].append((timestamp, value))
         
-        # Extract safety info
         safety = breakdown.get("safety", {})
         zone = safety.get("zone", "UNKNOWN")
         intervention = safety.get("intervention", 0.0)
@@ -113,7 +111,6 @@ class DomainStats:
             self.end_episode()
     
     def end_episode(self):
-        """Record episode completion."""
         self.episode_returns.append(self.current_episode_return)
         self.episode_lengths.append(self.current_episode_steps)
         self.episode_count += 1
@@ -121,12 +118,13 @@ class DomainStats:
         self.current_episode_steps = 0
     
     def get_summary(self) -> Dict:
-        """Get summary statistics."""
         recent_rewards = list(self.rewards)[-100:] if self.rewards else [0]
         recent_interventions = [x[1] for x in list(self.intervention_rates)[-100:]] if self.intervention_rates else [0]
         
         return {
-            "domain": self.domain,
+            "domain_id": self.domain_id,
+            "namespace": self.namespace,
+            "display_name": self.display_name,
             "total_steps": self.total_steps,
             "episode_count": self.episode_count,
             "current_episode_return": self.current_episode_return,
@@ -139,920 +137,578 @@ class DomainStats:
         }
     
     def get_plot_data(self, max_points: int = 500) -> Dict:
-        """Get data formatted for plotting."""
-        # Downsample if needed
         step = max(1, len(self.rewards) // max_points)
         
         rewards = list(self.rewards)[::step]
         timestamps = list(self.timestamps)[::step]
         
-        # Convert timestamps to relative seconds
         if timestamps:
             t0 = timestamps[0]
             rel_times = [(t - t0) for t in timestamps]
         else:
             rel_times = []
         
-        # Episode returns
         episode_returns = list(self.episode_returns)
         episode_indices = list(range(len(episode_returns)))
         
-        # Component data
         components_data = {}
         for key, values in self.components.items():
             vals = list(values)[::step]
+            t0_comp = vals[0][0] if vals else (t0 if timestamps else 0)
             components_data[key] = {
-                "times": [(v[0] - t0) if timestamps else 0 for v in vals],
+                "times": [(v[0] - t0_comp) for v in vals],
                 "values": [v[1] for v in vals]
             }
         
-        # Safety zone distribution
         zone_counts = {"FREE": 0, "AWARE": 0, "CAUTION": 0, "DANGER": 0, "EMERGENCY": 0, "CRITICAL": 0}
         for _, zone in list(self.safety_zones)[-500:]:
             if zone in zone_counts:
                 zone_counts[zone] += 1
         
-        # Intervention over time
         interventions = list(self.intervention_rates)[::step]
-        intervention_times = [(v[0] - t0) if timestamps else 0 for v in interventions]
+        t0_int = interventions[0][0] if interventions else (t0 if timestamps else 0)
+        intervention_times = [(v[0] - t0_int) for v in interventions]
         intervention_values = [v[1] for v in interventions]
         
         return {
-            "domain": self.domain,
-            "rewards": {
-                "times": rel_times,
-                "values": rewards
-            },
-            "episode_returns": {
-                "episodes": episode_indices,
-                "values": episode_returns
-            },
+            "domain_id": self.domain_id,
+            "display_name": self.display_name,
+            "rewards": {"times": rel_times, "values": rewards},
+            "episode_returns": {"episodes": episode_indices, "values": episode_returns},
             "components": components_data,
             "safety_zones": zone_counts,
-            "interventions": {
-                "times": intervention_times,
-                "values": intervention_values
-            }
+            "interventions": {"times": intervention_times, "values": intervention_values}
         }
 
 
 # =============================================================================
-# ROS Subscriber Node
+# Per-Domain ROS2 Subscriber
 # =============================================================================
 
-class RewardCollectorNode(Node):
-    """ROS node that subscribes to reward topics from multiple domains."""
+class DomainCollector:
+    """
+    Collects reward data from a single ROS2 domain.
+    Each domain gets its own rclpy context and executor.
+    """
     
-    def __init__(self, domains: List[str], stats_store: Dict[str, DomainStats]):
-        super().__init__("reward_visualizer")
-        
+    def __init__(self, domain_id: int, stats_store: Dict[str, DomainStats], 
+                 namespaces: List[str] = None):
+        self.domain_id = domain_id
         self.stats = stats_store
-        self._topic_subs = {}  # Renamed to avoid conflict with Node.subscriptions property
-        self.discovered_domains: Set[str] = set()
+        self.namespaces = namespaces or [""]
+        self.running = False
         
-        # Subscribe to specified domains
-        for domain in domains:
-            self._subscribe_domain(domain)
+        # Create isolated ROS2 context for this domain
+        self.context = Context()
+        rclpy.init(context=self.context, domain_id=domain_id)
         
-        self.get_logger().info(f"[VIZ] Collecting rewards from {len(domains)} domains")
+        # Create node in this context
+        self.node = rclpy.create_node(
+            f"reward_viz_domain_{domain_id}",
+            context=self.context,
+            automatically_declare_parameters_from_overrides=True
+        )
+        
+        self.executor = SingleThreadedExecutor(context=self.context)
+        self.executor.add_node(self.node)
+        
+        self._subscriptions = []
+        self._setup_subscriptions()
+        
+        self.node.get_logger().info(f"[Domain {domain_id}] Collector initialized")
     
-    def _subscribe_domain(self, domain: str):
-        """Subscribe to reward topics for a domain."""
-        if domain in self._topic_subs:
-            return
-        
-        # Initialize stats for this domain
-        if domain not in self.stats:
-            self.stats[domain] = DomainStats(domain=domain)
-        
-        # Determine topic names
-        if domain:
-            reward_topic = f"/{domain}/reward"
-            breakdown_topic = f"/{domain}/reward_breakdown"
+    def _setup_subscriptions(self):
+        """Subscribe to reward topics for all namespaces."""
+        for ns in self.namespaces:
+            self._subscribe_namespace(ns)
+    
+    def _subscribe_namespace(self, namespace: str):
+        """Subscribe to reward topics for a specific namespace."""
+        # Build topic names
+        if namespace:
+            reward_topic = f"/{namespace}/reward"
+            breakdown_topic = f"/{namespace}/reward_breakdown"
+            display_name = f"D{self.domain_id}:{namespace}"
         else:
             reward_topic = "/reward"
             breakdown_topic = "/reward_breakdown"
+            display_name = f"Domain {self.domain_id}"
         
-        # Create subscriptions
-        reward_sub = self.create_subscription(
+        # Create unique key for this domain+namespace combo
+        stats_key = f"{self.domain_id}:{namespace}"
+        
+        if stats_key not in self.stats:
+            self.stats[stats_key] = DomainStats(
+                domain_id=self.domain_id,
+                namespace=namespace,
+                display_name=display_name
+            )
+        
+        # QoS profile
+        qos = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=10
+        )
+        
+        # Subscribe to reward
+        reward_sub = self.node.create_subscription(
             Float32, reward_topic,
-            lambda msg, d=domain: self._reward_callback(msg, d),
-            10
+            lambda msg, k=stats_key: self._reward_callback(msg, k),
+            qos
         )
+        self._subscriptions.append(reward_sub)
         
-        breakdown_sub = self.create_subscription(
+        # Subscribe to breakdown
+        breakdown_sub = self.node.create_subscription(
             StringMsg, breakdown_topic,
-            lambda msg, d=domain: self._breakdown_callback(msg, d),
-            10
+            lambda msg, k=stats_key: self._breakdown_callback(msg, k),
+            qos
         )
+        self._subscriptions.append(breakdown_sub)
         
-        self._topic_subs[domain] = {
-            "reward": reward_sub,
-            "breakdown": breakdown_sub
-        }
-        
-        self.discovered_domains.add(domain)
-        self.get_logger().info(f"[VIZ] Subscribed to domain: {domain or 'default'}")
+        self.node.get_logger().info(f"[Domain {self.domain_id}] Subscribed: {reward_topic}")
     
-    def _reward_callback(self, msg: Float32, domain: str):
-        """Handle incoming reward message."""
-        if domain in self.stats:
-            self.stats[domain].add_reward(msg.data, time.time())
+    def _reward_callback(self, msg: Float32, stats_key: str):
+        if stats_key in self.stats:
+            self.stats[stats_key].add_reward(msg.data, time.time())
     
-    def _breakdown_callback(self, msg: StringMsg, domain: str):
-        """Handle incoming reward breakdown message."""
+    def _breakdown_callback(self, msg: StringMsg, stats_key: str):
         try:
             breakdown = json.loads(msg.data)
-            if domain in self.stats:
-                self.stats[domain].add_breakdown(breakdown)
+            if stats_key in self.stats:
+                self.stats[stats_key].add_breakdown(breakdown)
         except json.JSONDecodeError:
             pass
     
-    def discover_domains(self) -> List[str]:
-        """Discover available domains by scanning topics."""
-        # Get all topics
-        topic_names_and_types = self.get_topic_names_and_types()
+    def discover_namespaces(self) -> List[str]:
+        """Discover namespaces with reward topics in this domain."""
+        discovered = []
         
-        new_domains = []
+        topic_names_and_types = self.node.get_topic_names_and_types()
+        
         for topic_name, _ in topic_names_and_types:
             if topic_name.endswith("/reward"):
-                # Extract domain name
-                parts = topic_name.split("/")
-                if len(parts) >= 3:
-                    domain = parts[1]
-                    if domain not in self.discovered_domains:
-                        new_domains.append(domain)
-                        self._subscribe_domain(domain)
-                elif topic_name == "/reward":
-                    if "" not in self.discovered_domains:
-                        new_domains.append("")
-                        self._subscribe_domain("")
+                # Extract namespace
+                parts = topic_name.rsplit("/reward", 1)[0]
+                if parts:
+                    ns = parts.lstrip("/")
+                else:
+                    ns = ""
+                
+                if ns not in self.namespaces:
+                    discovered.append(ns)
+                    self._subscribe_namespace(ns)
+                    self.namespaces.append(ns)
         
-        return new_domains
+        return discovered
+    
+    def spin(self):
+        """Spin the executor (call from thread)."""
+        self.running = True
+        while self.running:
+            try:
+                self.executor.spin_once(timeout_sec=0.1)
+            except Exception as e:
+                self.node.get_logger().warn(f"[Domain {self.domain_id}] Spin error: {e}")
+    
+    def stop(self):
+        """Stop the collector."""
+        self.running = False
+        try:
+            self.executor.shutdown()
+            self.node.destroy_node()
+            rclpy.shutdown(context=self.context)
+        except Exception:
+            pass
 
 
 # =============================================================================
-# Flask Web Server
+# Multi-Domain Manager
 # =============================================================================
 
-# HTML Template for the dashboard
+class MultiDomainManager:
+    """Manages collectors for multiple ROS2 domains."""
+    
+    def __init__(self, stats_store: Dict[str, DomainStats]):
+        self.stats = stats_store
+        self.collectors: Dict[int, DomainCollector] = {}
+        self.threads: Dict[int, threading.Thread] = {}
+        self.lock = threading.Lock()
+    
+    def add_domain(self, domain_id: int, namespaces: List[str] = None) -> bool:
+        """Add a domain to monitor."""
+        with self.lock:
+            if domain_id in self.collectors:
+                return False
+            
+            try:
+                collector = DomainCollector(domain_id, self.stats, namespaces)
+                self.collectors[domain_id] = collector
+                
+                # Start spin thread
+                thread = threading.Thread(
+                    target=collector.spin,
+                    daemon=True,
+                    name=f"domain_{domain_id}_spin"
+                )
+                thread.start()
+                self.threads[domain_id] = thread
+                
+                print(f"[Manager] Added domain {domain_id}")
+                return True
+            except Exception as e:
+                print(f"[Manager] Failed to add domain {domain_id}: {e}")
+                return False
+    
+    def discover_domains(self, domain_range: range = None) -> List[int]:
+        """Scan for active domains with reward topics."""
+        domain_range = domain_range or DISCOVERY_SCAN_DOMAINS
+        discovered = []
+        
+        print(f"[Manager] Scanning domains {domain_range.start}-{domain_range.stop-1}...")
+        
+        def check_domain(domain_id: int) -> Optional[int]:
+            """Check if a domain has reward topics."""
+            try:
+                ctx = Context()
+                rclpy.init(context=ctx, domain_id=domain_id)
+                node = rclpy.create_node(f"scanner_{domain_id}", context=ctx)
+                
+                # Wait a bit for discovery
+                time.sleep(0.5)
+                
+                topics = node.get_topic_names_and_types()
+                has_reward = any(t[0].endswith("/reward") for t in topics)
+                
+                node.destroy_node()
+                rclpy.shutdown(context=ctx)
+                
+                if has_reward:
+                    return domain_id
+                return None
+            except Exception:
+                return None
+        
+        # Scan in parallel
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            results = list(executor.map(check_domain, domain_range))
+        
+        for domain_id in results:
+            if domain_id is not None and domain_id not in self.collectors:
+                if self.add_domain(domain_id):
+                    discovered.append(domain_id)
+        
+        print(f"[Manager] Discovered {len(discovered)} domains: {discovered}")
+        return discovered
+    
+    def discover_namespaces_all(self):
+        """Discover new namespaces in all monitored domains."""
+        for domain_id, collector in self.collectors.items():
+            try:
+                new_ns = collector.discover_namespaces()
+                if new_ns:
+                    print(f"[Manager] Domain {domain_id} new namespaces: {new_ns}")
+            except Exception as e:
+                print(f"[Manager] Discovery error in domain {domain_id}: {e}")
+    
+    def stop_all(self):
+        """Stop all collectors."""
+        for collector in self.collectors.values():
+            collector.stop()
+
+
+# =============================================================================
+# Flask Web Server (same HTML as before, but with domain ID display)
+# =============================================================================
+
 DASHBOARD_HTML = """
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>RL Reward Visualizer</title>
+    <title>RL Reward Visualizer - Multi-Domain</title>
     <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.5.4/socket.io.min.js"></script>
     <style>
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-        }
-        
+        * { margin: 0; padding: 0; box-sizing: border-box; }
         body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
-            background: #0f1419;
-            color: #e7e9ea;
-            min-height: 100vh;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #0f1419; color: #e7e9ea; min-height: 100vh;
         }
-        
         .header {
             background: linear-gradient(135deg, #1a1f2e 0%, #2d1f3d 100%);
-            padding: 20px 30px;
-            border-bottom: 1px solid #2f3336;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
+            padding: 20px 30px; border-bottom: 1px solid #2f3336;
+            display: flex; justify-content: space-between; align-items: center;
         }
-        
         .header h1 {
-            font-size: 24px;
-            font-weight: 600;
+            font-size: 24px; font-weight: 600;
             background: linear-gradient(90deg, #7c3aed, #2dd4bf);
-            -webkit-background-clip: text;
-            -webkit-text-fill-color: transparent;
+            -webkit-background-clip: text; -webkit-text-fill-color: transparent;
         }
-        
-        .connection-status {
-            display: flex;
-            align-items: center;
-            gap: 8px;
-            font-size: 14px;
+        .header-info { display: flex; align-items: center; gap: 20px; }
+        .domain-badge {
+            background: #7c3aed; padding: 5px 12px; border-radius: 15px;
+            font-size: 12px; font-weight: 600;
         }
-        
-        .status-dot {
-            width: 10px;
-            height: 10px;
-            border-radius: 50%;
-            background: #ef4444;
-        }
-        
-        .status-dot.connected {
-            background: #22c55e;
-            box-shadow: 0 0 10px #22c55e;
-        }
-        
-        .container {
-            padding: 20px;
-            max-width: 1800px;
-            margin: 0 auto;
-        }
-        
-        .domain-tabs {
-            display: flex;
-            gap: 10px;
-            margin-bottom: 20px;
-            flex-wrap: wrap;
-        }
-        
+        .connection-status { display: flex; align-items: center; gap: 8px; font-size: 14px; }
+        .status-dot { width: 10px; height: 10px; border-radius: 50%; background: #ef4444; }
+        .status-dot.connected { background: #22c55e; box-shadow: 0 0 10px #22c55e; }
+        .container { padding: 20px; max-width: 1800px; margin: 0 auto; }
+        .domain-tabs { display: flex; gap: 10px; margin-bottom: 20px; flex-wrap: wrap; }
         .domain-tab {
-            padding: 10px 20px;
-            background: #1e2732;
-            border: 1px solid #2f3336;
-            border-radius: 8px;
-            cursor: pointer;
-            transition: all 0.2s;
-            display: flex;
-            align-items: center;
-            gap: 8px;
+            padding: 10px 20px; background: #1e2732; border: 1px solid #2f3336;
+            border-radius: 8px; cursor: pointer; transition: all 0.2s;
+            display: flex; align-items: center; gap: 8px;
         }
-        
-        .domain-tab:hover {
-            background: #2a3544;
-        }
-        
-        .domain-tab.active {
-            background: #7c3aed;
-            border-color: #7c3aed;
-        }
-        
-        .domain-tab .indicator {
-            width: 8px;
-            height: 8px;
-            border-radius: 50%;
-            background: #6b7280;
-        }
-        
-        .domain-tab.active-domain .indicator {
-            background: #22c55e;
-            animation: pulse 2s infinite;
-        }
-        
-        @keyframes pulse {
-            0%, 100% { opacity: 1; }
-            50% { opacity: 0.5; }
-        }
-        
-        .stats-grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-            gap: 15px;
-            margin-bottom: 20px;
-        }
-        
-        .stat-card {
-            background: #1e2732;
-            border: 1px solid #2f3336;
-            border-radius: 12px;
-            padding: 20px;
-        }
-        
-        .stat-card .label {
-            font-size: 12px;
-            color: #71767b;
-            text-transform: uppercase;
-            letter-spacing: 0.5px;
-            margin-bottom: 8px;
-        }
-        
-        .stat-card .value {
-            font-size: 28px;
-            font-weight: 700;
-        }
-        
+        .domain-tab:hover { background: #2a3544; }
+        .domain-tab.active { background: #7c3aed; border-color: #7c3aed; }
+        .domain-tab .indicator { width: 8px; height: 8px; border-radius: 50%; background: #6b7280; }
+        .domain-tab.active-domain .indicator { background: #22c55e; animation: pulse 2s infinite; }
+        .domain-tab .domain-id { font-size: 10px; background: rgba(0,0,0,0.3); padding: 2px 6px; border-radius: 4px; }
+        @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
+        .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px; margin-bottom: 20px; }
+        .stat-card { background: #1e2732; border: 1px solid #2f3336; border-radius: 12px; padding: 20px; }
+        .stat-card .label { font-size: 12px; color: #71767b; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 8px; }
+        .stat-card .value { font-size: 28px; font-weight: 700; }
         .stat-card .value.positive { color: #22c55e; }
         .stat-card .value.negative { color: #ef4444; }
         .stat-card .value.neutral { color: #f59e0b; }
-        
-        .charts-grid {
-            display: grid;
-            grid-template-columns: repeat(2, 1fr);
-            gap: 20px;
-            margin-bottom: 20px;
-        }
-        
-        @media (max-width: 1200px) {
-            .charts-grid {
-                grid-template-columns: 1fr;
-            }
-        }
-        
-        .chart-container {
-            background: #1e2732;
-            border: 1px solid #2f3336;
-            border-radius: 12px;
-            padding: 20px;
-        }
-        
-        .chart-container h3 {
-            font-size: 16px;
-            margin-bottom: 15px;
-            color: #e7e9ea;
-        }
-        
-        .chart {
-            height: 300px;
-        }
-        
-        .chart.tall {
-            height: 400px;
-        }
-        
-        .safety-zones {
-            display: flex;
-            gap: 10px;
-            flex-wrap: wrap;
-            margin-top: 10px;
-        }
-        
-        .zone-badge {
-            padding: 5px 12px;
-            border-radius: 20px;
-            font-size: 12px;
-            font-weight: 600;
-        }
-        
+        .charts-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 20px; margin-bottom: 20px; }
+        @media (max-width: 1200px) { .charts-grid { grid-template-columns: 1fr; } }
+        .chart-container { background: #1e2732; border: 1px solid #2f3336; border-radius: 12px; padding: 20px; }
+        .chart-container h3 { font-size: 16px; margin-bottom: 15px; color: #e7e9ea; }
+        .chart { height: 300px; }
+        .chart.tall { height: 400px; }
+        .safety-zones { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 10px; }
+        .zone-badge { padding: 5px 12px; border-radius: 20px; font-size: 12px; font-weight: 600; }
         .zone-badge.FREE { background: #166534; color: #86efac; }
         .zone-badge.AWARE { background: #365314; color: #bef264; }
         .zone-badge.CAUTION { background: #713f12; color: #fde047; }
         .zone-badge.DANGER { background: #7c2d12; color: #fdba74; }
         .zone-badge.EMERGENCY { background: #7f1d1d; color: #fca5a5; }
         .zone-badge.CRITICAL { background: #450a0a; color: #fecaca; }
-        
-        .all-domains-view {
-            margin-top: 20px;
-        }
-        
+        .all-domains-view { margin-top: 20px; }
         .domain-row {
-            background: #1e2732;
-            border: 1px solid #2f3336;
-            border-radius: 12px;
-            padding: 15px 20px;
-            margin-bottom: 10px;
-            display: grid;
-            grid-template-columns: 150px 1fr repeat(4, 100px);
-            align-items: center;
-            gap: 20px;
+            background: #1e2732; border: 1px solid #2f3336; border-radius: 12px;
+            padding: 15px 20px; margin-bottom: 10px;
+            display: grid; grid-template-columns: 200px 1fr repeat(4, 100px);
+            align-items: center; gap: 20px; cursor: pointer;
         }
-        
-        .domain-row .domain-name {
-            font-weight: 600;
-            display: flex;
-            align-items: center;
-            gap: 10px;
-        }
-        
-        .domain-row .mini-chart {
-            height: 50px;
-        }
-        
-        .domain-row .stat {
-            text-align: center;
-        }
-        
-        .domain-row .stat .label {
-            font-size: 10px;
-            color: #71767b;
-        }
-        
-        .domain-row .stat .value {
-            font-size: 18px;
-            font-weight: 600;
-        }
-        
-        .no-data {
-            text-align: center;
-            padding: 60px;
-            color: #71767b;
-        }
-        
-        .no-data h2 {
-            margin-bottom: 10px;
-        }
+        .domain-row:hover { background: #2a3544; }
+        .domain-row .domain-name { font-weight: 600; display: flex; align-items: center; gap: 10px; flex-direction: column; align-items: flex-start; }
+        .domain-row .domain-name .ns { font-size: 11px; color: #71767b; }
+        .domain-row .mini-chart { height: 50px; }
+        .domain-row .stat { text-align: center; }
+        .domain-row .stat .label { font-size: 10px; color: #71767b; }
+        .domain-row .stat .value { font-size: 18px; font-weight: 600; }
+        .no-data { text-align: center; padding: 60px; color: #71767b; }
+        .no-data h2 { margin-bottom: 10px; }
     </style>
 </head>
 <body>
     <div class="header">
-        <h1>🤖 RL Reward Visualizer</h1>
-        <div class="connection-status">
-            <div class="status-dot" id="statusDot"></div>
-            <span id="statusText">Connecting...</span>
-        </div>
-    </div>
-    
-    <div class="container">
-        <div class="domain-tabs" id="domainTabs">
-            <div class="domain-tab active" data-domain="all">
-                <span>📊 All Domains</span>
+        <h1>RL Reward Visualizer - Multi-Domain</h1>
+        <div class="header-info">
+            <span class="domain-badge" id="domainCount">0 Domains</span>
+            <div class="connection-status">
+                <div class="status-dot" id="statusDot"></div>
+                <span id="statusText">Connecting...</span>
             </div>
         </div>
-        
+    </div>
+    <div class="container">
+        <div class="domain-tabs" id="domainTabs">
+            <div class="domain-tab active" onclick="selectDomain('all')"><span>All Domains</span></div>
+        </div>
         <div id="content">
             <div class="no-data">
                 <h2>Waiting for data...</h2>
-                <p>Make sure your RL training is running and publishing to /reward topics</p>
+                <p>Scanning ROS2 domains for reward topics...</p>
             </div>
         </div>
     </div>
-    
     <script>
-        // Connect to WebSocket
         const socket = io();
-        
         let domains = {};
         let selectedDomain = 'all';
-        let charts = {};
         
-        // Plotly dark theme
         const plotlyLayout = {
-            paper_bgcolor: 'rgba(0,0,0,0)',
-            plot_bgcolor: 'rgba(0,0,0,0)',
+            paper_bgcolor: 'rgba(0,0,0,0)', plot_bgcolor: 'rgba(0,0,0,0)',
             font: { color: '#e7e9ea', size: 12 },
             margin: { l: 50, r: 20, t: 30, b: 40 },
-            xaxis: {
-                gridcolor: '#2f3336',
-                zerolinecolor: '#2f3336',
-            },
-            yaxis: {
-                gridcolor: '#2f3336',
-                zerolinecolor: '#2f3336',
-            },
-            showlegend: true,
-            legend: {
-                bgcolor: 'rgba(0,0,0,0)',
-                font: { color: '#e7e9ea' }
-            }
+            xaxis: { gridcolor: '#2f3336', zerolinecolor: '#2f3336' },
+            yaxis: { gridcolor: '#2f3336', zerolinecolor: '#2f3336' },
+            showlegend: true, legend: { bgcolor: 'rgba(0,0,0,0)', font: { color: '#e7e9ea' } }
         };
+        const plotlyConfig = { displayModeBar: false, responsive: true };
         
-        const plotlyConfig = {
-            displayModeBar: false,
-            responsive: true
-        };
-        
-        // Connection status
         socket.on('connect', () => {
             document.getElementById('statusDot').classList.add('connected');
             document.getElementById('statusText').textContent = 'Connected';
         });
-        
         socket.on('disconnect', () => {
             document.getElementById('statusDot').classList.remove('connected');
             document.getElementById('statusText').textContent = 'Disconnected';
         });
+        socket.on('update', (data) => { domains = data.domains; updateUI(); });
         
-        // Handle data updates
-        socket.on('update', (data) => {
-            domains = data.domains;
+        function updateUI() {
+            const count = Object.keys(domains).length;
+            document.getElementById('domainCount').textContent = `${count} Domain${count !== 1 ? 's' : ''}`;
             updateTabs();
             updateContent();
-        });
+        }
         
         function updateTabs() {
             const tabsContainer = document.getElementById('domainTabs');
-            const domainNames = Object.keys(domains);
+            const domainKeys = Object.keys(domains);
             
-            // Keep "All Domains" tab, update domain tabs
-            let html = `
-                <div class="domain-tab ${selectedDomain === 'all' ? 'active' : ''}" 
-                     data-domain="all" onclick="selectDomain('all')">
-                    <span>📊 All Domains (${domainNames.length})</span>
-                </div>
-            `;
+            let html = `<div class="domain-tab ${selectedDomain === 'all' ? 'active' : ''}" onclick="selectDomain('all')"><span>All (${domainKeys.length})</span></div>`;
             
-            domainNames.forEach(domain => {
-                const stats = domains[domain].summary;
-                const isActive = stats.active;
-                const displayName = domain || 'default';
-                
-                html += `
-                    <div class="domain-tab ${selectedDomain === domain ? 'active' : ''} ${isActive ? 'active-domain' : ''}"
-                         data-domain="${domain}" onclick="selectDomain('${domain}')">
-                        <div class="indicator"></div>
-                        <span>${displayName}</span>
-                    </div>
-                `;
+            domainKeys.forEach(key => {
+                const d = domains[key];
+                const stats = d.summary;
+                html += `<div class="domain-tab ${selectedDomain === key ? 'active' : ''} ${stats.active ? 'active-domain' : ''}" onclick="selectDomain('${key}')">
+                    <div class="indicator"></div>
+                    <span>${stats.display_name}</span>
+                    <span class="domain-id">D${stats.domain_id}</span>
+                </div>`;
             });
             
             tabsContainer.innerHTML = html;
         }
         
-        function selectDomain(domain) {
-            selectedDomain = domain;
-            updateTabs();
-            updateContent();
-        }
+        function selectDomain(key) { selectedDomain = key; updateTabs(); updateContent(); }
         
         function updateContent() {
             const container = document.getElementById('content');
-            
             if (Object.keys(domains).length === 0) {
-                container.innerHTML = `
-                    <div class="no-data">
-                        <h2>Waiting for data...</h2>
-                        <p>Make sure your RL training is running and publishing to /reward topics</p>
-                    </div>
-                `;
+                container.innerHTML = '<div class="no-data"><h2>Waiting for data...</h2><p>Scanning ROS2 domains for reward topics...</p></div>';
                 return;
             }
-            
-            if (selectedDomain === 'all') {
-                renderAllDomainsView(container);
-            } else {
-                renderSingleDomainView(container, selectedDomain);
-            }
+            if (selectedDomain === 'all') renderAllDomainsView(container);
+            else renderSingleDomainView(container, selectedDomain);
         }
         
         function renderAllDomainsView(container) {
-            let html = '<div class="all-domains-view">';
+            const vals = Object.values(domains);
+            const totalSteps = vals.reduce((s, d) => s + d.summary.total_steps, 0);
+            const totalEpisodes = vals.reduce((s, d) => s + d.summary.episode_count, 0);
+            const avgReturn = vals.reduce((s, d) => s + d.summary.avg_episode_return, 0) / Math.max(vals.length, 1);
+            const activeCount = vals.filter(d => d.summary.active).length;
             
-            // Summary stats
-            const totalSteps = Object.values(domains).reduce((sum, d) => sum + d.summary.total_steps, 0);
-            const totalEpisodes = Object.values(domains).reduce((sum, d) => sum + d.summary.episode_count, 0);
-            const avgReturn = Object.values(domains).reduce((sum, d) => sum + d.summary.avg_episode_return, 0) / Object.keys(domains).length;
-            
-            html += `
+            let html = `<div class="all-domains-view">
                 <div class="stats-grid">
-                    <div class="stat-card">
-                        <div class="label">Total Steps (All Domains)</div>
-                        <div class="value">${totalSteps.toLocaleString()}</div>
-                    </div>
-                    <div class="stat-card">
-                        <div class="label">Total Episodes</div>
-                        <div class="value">${totalEpisodes}</div>
-                    </div>
-                    <div class="stat-card">
-                        <div class="label">Avg Episode Return</div>
-                        <div class="value ${avgReturn >= 0 ? 'positive' : 'negative'}">${avgReturn.toFixed(1)}</div>
-                    </div>
-                    <div class="stat-card">
-                        <div class="label">Active Domains</div>
-                        <div class="value positive">${Object.values(domains).filter(d => d.summary.active).length}</div>
-                    </div>
+                    <div class="stat-card"><div class="label">Total Steps</div><div class="value">${totalSteps.toLocaleString()}</div></div>
+                    <div class="stat-card"><div class="label">Total Episodes</div><div class="value">${totalEpisodes}</div></div>
+                    <div class="stat-card"><div class="label">Avg Episode Return</div><div class="value ${avgReturn >= 0 ? 'positive' : 'negative'}">${avgReturn.toFixed(1)}</div></div>
+                    <div class="stat-card"><div class="label">Active / Total</div><div class="value positive">${activeCount} / ${vals.length}</div></div>
                 </div>
-            `;
+                <div class="chart-container"><h3>Episode Returns Comparison</h3><div id="comparisonChart" class="chart tall"></div></div>`;
             
-            // Comparison chart
-            html += `
-                <div class="chart-container">
-                    <h3>Episode Returns Comparison</h3>
-                    <div id="comparisonChart" class="chart tall"></div>
-                </div>
-            `;
-            
-            // Domain rows
-            Object.entries(domains).forEach(([domain, data]) => {
-                const stats = data.summary;
-                const displayName = domain || 'default';
-                
-                html += `
-                    <div class="domain-row" onclick="selectDomain('${domain}')">
-                        <div class="domain-name">
-                            <div class="indicator" style="background: ${stats.active ? '#22c55e' : '#6b7280'}"></div>
-                            ${displayName}
-                        </div>
-                        <div class="mini-chart" id="miniChart_${domain.replace(/[^a-zA-Z0-9]/g, '_')}"></div>
-                        <div class="stat">
-                            <div class="label">Steps</div>
-                            <div class="value">${stats.total_steps.toLocaleString()}</div>
-                        </div>
-                        <div class="stat">
-                            <div class="label">Episodes</div>
-                            <div class="value">${stats.episode_count}</div>
-                        </div>
-                        <div class="stat">
-                            <div class="label">Avg Return</div>
-                            <div class="value" style="color: ${stats.avg_episode_return >= 0 ? '#22c55e' : '#ef4444'}">
-                                ${stats.avg_episode_return.toFixed(1)}
-                            </div>
-                        </div>
-                        <div class="stat">
-                            <div class="label">Intervention</div>
-                            <div class="value" style="color: ${stats.avg_intervention < 0.2 ? '#22c55e' : '#f59e0b'}">
-                                ${(stats.avg_intervention * 100).toFixed(0)}%
-                            </div>
-                        </div>
+            Object.entries(domains).forEach(([key, data]) => {
+                const s = data.summary;
+                html += `<div class="domain-row" onclick="selectDomain('${key}')">
+                    <div class="domain-name">
+                        <div><div class="indicator" style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${s.active ? '#22c55e' : '#6b7280'};margin-right:8px"></div>${s.display_name}</div>
+                        <div class="ns">Domain ${s.domain_id} | ${s.namespace || '/'}</div>
                     </div>
-                `;
+                    <div class="mini-chart" id="mini_${key.replace(/[^a-zA-Z0-9]/g, '_')}"></div>
+                    <div class="stat"><div class="label">Steps</div><div class="value">${s.total_steps.toLocaleString()}</div></div>
+                    <div class="stat"><div class="label">Episodes</div><div class="value">${s.episode_count}</div></div>
+                    <div class="stat"><div class="label">Avg Return</div><div class="value" style="color:${s.avg_episode_return >= 0 ? '#22c55e' : '#ef4444'}">${s.avg_episode_return.toFixed(1)}</div></div>
+                    <div class="stat"><div class="label">Intervention</div><div class="value" style="color:${s.avg_intervention < 0.2 ? '#22c55e' : '#f59e0b'}">${(s.avg_intervention * 100).toFixed(0)}%</div></div>
+                </div>`;
             });
-            
             html += '</div>';
             container.innerHTML = html;
             
-            // Render comparison chart
-            renderComparisonChart();
-            
-            // Render mini charts
-            Object.entries(domains).forEach(([domain, data]) => {
-                renderMiniChart(domain, data.plot_data);
-            });
-        }
-        
-        function renderComparisonChart() {
-            const traces = [];
-            const colors = ['#7c3aed', '#2dd4bf', '#f59e0b', '#ef4444', '#22c55e', '#3b82f6'];
-            
-            let colorIndex = 0;
-            Object.entries(domains).forEach(([domain, data]) => {
-                const plotData = data.plot_data;
-                if (plotData.episode_returns.values.length > 0) {
-                    traces.push({
-                        x: plotData.episode_returns.episodes,
-                        y: plotData.episode_returns.values,
-                        type: 'scatter',
-                        mode: 'lines',
-                        name: domain || 'default',
-                        line: { color: colors[colorIndex % colors.length], width: 2 }
-                    });
+            // Comparison chart
+            const traces = [], colors = ['#7c3aed', '#2dd4bf', '#f59e0b', '#ef4444', '#22c55e', '#3b82f6', '#ec4899', '#8b5cf6'];
+            let ci = 0;
+            Object.entries(domains).forEach(([key, data]) => {
+                const pd = data.plot_data;
+                if (pd.episode_returns.values.length > 0) {
+                    traces.push({ x: pd.episode_returns.episodes, y: pd.episode_returns.values, type: 'scatter', mode: 'lines', name: pd.display_name, line: { color: colors[ci++ % colors.length], width: 2 } });
                 }
-                colorIndex++;
             });
-            
-            const layout = {
-                ...plotlyLayout,
-                xaxis: { ...plotlyLayout.xaxis, title: 'Episode' },
-                yaxis: { ...plotlyLayout.yaxis, title: 'Return' },
-            };
-            
-            Plotly.newPlot('comparisonChart', traces, layout, plotlyConfig);
-        }
-        
-        function renderMiniChart(domain, plotData) {
-            const elementId = `miniChart_${domain.replace(/[^a-zA-Z0-9]/g, '_')}`;
-            const element = document.getElementById(elementId);
-            if (!element) return;
-            
-            const trace = {
-                x: plotData.rewards.times.slice(-100),
-                y: plotData.rewards.values.slice(-100),
-                type: 'scatter',
-                mode: 'lines',
-                line: { color: '#7c3aed', width: 1.5 },
-                fill: 'tozeroy',
-                fillcolor: 'rgba(124, 58, 237, 0.2)'
-            };
-            
-            const layout = {
-                paper_bgcolor: 'rgba(0,0,0,0)',
-                plot_bgcolor: 'rgba(0,0,0,0)',
-                margin: { l: 0, r: 0, t: 0, b: 0 },
-                xaxis: { visible: false },
-                yaxis: { visible: false },
-                showlegend: false
-            };
-            
-            Plotly.newPlot(elementId, [trace], layout, plotlyConfig);
-        }
-        
-        function renderSingleDomainView(container, domain) {
-            const data = domains[domain];
-            if (!data) return;
-            
-            const stats = data.summary;
-            const plotData = data.plot_data;
-            const displayName = domain || 'default';
-            
-            let html = `
-                <div class="stats-grid">
-                    <div class="stat-card">
-                        <div class="label">Total Steps</div>
-                        <div class="value">${stats.total_steps.toLocaleString()}</div>
-                    </div>
-                    <div class="stat-card">
-                        <div class="label">Episodes</div>
-                        <div class="value">${stats.episode_count}</div>
-                    </div>
-                    <div class="stat-card">
-                        <div class="label">Current Episode Return</div>
-                        <div class="value ${stats.current_episode_return >= 0 ? 'positive' : 'negative'}">
-                            ${stats.current_episode_return.toFixed(1)}
-                        </div>
-                    </div>
-                    <div class="stat-card">
-                        <div class="label">Avg Episode Return</div>
-                        <div class="value ${stats.avg_episode_return >= 0 ? 'positive' : 'negative'}">
-                            ${stats.avg_episode_return.toFixed(1)}
-                        </div>
-                    </div>
-                    <div class="stat-card">
-                        <div class="label">Avg Reward (Last 100)</div>
-                        <div class="value ${stats.avg_reward_100 >= 0 ? 'positive' : 'negative'}">
-                            ${stats.avg_reward_100.toFixed(3)}
-                        </div>
-                    </div>
-                    <div class="stat-card">
-                        <div class="label">Safety Intervention</div>
-                        <div class="value ${stats.avg_intervention < 0.2 ? 'positive' : 'neutral'}">
-                            ${(stats.avg_intervention * 100).toFixed(1)}%
-                        </div>
-                    </div>
-                </div>
-                
-                <div class="charts-grid">
-                    <div class="chart-container">
-                        <h3>📈 Real-Time Reward</h3>
-                        <div id="rewardChart" class="chart"></div>
-                    </div>
-                    
-                    <div class="chart-container">
-                        <h3>🏆 Episode Returns</h3>
-                        <div id="episodeChart" class="chart"></div>
-                    </div>
-                    
-                    <div class="chart-container">
-                        <h3>🛡️ Safety Intervention Rate</h3>
-                        <div id="interventionChart" class="chart"></div>
-                    </div>
-                    
-                    <div class="chart-container">
-                        <h3>🎯 Safety Zone Distribution</h3>
-                        <div id="zoneChart" class="chart"></div>
-                        <div class="safety-zones">
-                            ${Object.entries(plotData.safety_zones).map(([zone, count]) => 
-                                `<span class="zone-badge ${zone}">${zone}: ${count}</span>`
-                            ).join('')}
-                        </div>
-                    </div>
-                </div>
-                
-                <div class="chart-container">
-                    <h3>📊 Reward Components Breakdown</h3>
-                    <div id="componentsChart" class="chart tall"></div>
-                </div>
-            `;
-            
-            container.innerHTML = html;
-            
-            // Render charts
-            renderRewardChart(plotData);
-            renderEpisodeChart(plotData);
-            renderInterventionChart(plotData);
-            renderZoneChart(plotData);
-            renderComponentsChart(plotData);
-        }
-        
-        function renderRewardChart(plotData) {
-            const trace = {
-                x: plotData.rewards.times,
-                y: plotData.rewards.values,
-                type: 'scatter',
-                mode: 'lines',
-                name: 'Reward',
-                line: { color: '#7c3aed', width: 1.5 },
-                fill: 'tozeroy',
-                fillcolor: 'rgba(124, 58, 237, 0.2)'
-            };
-            
-            const layout = {
-                ...plotlyLayout,
-                xaxis: { ...plotlyLayout.xaxis, title: 'Time (s)' },
-                yaxis: { ...plotlyLayout.yaxis, title: 'Reward' },
-            };
-            
-            Plotly.newPlot('rewardChart', [trace], layout, plotlyConfig);
-        }
-        
-        function renderEpisodeChart(plotData) {
-            const trace = {
-                x: plotData.episode_returns.episodes,
-                y: plotData.episode_returns.values,
-                type: 'scatter',
-                mode: 'lines+markers',
-                name: 'Episode Return',
-                line: { color: '#2dd4bf', width: 2 },
-                marker: { size: 6 }
-            };
-            
-            // Add rolling average
-            const windowSize = 10;
-            const rollingAvg = [];
-            for (let i = 0; i < plotData.episode_returns.values.length; i++) {
-                const start = Math.max(0, i - windowSize + 1);
-                const window = plotData.episode_returns.values.slice(start, i + 1);
-                rollingAvg.push(window.reduce((a, b) => a + b, 0) / window.length);
+            if (traces.length > 0) {
+                Plotly.newPlot('comparisonChart', traces, { ...plotlyLayout, xaxis: { ...plotlyLayout.xaxis, title: 'Episode' }, yaxis: { ...plotlyLayout.yaxis, title: 'Return' } }, plotlyConfig);
             }
             
-            const avgTrace = {
-                x: plotData.episode_returns.episodes,
-                y: rollingAvg,
-                type: 'scatter',
-                mode: 'lines',
-                name: 'Rolling Avg (10)',
-                line: { color: '#f59e0b', width: 3 }
-            };
-            
-            const layout = {
-                ...plotlyLayout,
-                xaxis: { ...plotlyLayout.xaxis, title: 'Episode' },
-                yaxis: { ...plotlyLayout.yaxis, title: 'Return' },
-            };
-            
-            Plotly.newPlot('episodeChart', [trace, avgTrace], layout, plotlyConfig);
-        }
-        
-        function renderInterventionChart(plotData) {
-            const trace = {
-                x: plotData.interventions.times,
-                y: plotData.interventions.values.map(v => v * 100),
-                type: 'scatter',
-                mode: 'lines',
-                name: 'Intervention %',
-                line: { color: '#ef4444', width: 1.5 },
-                fill: 'tozeroy',
-                fillcolor: 'rgba(239, 68, 68, 0.2)'
-            };
-            
-            const layout = {
-                ...plotlyLayout,
-                xaxis: { ...plotlyLayout.xaxis, title: 'Time (s)' },
-                yaxis: { ...plotlyLayout.yaxis, title: 'Intervention %', range: [0, 100] },
-            };
-            
-            Plotly.newPlot('interventionChart', [trace], layout, plotlyConfig);
-        }
-        
-        function renderZoneChart(plotData) {
-            const zones = Object.entries(plotData.safety_zones);
-            const colors = {
-                'FREE': '#22c55e',
-                'AWARE': '#84cc16',
-                'CAUTION': '#eab308',
-                'DANGER': '#f97316',
-                'EMERGENCY': '#ef4444',
-                'CRITICAL': '#b91c1c'
-            };
-            
-            const trace = {
-                values: zones.map(z => z[1]),
-                labels: zones.map(z => z[0]),
-                type: 'pie',
-                marker: {
-                    colors: zones.map(z => colors[z[0]] || '#6b7280')
-                },
-                textinfo: 'label+percent',
-                textfont: { color: '#fff' },
-                hole: 0.4
-            };
-            
-            const layout = {
-                ...plotlyLayout,
-                showlegend: false,
-            };
-            
-            Plotly.newPlot('zoneChart', [trace], layout, plotlyConfig);
-        }
-        
-        function renderComponentsChart(plotData) {
-            const traces = [];
-            const componentColors = {
-                'progress': '#22c55e',
-                'alignment': '#3b82f6',
-                'discovery': '#8b5cf6',
-                'novelty': '#ec4899',
-                'frontier': '#f59e0b',
-                'proximity': '#ef4444',
-                'intervention_penalty': '#dc2626',
-                'rnd': '#06b6d4',
-                'step': '#6b7280',
-                'collision': '#7f1d1d',
-                'goal': '#15803d',
-            };
-            
-            Object.entries(plotData.components).forEach(([name, data]) => {
-                if (data.values.length > 0) {
-                    traces.push({
-                        x: data.times,
-                        y: data.values,
-                        type: 'scatter',
-                        mode: 'lines',
-                        name: name,
-                        line: { 
-                            color: componentColors[name] || '#6b7280',
-                            width: 1.5
-                        }
-                    });
+            // Mini charts
+            Object.entries(domains).forEach(([key, data]) => {
+                const id = `mini_${key.replace(/[^a-zA-Z0-9]/g, '_')}`;
+                const el = document.getElementById(id);
+                if (el && data.plot_data.rewards.values.length > 0) {
+                    Plotly.newPlot(id, [{ x: data.plot_data.rewards.times.slice(-100), y: data.plot_data.rewards.values.slice(-100), type: 'scatter', mode: 'lines', line: { color: '#7c3aed', width: 1.5 }, fill: 'tozeroy', fillcolor: 'rgba(124, 58, 237, 0.2)' }], { paper_bgcolor: 'rgba(0,0,0,0)', plot_bgcolor: 'rgba(0,0,0,0)', margin: { l: 0, r: 0, t: 0, b: 0 }, xaxis: { visible: false }, yaxis: { visible: false }, showlegend: false }, plotlyConfig);
                 }
             });
+        }
+        
+        function renderSingleDomainView(container, key) {
+            const data = domains[key];
+            if (!data) return;
+            const s = data.summary, pd = data.plot_data;
             
-            const layout = {
-                ...plotlyLayout,
-                xaxis: { ...plotlyLayout.xaxis, title: 'Time (s)' },
-                yaxis: { ...plotlyLayout.yaxis, title: 'Reward Component' },
-            };
+            let html = `
+                <h2 style="margin-bottom:20px">${s.display_name} <span style="color:#71767b;font-size:14px">Domain ${s.domain_id} | ${s.namespace || '/'}</span></h2>
+                <div class="stats-grid">
+                    <div class="stat-card"><div class="label">Total Steps</div><div class="value">${s.total_steps.toLocaleString()}</div></div>
+                    <div class="stat-card"><div class="label">Episodes</div><div class="value">${s.episode_count}</div></div>
+                    <div class="stat-card"><div class="label">Current Return</div><div class="value ${s.current_episode_return >= 0 ? 'positive' : 'negative'}">${s.current_episode_return.toFixed(1)}</div></div>
+                    <div class="stat-card"><div class="label">Avg Return</div><div class="value ${s.avg_episode_return >= 0 ? 'positive' : 'negative'}">${s.avg_episode_return.toFixed(1)}</div></div>
+                    <div class="stat-card"><div class="label">Avg Reward (100)</div><div class="value ${s.avg_reward_100 >= 0 ? 'positive' : 'negative'}">${s.avg_reward_100.toFixed(3)}</div></div>
+                    <div class="stat-card"><div class="label">Intervention</div><div class="value ${s.avg_intervention < 0.2 ? 'positive' : 'neutral'}">${(s.avg_intervention * 100).toFixed(1)}%</div></div>
+                </div>
+                <div class="charts-grid">
+                    <div class="chart-container"><h3>Real-Time Reward</h3><div id="rewardChart" class="chart"></div></div>
+                    <div class="chart-container"><h3>Episode Returns</h3><div id="episodeChart" class="chart"></div></div>
+                    <div class="chart-container"><h3>Intervention Rate</h3><div id="interventionChart" class="chart"></div></div>
+                    <div class="chart-container"><h3>Safety Zones</h3><div id="zoneChart" class="chart"></div>
+                        <div class="safety-zones">${Object.entries(pd.safety_zones).map(([z,c]) => `<span class="zone-badge ${z}">${z}: ${c}</span>`).join('')}</div>
+                    </div>
+                </div>
+                <div class="chart-container"><h3>Reward Components</h3><div id="componentsChart" class="chart tall"></div></div>`;
+            container.innerHTML = html;
             
-            Plotly.newPlot('componentsChart', traces, layout, plotlyConfig);
+            // Charts
+            if (pd.rewards.values.length > 0) {
+                Plotly.newPlot('rewardChart', [{ x: pd.rewards.times, y: pd.rewards.values, type: 'scatter', mode: 'lines', line: { color: '#7c3aed', width: 1.5 }, fill: 'tozeroy', fillcolor: 'rgba(124, 58, 237, 0.2)' }], { ...plotlyLayout, xaxis: { ...plotlyLayout.xaxis, title: 'Time (s)' }, yaxis: { ...plotlyLayout.yaxis, title: 'Reward' } }, plotlyConfig);
+            }
+            
+            if (pd.episode_returns.values.length > 0) {
+                const ws = 10, ra = [];
+                for (let i = 0; i < pd.episode_returns.values.length; i++) {
+                    const w = pd.episode_returns.values.slice(Math.max(0, i - ws + 1), i + 1);
+                    ra.push(w.reduce((a, b) => a + b, 0) / w.length);
+                }
+                Plotly.newPlot('episodeChart', [
+                    { x: pd.episode_returns.episodes, y: pd.episode_returns.values, type: 'scatter', mode: 'lines+markers', name: 'Return', line: { color: '#2dd4bf', width: 2 }, marker: { size: 6 } },
+                    { x: pd.episode_returns.episodes, y: ra, type: 'scatter', mode: 'lines', name: 'Avg', line: { color: '#f59e0b', width: 3 } }
+                ], { ...plotlyLayout, xaxis: { ...plotlyLayout.xaxis, title: 'Episode' }, yaxis: { ...plotlyLayout.yaxis, title: 'Return' } }, plotlyConfig);
+            }
+            
+            if (pd.interventions.values.length > 0) {
+                Plotly.newPlot('interventionChart', [{ x: pd.interventions.times, y: pd.interventions.values.map(v => v * 100), type: 'scatter', mode: 'lines', line: { color: '#ef4444', width: 1.5 }, fill: 'tozeroy', fillcolor: 'rgba(239, 68, 68, 0.2)' }], { ...plotlyLayout, xaxis: { ...plotlyLayout.xaxis, title: 'Time (s)' }, yaxis: { ...plotlyLayout.yaxis, title: '%', range: [0, 100] } }, plotlyConfig);
+            }
+            
+            const zc = { 'FREE': '#22c55e', 'AWARE': '#84cc16', 'CAUTION': '#eab308', 'DANGER': '#f97316', 'EMERGENCY': '#ef4444', 'CRITICAL': '#b91c1c' };
+            const zones = Object.entries(pd.safety_zones).filter(z => z[1] > 0);
+            if (zones.length > 0) {
+                Plotly.newPlot('zoneChart', [{ values: zones.map(z => z[1]), labels: zones.map(z => z[0]), type: 'pie', marker: { colors: zones.map(z => zc[z[0]] || '#6b7280') }, textinfo: 'label+percent', textfont: { color: '#fff' }, hole: 0.4 }], { ...plotlyLayout, showlegend: false }, plotlyConfig);
+            }
+            
+            const cc = { 'progress': '#22c55e', 'discovery': '#8b5cf6', 'proximity': '#ef4444', 'intervention_penalty': '#dc2626', 'step': '#6b7280', 'novelty': '#ec4899', 'rnd': '#06b6d4' };
+            const compTraces = [];
+            Object.entries(pd.components).forEach(([n, d]) => {
+                if (d.values.length > 0) compTraces.push({ x: d.times, y: d.values, type: 'scatter', mode: 'lines', name: n, line: { color: cc[n] || '#6b7280', width: 1.5 } });
+            });
+            if (compTraces.length > 0) {
+                Plotly.newPlot('componentsChart', compTraces, { ...plotlyLayout, xaxis: { ...plotlyLayout.xaxis, title: 'Time (s)' }, yaxis: { ...plotlyLayout.yaxis, title: 'Value' } }, plotlyConfig);
+            }
         }
     </script>
 </body>
@@ -1060,10 +716,10 @@ DASHBOARD_HTML = """
 """
 
 
-def create_app(stats_store: Dict[str, DomainStats]) -> tuple:
+def create_app(stats_store: Dict[str, DomainStats]):
     """Create Flask app with SocketIO."""
     app = Flask(__name__)
-    app.config['SECRET_KEY'] = 'reward_viz_secret'
+    app.config['SECRET_KEY'] = 'multi_domain_viz'
     CORS(app)
     socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
     
@@ -1073,27 +729,17 @@ def create_app(stats_store: Dict[str, DomainStats]) -> tuple:
     
     @app.route('/api/domains')
     def get_domains():
-        """Get list of domains and their stats."""
         result = {}
-        for domain, stats in stats_store.items():
-            result[domain] = {
-                "summary": stats.get_summary(),
-                "plot_data": stats.get_plot_data()
-            }
+        for key, stats in stats_store.items():
+            result[key] = {"summary": stats.get_summary(), "plot_data": stats.get_plot_data()}
         return jsonify(result)
     
     def background_update():
-        """Background thread that pushes updates to connected clients."""
         while True:
             time.sleep(1.0 / UPDATE_RATE_HZ)
-            
             data = {"domains": {}}
-            for domain, stats in stats_store.items():
-                data["domains"][domain] = {
-                    "summary": stats.get_summary(),
-                    "plot_data": stats.get_plot_data()
-                }
-            
+            for key, stats in stats_store.items():
+                data["domains"][key] = {"summary": stats.get_summary(), "plot_data": stats.get_plot_data()}
             socketio.emit('update', data)
     
     return app, socketio, background_update
@@ -1104,66 +750,71 @@ def create_app(stats_store: Dict[str, DomainStats]) -> tuple:
 # =============================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description="Real-time RL reward visualization")
-    parser.add_argument("--port", type=int, default=DEFAULT_PORT, 
+    parser = argparse.ArgumentParser(description="Multi-domain RL reward visualization")
+    parser.add_argument("--port", type=int, default=DEFAULT_PORT,
                         help=f"Web server port (default: {DEFAULT_PORT})")
-    parser.add_argument("--domains", nargs="*", default=[""],
-                        help="Domain namespaces to monitor (default: '' for /reward)")
+    parser.add_argument("--domains", nargs="*", type=int, default=None,
+                        help="Specific ROS2 domain IDs to monitor (e.g., --domains 10 11 12)")
+    parser.add_argument("--domain-range", nargs=2, type=int, metavar=("START", "END"),
+                        help="Range of domain IDs to monitor (e.g., --domain-range 10 15)")
+    parser.add_argument("--namespaces", nargs="*", default=["", "stretch"],
+                        help="Namespaces to monitor in each domain")
     parser.add_argument("--auto-discover", action="store_true",
-                        help="Auto-discover domains from ROS topics")
+                        help="Auto-discover active domains")
+    parser.add_argument("--discovery-interval", type=float, default=10.0,
+                        help="Seconds between auto-discovery scans")
     args = parser.parse_args()
     
-    print(f"""
-╔══════════════════════════════════════════════════════════════╗
-║           🤖 RL Reward Visualizer Server                     ║
-╠══════════════════════════════════════════════════════════════╣
-║  Open in browser:  http://localhost:{args.port:<5}                 ║
-║  Domains: {str(args.domains):<49}║
-║  Auto-discover: {str(args.auto_discover):<42}║
-╚══════════════════════════════════════════════════════════════╝
-    """)
+    # Determine which domains to monitor
+    if args.domain_range:
+        domain_ids = list(range(args.domain_range[0], args.domain_range[1] + 1))
+    elif args.domains:
+        domain_ids = args.domains
+    else:
+        domain_ids = [10]  # Default: domain 10 (common for simulations)
     
-    # Initialize ROS
-    rclpy.init()
+    print(f"""
++==============================================================+
+|        RL Reward Visualizer - MULTI-DOMAIN                   |
++==============================================================+
+|  Open in browser:  http://localhost:{args.port:<5}                 |
+|  Initial domains: {str(domain_ids):<42}|
+|  Namespaces: {str(args.namespaces):<48}|
+|  Auto-discover: {str(args.auto_discover):<43}|
++==============================================================+
+    """)
     
     # Shared stats store
     stats_store: Dict[str, DomainStats] = {}
     
-    # Create ROS node
-    ros_node = RewardCollectorNode(args.domains, stats_store)
+    # Create domain manager
+    manager = MultiDomainManager(stats_store)
     
-    # Create ROS executor
-    ros_executor = MultiThreadedExecutor()
-    ros_executor.add_node(ros_node)
+    # Add initial domains
+    for domain_id in domain_ids:
+        manager.add_domain(domain_id, args.namespaces.copy())
+    
+    # Auto-discovery if enabled
+    if args.auto_discover:
+        manager.discover_domains()
     
     # Create Flask app
     app, socketio, background_update = create_app(stats_store)
-    
-    # Start ROS spinning in background thread
-    def ros_spin():
-        try:
-            ros_executor.spin()
-        except Exception as e:
-            print(f"[ROS] Error: {e}")
-    
-    ros_thread = threading.Thread(target=ros_spin, daemon=True)
-    ros_thread.start()
     
     # Start background update thread
     update_thread = threading.Thread(target=background_update, daemon=True)
     update_thread.start()
     
-    # Auto-discovery thread
+    # Periodic discovery thread
     if args.auto_discover:
         def discovery_loop():
             while True:
-                time.sleep(DISCOVERY_INTERVAL)
+                time.sleep(args.discovery_interval)
                 try:
-                    new_domains = ros_node.discover_domains()
-                    if new_domains:
-                        print(f"[VIZ] Discovered new domains: {new_domains}")
+                    manager.discover_domains()
+                    manager.discover_namespaces_all()
                 except Exception as e:
-                    print(f"[VIZ] Discovery error: {e}")
+                    print(f"[Discovery] Error: {e}")
         
         discovery_thread = threading.Thread(target=discovery_loop, daemon=True)
         discovery_thread.start()
@@ -1171,12 +822,7 @@ def main():
     # Shutdown handler
     def shutdown(signum=None, frame=None):
         print("\n[VIZ] Shutting down...")
-        try:
-            ros_executor.shutdown()
-            ros_node.destroy_node()
-            rclpy.shutdown()
-        except:
-            pass
+        manager.stop_all()
         sys.exit(0)
     
     signal.signal(signal.SIGINT, shutdown)
@@ -1184,7 +830,7 @@ def main():
     
     # Run Flask server
     try:
-        socketio.run(app, host='0.0.0.0', port=args.port, debug=False, 
+        socketio.run(app, host='0.0.0.0', port=args.port, debug=False,
                      use_reloader=False, log_output=False)
     except Exception as e:
         print(f"[VIZ] Server error: {e}")
