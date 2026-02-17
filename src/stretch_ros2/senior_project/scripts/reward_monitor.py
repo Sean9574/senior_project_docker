@@ -1,48 +1,38 @@
 #!/usr/bin/env python3
 """
-Multi-Domain RL Training Monitor + Per-Domain Camera Streaming (MJPEG)
+Multi-Domain RL Training Monitor + Camera Streaming
 
-- Automatically discovers ROS2 domains that have reward topics (as before).
-- ALSO discovers Image topics (sensor_msgs/msg/Image) in each domain.
-- Exposes a per-domain MJPEG endpoint for any image topic:
-    /stream/<domain_id>?topic=/sam3_goal_generator/visualization
-
-Open dashboard:
-  http://localhost:5555
-
-Direct stream test (example):
-  http://localhost:5555/stream/7?topic=/sam3_goal_generator/visualization
-
-Docker reminder:
-  docker run ... -p 5555:5555 ...
+Features:
+- Auto-discovers ROS2 domains with reward topics
+- Streams camera/image topics via MJPEG
+- Smooth, non-jittery chart updates
+- Clean, soft UI design
 """
 
 import argparse
 import json
+import logging
 import signal
 import sys
 import threading
 import time
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
-from concurrent.futures import ThreadPoolExecutor
-
-import rclpy
-from rclpy.context import Context
-from rclpy.executors import SingleThreadedExecutor
-from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
-from rclpy.qos import qos_profile_sensor_data
-
-from std_msgs.msg import Float32, String as StringMsg
-from sensor_msgs.msg import Image as RosImage
-
-from flask import Flask, render_template_string, Response, request, jsonify
-from flask_socketio import SocketIO
-from flask_cors import CORS
 
 import cv2
+import rclpy
 from cv_bridge import CvBridge
+from flask import Flask, Response, jsonify, render_template_string, request
+from flask_cors import CORS
+from flask_socketio import SocketIO
+from rclpy.context import Context
+from rclpy.executors import SingleThreadedExecutor
+from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
+from sensor_msgs.msg import Image as RosImage
+from std_msgs.msg import Float32
+from std_msgs.msg import String as StringMsg
 
 # =============================================================================
 # Configuration
@@ -50,15 +40,14 @@ from cv_bridge import CvBridge
 
 DEFAULT_PORT = 5555
 MAX_HISTORY_LENGTH = 1000
-UPDATE_RATE_HZ = 10
+UPDATE_RATE_HZ = 5  # Slower updates = smoother charts
 DEFAULT_SCAN_START = 0
 DEFAULT_SCAN_END = 50
 DEFAULT_SCAN_INTERVAL = 15.0
 
-# Camera defaults
-DEFAULT_CAMERA_FPS = 10.0
-DEFAULT_CAMERA_JPEG_QUALITY = 80
-DEFAULT_CAMERA_MAX_WIDTH = 960  # resize for performance; set 0 to disable
+DEFAULT_CAMERA_FPS = 15.0
+DEFAULT_CAMERA_JPEG_QUALITY = 85
+DEFAULT_CAMERA_MAX_WIDTH = 800
 
 # =============================================================================
 # Data Structures
@@ -66,7 +55,6 @@ DEFAULT_CAMERA_MAX_WIDTH = 960  # resize for performance; set 0 to disable
 
 @dataclass
 class DomainStats:
-    """Statistics for a single robot domain."""
     domain_id: int
     namespace: str
     display_name: str
@@ -97,31 +85,26 @@ class DomainStats:
     def add_breakdown(self, breakdown: Dict):
         timestamp = time.time()
 
-        # Track reward components
         reward_terms = breakdown.get("reward_terms", {})
         for key, value in reward_terms.items():
             if key not in self.components:
                 self.components[key] = deque(maxlen=MAX_HISTORY_LENGTH)
             self.components[key].append((timestamp, value))
 
-        # Track safety
         safety = breakdown.get("safety", {})
         zone = safety.get("zone", "UNKNOWN")
         intervention = safety.get("intervention", 0.0)
         self.safety_zones.append((timestamp, zone))
         self.intervention_rates.append((timestamp, intervention))
 
-        # Track goals from breakdown
         goals = breakdown.get("goals_reached", 0)
         if goals > self.goals_reached:
             self.goals_reached = goals
 
-        # Track exploration stats
         explore_stats = breakdown.get("explore_stats", {})
         self.cells_discovered = explore_stats.get("total_discovered", self.cells_discovered)
         self.frontiers = explore_stats.get("frontier_count", self.frontiers)
 
-        # Detect episode changes by watching episode number
         episode_num = breakdown.get("episode", 0)
         if episode_num > self.last_episode_num and self.last_episode_num > 0:
             if self.current_episode_steps > 0:
@@ -153,7 +136,7 @@ class DomainStats:
             "active": time.time() - self.last_update < 5.0,
         }
 
-    def get_plot_data(self, max_points: int = 500) -> Dict:
+    def get_plot_data(self, max_points: int = 300) -> Dict:
         step = max(1, len(self.rewards) // max_points)
 
         rewards = list(self.rewards)[::step]
@@ -199,12 +182,11 @@ class DomainStats:
 
 
 # =============================================================================
-# Per-Domain ROS2 Subscriber (Rewards)
+# ROS2 Collectors
 # =============================================================================
 
 class DomainCollector:
-    def __init__(self, domain_id: int, stats_store: Dict[str, DomainStats],
-                 namespaces: List[str] = None):
+    def __init__(self, domain_id: int, stats_store: Dict[str, DomainStats], namespaces: List[str] = None):
         self.domain_id = domain_id
         self.stats = stats_store
         self.namespaces = namespaces or [""]
@@ -212,12 +194,7 @@ class DomainCollector:
 
         self.context = Context()
         rclpy.init(context=self.context, domain_id=domain_id)
-
-        self.node = rclpy.create_node(
-            f"reward_monitor_{domain_id}",
-            context=self.context
-        )
-
+        self.node = rclpy.create_node(f"monitor_{domain_id}", context=self.context)
         self.executor = SingleThreadedExecutor(context=self.context)
         self.executor.add_node(self.node)
 
@@ -247,23 +224,10 @@ class DomainCollector:
                 display_name=display_name
             )
 
-        qos = QoSProfile(
-            reliability=ReliabilityPolicy.BEST_EFFORT,
-            history=HistoryPolicy.KEEP_LAST,
-            depth=10
-        )
+        qos = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT, history=HistoryPolicy.KEEP_LAST, depth=10)
 
-        self._subs.append(self.node.create_subscription(
-            Float32, reward_topic,
-            lambda msg, k=stats_key: self._reward_cb(msg, k), qos
-        ))
-
-        self._subs.append(self.node.create_subscription(
-            StringMsg, breakdown_topic,
-            lambda msg, k=stats_key: self._breakdown_cb(msg, k), qos
-        ))
-
-        print(f"[Domain {self.domain_id}] Subscribed: {reward_topic}")
+        self._subs.append(self.node.create_subscription(Float32, reward_topic, lambda msg, k=stats_key: self._reward_cb(msg, k), qos))
+        self._subs.append(self.node.create_subscription(StringMsg, breakdown_topic, lambda msg, k=stats_key: self._breakdown_cb(msg, k), qos))
 
     def _reward_cb(self, msg: Float32, key: str):
         if key in self.stats:
@@ -271,10 +235,9 @@ class DomainCollector:
 
     def _breakdown_cb(self, msg: StringMsg, key: str):
         try:
-            data = json.loads(msg.data)
             if key in self.stats:
-                self.stats[key].add_breakdown(data)
-        except Exception:
+                self.stats[key].add_breakdown(json.loads(msg.data))
+        except:
             pass
 
     def discover_namespaces(self) -> List[str]:
@@ -293,7 +256,7 @@ class DomainCollector:
         while self.running:
             try:
                 self.executor.spin_once(timeout_sec=0.1)
-            except Exception:
+            except:
                 pass
 
     def stop(self):
@@ -302,28 +265,15 @@ class DomainCollector:
             self.executor.shutdown()
             self.node.destroy_node()
             rclpy.shutdown(context=self.context)
-        except Exception:
+        except:
             pass
 
 
-# =============================================================================
-# Per-Domain ROS2 Camera Collector (Image -> JPEG)
-# =============================================================================
-
 class CameraCollector:
-    """
-    One CameraCollector per ROS2 domain.
-
-    - Keeps ONE active image subscription at a time per domain (chosen by browser request).
-    - Stores latest JPEG bytes for MJPEG streaming.
-    """
-    def __init__(self, domain_id: int,
-                 fps: float = DEFAULT_CAMERA_FPS,
-                 jpeg_quality: int = DEFAULT_CAMERA_JPEG_QUALITY,
-                 max_width: int = DEFAULT_CAMERA_MAX_WIDTH):
+    def __init__(self, domain_id: int, fps: float = DEFAULT_CAMERA_FPS, quality: int = DEFAULT_CAMERA_JPEG_QUALITY, max_width: int = DEFAULT_CAMERA_MAX_WIDTH):
         self.domain_id = domain_id
-        self.fps = max(1.0, float(fps))
-        self.jpeg_quality = int(max(10, min(95, jpeg_quality)))
+        self.fps = max(1.0, fps)
+        self.quality = int(max(10, min(95, quality)))
         self.max_width = int(max_width)
 
         self._bridge = CvBridge()
@@ -333,14 +283,12 @@ class CameraCollector:
 
         self._context = Context()
         rclpy.init(context=self._context, domain_id=domain_id)
-        self._node = rclpy.create_node(f"camera_monitor_{domain_id}", context=self._context)
-
+        self._node = rclpy.create_node(f"cam_{domain_id}", context=self._context)
         self._executor = SingleThreadedExecutor(context=self._context)
         self._executor.add_node(self._node)
 
         self._sub = None
         self._sub_topic: Optional[str] = None
-
         self._running = True
         self._thread = threading.Thread(target=self._spin, daemon=True)
         self._thread.start()
@@ -349,7 +297,7 @@ class CameraCollector:
         while self._running:
             try:
                 self._executor.spin_once(timeout_sec=0.1)
-            except Exception:
+            except:
                 pass
 
     def ensure_subscription(self, topic: str) -> bool:
@@ -359,98 +307,62 @@ class CameraCollector:
         if not topic.startswith("/"):
             topic = "/" + topic
 
-        # Already subscribed
         if self._sub is not None and self._sub_topic == topic:
             return True
 
         try:
-            # Replace old subscription
             if self._sub is not None:
                 try:
                     self._node.destroy_subscription(self._sub)
-                except Exception:
+                except:
                     pass
                 self._sub = None
 
-            self._sub = self._node.create_subscription(
-                RosImage,
-                topic,
-                self._image_cb,
-                qos_profile_sensor_data
-            )
+            self._sub = self._node.create_subscription(RosImage, topic, self._image_cb, qos_profile_sensor_data)
             self._sub_topic = topic
-            print(f"[Camera D{self.domain_id}] Subscribed: {topic}")
             return True
-        except Exception as e:
-            print(f"[Camera D{self.domain_id}] Failed to subscribe {topic}: {e}")
+        except:
             self._sub_topic = None
             self._sub = None
             return False
 
     def _image_cb(self, msg: RosImage):
         now = time.time()
-
         with self._lock:
             if (now - self._latest_ts) < (1.0 / self.fps):
                 return
 
         try:
             cv_img = self._bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
-
             if self.max_width and cv_img is not None:
                 h, w = cv_img.shape[:2]
                 if w > self.max_width:
                     scale = self.max_width / float(w)
-                    cv_img = cv2.resize(
-                        cv_img,
-                        (int(w * scale), int(h * scale)),
-                        interpolation=cv2.INTER_AREA
-                    )
+                    cv_img = cv2.resize(cv_img, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
 
-            ok, buf = cv2.imencode(
-                ".jpg",
-                cv_img,
-                [int(cv2.IMWRITE_JPEG_QUALITY), self.jpeg_quality]
-            )
-            if not ok:
-                return
-
-            jpeg_bytes = buf.tobytes()
-            with self._lock:
-                self._latest_jpeg = jpeg_bytes
-                self._latest_ts = now
-
-        except Exception:
-            return
+            ok, buf = cv2.imencode(".jpg", cv_img, [int(cv2.IMWRITE_JPEG_QUALITY), self.quality])
+            if ok:
+                with self._lock:
+                    self._latest_jpeg = buf.tobytes()
+                    self._latest_ts = now
+        except:
+            pass
 
     def latest_jpeg(self) -> Optional[bytes]:
         with self._lock:
             return self._latest_jpeg
 
-    def latest_age_sec(self) -> float:
-        with self._lock:
-            if self._latest_ts == 0:
-                return 1e9
-            return time.time() - self._latest_ts
-
     def stop(self):
         self._running = False
         try:
-            if self._sub is not None:
-                try:
-                    self._node.destroy_subscription(self._sub)
-                except Exception:
-                    pass
+            if self._sub:
+                self._node.destroy_subscription(self._sub)
             self._executor.shutdown()
             self._node.destroy_node()
             rclpy.shutdown(context=self._context)
-        except Exception:
+        except:
             pass
 
-
-# =============================================================================
-# Multi-Domain Manager (Rewards + Cameras + Scanning)
-# =============================================================================
 
 class MultiDomainManager:
     def __init__(self, stats_store: Dict[str, DomainStats]):
@@ -459,7 +371,6 @@ class MultiDomainManager:
         self.threads: Dict[int, threading.Thread] = {}
         self.cameras: Dict[int, CameraCollector] = {}
         self.domain_image_topics: Dict[int, List[str]] = {}
-
         self.lock = threading.Lock()
 
     def add_domain(self, domain_id: int, namespaces: List[str] = None) -> bool:
@@ -469,39 +380,26 @@ class MultiDomainManager:
             try:
                 collector = DomainCollector(domain_id, self.stats, namespaces)
                 self.collectors[domain_id] = collector
-
                 thread = threading.Thread(target=collector.spin, daemon=True)
                 thread.start()
                 self.threads[domain_id] = thread
 
-                # Create camera collector too (lazy subscribe when requested)
                 if domain_id not in self.cameras:
                     self.cameras[domain_id] = CameraCollector(domain_id)
-
-                print(f"[Manager] Added domain {domain_id}")
                 return True
-            except Exception as e:
-                print(f"[Manager] Failed to add domain {domain_id}: {e}")
+            except:
                 return False
 
     def _scan_domain_topics(self, did: int) -> Tuple[int, bool, List[str]]:
-        """
-        Returns: (did, has_reward, image_topics)
-        """
         ctx = Context()
         image_topics: List[str] = []
         try:
             rclpy.init(context=ctx, domain_id=did)
             node = rclpy.create_node(f"scan_{did}", context=ctx)
-
-            # tiny delay to allow discovery
             time.sleep(0.3)
             topics = node.get_topic_names_and_types()
-
             has_reward = any(t[0].endswith("/reward") for t in topics)
 
-            # Detect image topics by type name
-            # types look like: ['sensor_msgs/msg/Image']
             for tname, ttypes in topics:
                 if "sensor_msgs/msg/Image" in ttypes:
                     image_topics.append(tname)
@@ -509,40 +407,35 @@ class MultiDomainManager:
             node.destroy_node()
             rclpy.shutdown(context=ctx)
             return did, has_reward, sorted(image_topics)
-        except Exception:
+        except:
             try:
                 rclpy.shutdown(context=ctx)
-            except Exception:
+            except:
                 pass
             return did, False, []
 
     def discover_domains(self, start: int, end: int) -> List[int]:
         discovered = []
-
         with ThreadPoolExecutor(max_workers=10) as ex:
             results = list(ex.map(self._scan_domain_topics, range(start, end + 1)))
 
         for did, has_reward, image_topics in results:
             if image_topics:
                 self.domain_image_topics[did] = image_topics
-            else:
-                # keep old list if already known; don't wipe it
-                if did not in self.domain_image_topics:
-                    self.domain_image_topics[did] = []
+            elif did not in self.domain_image_topics:
+                self.domain_image_topics[did] = []
 
             if has_reward and did not in self.collectors:
                 if self.add_domain(did):
                     discovered.append(did)
 
-        if discovered:
-            print(f"[Manager] Found reward domains: {discovered}")
         return discovered
 
     def discover_namespaces_all(self):
         for c in self.collectors.values():
             try:
                 c.discover_namespaces()
-            except Exception:
+            except:
                 pass
 
     def get_image_topics(self, domain_id: int) -> List[str]:
@@ -559,7 +452,7 @@ class MultiDomainManager:
 
 
 # =============================================================================
-# Dashboard HTML (adds a camera panel)
+# Dashboard HTML - Clean Soft Design with Smooth Charts
 # =============================================================================
 
 DASHBOARD_HTML = """
@@ -572,160 +465,515 @@ DASHBOARD_HTML = """
   <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.5.4/socket.io.min.js"></script>
   <style>
-    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background:#f8fafc; margin:0; }
-    .header { background:white; padding:16px 20px; border-bottom:1px solid #e2e8f0; display:flex; justify-content:space-between; align-items:center; }
-    .container { padding:18px 20px; max-width:1500px; margin:0 auto; }
-    .tabs { display:flex; gap:8px; flex-wrap:wrap; margin-bottom:16px; }
-    .tab { padding:10px 14px; background:white; border:1px solid #e2e8f0; border-radius:12px; cursor:pointer; }
-    .tab.active { background:#6366f1; border-color:#6366f1; color:white; }
-    .card { background:white; border:1px solid #e2e8f0; border-radius:16px; padding:16px; margin-bottom:16px; }
-    .grid2 { display:grid; grid-template-columns: 1fr 1fr; gap:16px; }
-    @media(max-width:1000px){ .grid2{ grid-template-columns: 1fr; } }
-    .row { display:flex; gap:10px; flex-wrap:wrap; align-items:center; }
-    select, input { padding:8px 10px; border-radius:10px; border:1px solid #cbd5e1; }
-    .cam {
-      width:100%;
-      max-height:480px;
-      object-fit:contain;
-      border-radius:14px;
-      border:1px solid #e2e8f0;
-      background:#0b1220;
+    :root {
+      --bg: #f4f7fa;
+      --card: #ffffff;
+      --border: #e8ecf1;
+      --text: #2d3748;
+      --text-light: #718096;
+      --text-muted: #a0aec0;
+      --blue: #667eea;
+      --green: #48bb78;
+      --red: #fc8181;
+      --yellow: #f6e05e;
+      --purple: #9f7aea;
+      --radius: 16px;
+      --shadow: 0 2px 8px rgba(0,0,0,0.04);
     }
-    .muted { color:#64748b; font-size:13px; }
+
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    body {
+      font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.5;
+    }
+
+    .header {
+      background: var(--card);
+      padding: 16px 24px;
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      box-shadow: var(--shadow);
+    }
+
+    .header h1 {
+      font-size: 18px;
+      font-weight: 700;
+      color: var(--text);
+    }
+
+    .badge {
+      background: linear-gradient(135deg, #eef2ff 0%, #f5f3ff 100%);
+      border: 1px solid #c7d2fe;
+      padding: 6px 14px;
+      border-radius: 20px;
+      font-size: 12px;
+      font-weight: 600;
+      color: var(--blue);
+    }
+
+    .container {
+      padding: 20px 24px;
+      max-width: 1400px;
+      margin: 0 auto;
+    }
+
+    .tabs {
+      display: flex;
+      gap: 10px;
+      margin-bottom: 20px;
+      flex-wrap: wrap;
+    }
+
+    .tab {
+      padding: 10px 18px;
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      cursor: pointer;
+      font-size: 13px;
+      font-weight: 500;
+      color: var(--text-light);
+      transition: all 0.2s;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      box-shadow: var(--shadow);
+    }
+
+    .tab:hover {
+      border-color: var(--blue);
+      color: var(--blue);
+    }
+
+    .tab.active {
+      background: linear-gradient(135deg, var(--blue) 0%, #7c3aed 100%);
+      border-color: transparent;
+      color: white;
+      box-shadow: 0 4px 12px rgba(102, 126, 234, 0.3);
+    }
+
+    .tab .dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: var(--text-muted);
+    }
+
+    .tab.live .dot {
+      background: var(--green);
+      animation: pulse 2s infinite;
+    }
+
+    .tab.active .dot {
+      background: rgba(255,255,255,0.6);
+    }
+
+    .tab.active.live .dot {
+      background: white;
+    }
+
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.5; }
+    }
+
+    .card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 20px;
+      box-shadow: var(--shadow);
+      margin-bottom: 16px;
+    }
+
+    .card h3 {
+      font-size: 13px;
+      font-weight: 600;
+      color: var(--text-light);
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      margin-bottom: 16px;
+    }
+
+    .stats-row {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+      gap: 12px;
+      margin-bottom: 20px;
+    }
+
+    .stat {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 16px;
+      box-shadow: var(--shadow);
+    }
+
+    .stat .label {
+      font-size: 11px;
+      font-weight: 600;
+      color: var(--text-muted);
+      text-transform: uppercase;
+      letter-spacing: 0.3px;
+    }
+
+    .stat .value {
+      font-size: 24px;
+      font-weight: 700;
+      margin-top: 4px;
+    }
+
+    .stat .value.green { color: var(--green); }
+    .stat .value.red { color: var(--red); }
+    .stat .value.blue { color: var(--blue); }
+    .stat .value.purple { color: var(--purple); }
+
+    .grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 16px;
+    }
+
+    @media (max-width: 1000px) {
+      .grid { grid-template-columns: 1fr; }
+    }
+
+    .chart { height: 240px; }
+
+    .camera-container {
+      position: relative;
+      background: #1a202c;
+      border-radius: 12px;
+      overflow: hidden;
+    }
+
+    .camera-img {
+      width: 100%;
+      height: 300px;
+      object-fit: contain;
+      display: block;
+    }
+
+    .camera-select {
+      padding: 8px 12px;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      font-size: 12px;
+      background: var(--card);
+      color: var(--text);
+      min-width: 200px;
+    }
+
+    .zones {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      margin-top: 12px;
+    }
+
+    .zone {
+      padding: 4px 12px;
+      border-radius: 16px;
+      font-size: 11px;
+      font-weight: 600;
+    }
+
+    .zone.FREE { background: #c6f6d5; color: #276749; }
+    .zone.AWARE { background: #fefcbf; color: #975a16; }
+    .zone.CAUTION { background: #fed7aa; color: #c05621; }
+    .zone.DANGER { background: #fed7d7; color: #c53030; }
+    .zone.EMERGENCY { background: #feb2b2; color: #9b2c2c; }
+
+    .empty {
+      text-align: center;
+      padding: 60px;
+      color: var(--text-muted);
+    }
+
+    .summary-box {
+      background: linear-gradient(135deg, #eef2ff 0%, #faf5ff 100%);
+      border: 1px solid #ddd6fe;
+      border-radius: var(--radius);
+      padding: 20px;
+      margin-bottom: 20px;
+    }
+
+    .summary-box h3 {
+      color: var(--blue);
+      margin-bottom: 16px;
+    }
+
+    .summary-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+      gap: 16px;
+    }
+
+    .summary-stat {
+      text-align: center;
+    }
+
+    .summary-stat .label {
+      font-size: 10px;
+      color: var(--text-muted);
+      text-transform: uppercase;
+    }
+
+    .summary-stat .value {
+      font-size: 20px;
+      font-weight: 700;
+      margin-top: 4px;
+    }
   </style>
 </head>
 <body>
   <div class="header">
-    <div style="font-weight:700">RL Training Monitor</div>
-    <div class="muted" id="badge">Connecting...</div>
+    <h1>RL Training Monitor</h1>
+    <span class="badge" id="badge">Scanning...</span>
   </div>
 
   <div class="container">
     <div class="tabs" id="tabs"></div>
-    <div id="content"><div class="muted">Scanning for domains...</div></div>
+    <div id="content"><div class="empty">Scanning for ROS2 domains...</div></div>
   </div>
 
   <script>
     const socket = io();
     let domains = {};
     let selected = 'all';
+    let chartsInitialized = {};
+
+    const colors = {
+      blue: '#667eea', green: '#48bb78', red: '#fc8181',
+      yellow: '#ecc94b', purple: '#9f7aea', cyan: '#4fd1c5'
+    };
+
+    const layoutBase = {
+      paper_bgcolor: 'rgba(0,0,0,0)',
+      plot_bgcolor: 'rgba(0,0,0,0)',
+      font: { color: '#718096', size: 10 },
+      margin: { l: 40, r: 16, t: 24, b: 32 },
+      xaxis: { gridcolor: '#edf2f7', zerolinecolor: '#e2e8f0' },
+      yaxis: { gridcolor: '#edf2f7', zerolinecolor: '#e2e8f0' },
+      showlegend: false
+    };
+
+    const config = { displayModeBar: false, responsive: true };
+
+    socket.on('connect', () => document.getElementById('badge').textContent = 'Connected');
+    socket.on('disconnect', () => document.getElementById('badge').textContent = 'Disconnected');
 
     socket.on('update', data => {
       domains = data.domains || {};
+      const n = Object.keys(domains).length;
+      document.getElementById('badge').textContent = n + ' Domain' + (n !== 1 ? 's' : '');
       render();
     });
 
     function render() {
-      const keys = Object.keys(domains);
-      document.getElementById('badge').textContent = keys.length + ' domain(s)';
-      renderTabs(keys);
-
-      if (selected === 'all') {
-        document.getElementById('content').innerHTML = '<div class="muted">Select a domain to view charts + camera.</div>';
-      } else {
-        renderSingle(selected);
-      }
+      renderTabs();
+      if (selected === 'all') renderAllView();
+      else renderDomainView(selected);
     }
 
-    function renderTabs(keys) {
-      let h = '<div class="tab ' + (selected==='all'?'active':'') + '" onclick="selectTab(\\'all\\')">All</div>';
+    function renderTabs() {
+      const keys = Object.keys(domains);
+      let h = '<div class="tab ' + (selected === 'all' ? 'active' : '') + '" onclick="sel(\\'all\\')">Overview</div>';
       keys.forEach(k => {
         const s = domains[k].summary;
-        h += '<div class="tab ' + (selected===k?'active':'') + '" onclick="selectTab(\\'' + k + '\\')">' + s.display_name + '</div>';
+        h += '<div class="tab ' + (selected === k ? 'active' : '') + ' ' + (s.active ? 'live' : '') + '" onclick="sel(\\'' + k + '\\')">' +
+             '<div class="dot"></div>' + s.display_name + '</div>';
       });
       document.getElementById('tabs').innerHTML = h;
     }
 
-    function selectTab(k){ selected=k; render(); }
+    function sel(k) {
+      selected = k;
+      chartsInitialized = {};
+      render();
+    }
 
-    async function renderSingle(k) {
+    function renderAllView() {
+      const vals = Object.values(domains);
+      if (!vals.length) {
+        document.getElementById('content').innerHTML = '<div class="empty">No domains found yet...</div>';
+        return;
+      }
+
+      const totSteps = vals.reduce((a, d) => a + d.summary.total_steps, 0);
+      const totEp = vals.reduce((a, d) => a + d.summary.episode_count, 0);
+      const totGoals = vals.reduce((a, d) => a + d.summary.goals_reached, 0);
+      const active = vals.filter(d => d.summary.active).length;
+      const rets = vals.filter(d => d.summary.episode_count > 0).map(d => d.summary.avg_episode_return);
+      const avgRet = rets.length ? rets.reduce((a, b) => a + b, 0) / rets.length : 0;
+
+      let h = '<div class="summary-box"><h3>Cross-Domain Summary</h3><div class="summary-grid">' +
+        '<div class="summary-stat"><div class="label">Total Steps</div><div class="value">' + totSteps.toLocaleString() + '</div></div>' +
+        '<div class="summary-stat"><div class="label">Episodes</div><div class="value">' + totEp + '</div></div>' +
+        '<div class="summary-stat"><div class="label">Goals</div><div class="value">' + totGoals + '</div></div>' +
+        '<div class="summary-stat"><div class="label">Avg Return</div><div class="value" style="color:' + (avgRet >= 0 ? colors.green : colors.red) + '">' + avgRet.toFixed(1) + '</div></div>' +
+        '<div class="summary-stat"><div class="label">Active</div><div class="value" style="color:' + colors.green + '">' + active + '/' + vals.length + '</div></div>' +
+      '</div></div>';
+
+      h += '<div class="card"><h3>Episode Returns (All Domains)</h3><div id="allChart" class="chart" style="height:280px"></div></div>';
+
+      document.getElementById('content').innerHTML = h;
+
+      // Draw comparison chart
+      const traces = [];
+      const cls = [colors.blue, colors.green, colors.purple, colors.red, colors.cyan, colors.yellow];
+      let ci = 0;
+      Object.values(domains).forEach(d => {
+        const p = d.plot_data;
+        if (p.episode_returns.values.length) {
+          traces.push({
+            x: p.episode_returns.episodes,
+            y: p.episode_returns.values,
+            type: 'scatter',
+            mode: 'lines',
+            name: p.display_name,
+            line: { color: cls[ci++ % cls.length], width: 2 }
+          });
+        }
+      });
+      if (traces.length) {
+        Plotly.newPlot('allChart', traces, {
+          ...layoutBase,
+          showlegend: true,
+          legend: { bgcolor: 'rgba(0,0,0,0)', font: { size: 10 } },
+          xaxis: { ...layoutBase.xaxis, title: 'Episode' },
+          yaxis: { ...layoutBase.yaxis, title: 'Return' }
+        }, config);
+      }
+    }
+
+    async function renderDomainView(k) {
       const d = domains[k];
       if (!d) return;
 
       const s = d.summary;
+      const p = d.plot_data;
 
-      // Fetch camera topics for this domain_id
+      // Fetch camera topics
       const resp = await fetch('/api/cameras?domain_id=' + s.domain_id);
       const camData = await resp.json();
-      const topics = (camData.topics || []);
-
+      const topics = camData.topics || [];
       const defaultTopic = topics.includes('/sam3_goal_generator/visualization')
-        ? '/sam3_goal_generator/visualization'
-        : (topics[0] || '');
+        ? '/sam3_goal_generator/visualization' : (topics[0] || '');
 
-      const camSelectId = 'cam_topic_select';
-      const camImgId = 'cam_img';
+      let options = topics.length
+        ? topics.map(t => '<option value="' + t + '"' + (t === defaultTopic ? ' selected' : '') + '>' + t + '</option>').join('')
+        : '<option value="">No image topics</option>';
 
-      let options = '';
-      if (!topics.length) {
-        options = '<option value="">(no Image topics found)</option>';
-      } else {
-        topics.forEach(t => {
-          const sel = (t === defaultTopic) ? 'selected' : '';
-          options += '<option value="' + t + '" ' + sel + '>' + t + '</option>';
-        });
-      }
+      let h = '<div class="stats-row">' +
+        '<div class="stat"><div class="label">Steps</div><div class="value">' + s.total_steps.toLocaleString() + '</div></div>' +
+        '<div class="stat"><div class="label">Episodes</div><div class="value">' + s.episode_count + '</div></div>' +
+        '<div class="stat"><div class="label">Goals</div><div class="value green">' + s.goals_reached + '</div></div>' +
+        '<div class="stat"><div class="label">Cells</div><div class="value blue">' + s.cells_discovered + '</div></div>' +
+        '<div class="stat"><div class="label">Current Return</div><div class="value ' + (s.current_episode_return >= 0 ? 'green' : 'red') + '">' + s.current_episode_return.toFixed(1) + '</div></div>' +
+        '<div class="stat"><div class="label">Avg Return</div><div class="value ' + (s.avg_episode_return >= 0 ? 'green' : 'red') + '">' + s.avg_episode_return.toFixed(1) + '</div></div>' +
+        '<div class="stat"><div class="label">Intervention</div><div class="value ' + (s.avg_intervention < 0.3 ? 'green' : '') + '">' + (s.avg_intervention * 100).toFixed(0) + '%</div></div>' +
+      '</div>';
 
-      const streamUrl = defaultTopic ? ('/stream/' + s.domain_id + '?topic=' + encodeURIComponent(defaultTopic)) : '';
+      h += '<div class="grid">' +
+        '<div class="card"><h3>Camera Feed</h3>' +
+        '<div style="margin-bottom:12px"><select class="camera-select" id="camSelect">' + options + '</select></div>' +
+        '<div class="camera-container"><img class="camera-img" id="camImg" src="' +
+        (defaultTopic ? '/stream/' + s.domain_id + '?topic=' + encodeURIComponent(defaultTopic) : '') + '"/></div></div>' +
+        '<div class="card"><h3>Real-Time Reward</h3><div id="rewChart" class="chart"></div></div>' +
+      '</div>';
 
-      let h = '';
-      h += '<div class="card">';
-      h += '<div style="font-size:18px;font-weight:700">' + s.display_name + '</div>';
-      h += '<div class="muted">Domain ' + s.domain_id + ' | Steps ' + s.total_steps.toLocaleString() + ' | Episodes ' + s.episode_count + '</div>';
-      h += '</div>';
+      h += '<div class="grid">' +
+        '<div class="card"><h3>Episode Returns</h3><div id="epChart" class="chart"></div></div>' +
+        '<div class="card"><h3>Intervention Rate</h3><div id="intChart" class="chart"></div></div>' +
+      '</div>';
 
-      h += '<div class="grid2">';
-      h += '  <div class="card">';
-      h += '    <div style="font-weight:700; margin-bottom:10px">Live Camera</div>';
-      h += '    <div class="row" style="margin-bottom:10px">';
-      h += '      <div class="muted">Topic:</div>';
-      h += '      <select id="' + camSelectId + '">' + options + '</select>';
-      h += '      <span class="muted" id="cam_status"></span>';
-      h += '    </div>';
-      h += '    <img class="cam" id="' + camImgId + '" src="' + streamUrl + '" />';
-      h += '    <div class="muted" style="margin-top:8px">Stream: /stream/' + s.domain_id + '?topic=...</div>';
-      h += '  </div>';
-
-      h += '  <div class="card">';
-      h += '    <div style="font-weight:700; margin-bottom:10px">Reward (last 100)</div>';
-      h += '    <div id="rewChart" style="height:320px"></div>';
-      h += '  </div>';
-      h += '</div>';
+      h += '<div class="grid">' +
+        '<div class="card"><h3>Safety Zones</h3><div id="zoneChart" class="chart"></div>' +
+        '<div class="zones">' + Object.entries(p.safety_zones).filter(z => z[1] > 0).map(z => '<span class="zone ' + z[0] + '">' + z[0] + ': ' + z[1] + '</span>').join('') + '</div></div>' +
+        '<div class="card"><h3>Reward Components</h3><div id="compChart" class="chart"></div></div>' +
+      '</div>';
 
       document.getElementById('content').innerHTML = h;
 
-      // Hook topic change -> update img src
-      const sel = document.getElementById(camSelectId);
-      const img = document.getElementById(camImgId);
-      const status = document.getElementById('cam_status');
+      // Camera select handler
+      const camSelect = document.getElementById('camSelect');
+      const camImg = document.getElementById('camImg');
+      camSelect.onchange = () => {
+        const t = camSelect.value;
+        camImg.src = t ? '/stream/' + s.domain_id + '?topic=' + encodeURIComponent(t) + '&_t=' + Date.now() : '';
+      };
 
-      function updateStream() {
-        const topic = sel.value;
-        if (!topic) {
-          img.removeAttribute('src');
-          status.textContent = ' (no topic)';
-          return;
-        }
-        img.src = '/stream/' + s.domain_id + '?topic=' + encodeURIComponent(topic) + '&_t=' + Date.now();
-        status.textContent = '';
+      // Draw charts using Plotly.react for smooth updates
+      drawRewardChart(p);
+      drawEpisodeChart(p);
+      drawInterventionChart(p);
+      drawZoneChart(p);
+      drawComponentsChart(p);
+    }
+
+    function drawRewardChart(p) {
+      if (!p.rewards.values.length) return;
+      Plotly.react('rewChart', [{
+        x: p.rewards.times, y: p.rewards.values,
+        type: 'scatter', mode: 'lines',
+        line: { color: colors.blue, width: 2 },
+        fill: 'tozeroy', fillcolor: 'rgba(102,126,234,0.1)'
+      }], { ...layoutBase, xaxis: { ...layoutBase.xaxis, title: 'Time (s)' } }, config);
+    }
+
+    function drawEpisodeChart(p) {
+      if (!p.episode_returns.values.length) return;
+      const ra = [];
+      for (let i = 0; i < p.episode_returns.values.length; i++) {
+        const w = p.episode_returns.values.slice(Math.max(0, i - 9), i + 1);
+        ra.push(w.reduce((a, b) => a + b, 0) / w.length);
       }
-      sel.addEventListener('change', updateStream);
+      Plotly.react('epChart', [
+        { x: p.episode_returns.episodes, y: p.episode_returns.values, type: 'scatter', mode: 'lines+markers', name: 'Return', line: { color: colors.green, width: 2 }, marker: { size: 4 } },
+        { x: p.episode_returns.episodes, y: ra, type: 'scatter', mode: 'lines', name: 'Avg', line: { color: colors.yellow, width: 2.5 } }
+      ], { ...layoutBase, showlegend: true, legend: { bgcolor: 'rgba(0,0,0,0)', x: 0.02, y: 0.98 }, xaxis: { ...layoutBase.xaxis, title: 'Episode' } }, config);
+    }
 
-      // Plot reward mini chart
-      const p = d.plot_data;
-      if (p && p.rewards && p.rewards.values && p.rewards.values.length) {
-        const xs = p.rewards.times.slice(-100);
-        const ys = p.rewards.values.slice(-100);
-        Plotly.newPlot('rewChart', [{
-          x: xs, y: ys, type:'scatter', mode:'lines', fill:'tozeroy'
-        }], {
-          paper_bgcolor:'rgba(0,0,0,0)',
-          plot_bgcolor:'rgba(0,0,0,0)',
-          margin:{l:45,r:10,t:10,b:35},
-          xaxis:{gridcolor:'#e2e8f0'},
-          yaxis:{gridcolor:'#e2e8f0'},
-          showlegend:false
-        }, {displayModeBar:false, responsive:true});
+    function drawInterventionChart(p) {
+      if (!p.interventions.values.length) return;
+      Plotly.react('intChart', [{
+        x: p.interventions.times, y: p.interventions.values.map(v => v * 100),
+        type: 'scatter', mode: 'lines',
+        line: { color: colors.red, width: 2 },
+        fill: 'tozeroy', fillcolor: 'rgba(252,129,129,0.1)'
+      }], { ...layoutBase, xaxis: { ...layoutBase.xaxis, title: 'Time (s)' }, yaxis: { ...layoutBase.yaxis, title: '%', range: [0, 100] } }, config);
+    }
+
+    function drawZoneChart(p) {
+      const zc = { FREE: colors.green, AWARE: '#9ae6b4', CAUTION: colors.yellow, DANGER: '#feb2b2', EMERGENCY: colors.red };
+      const zones = Object.entries(p.safety_zones).filter(z => z[1] > 0);
+      if (!zones.length) return;
+      Plotly.react('zoneChart', [{
+        values: zones.map(z => z[1]),
+        labels: zones.map(z => z[0]),
+        type: 'pie',
+        marker: { colors: zones.map(z => zc[z[0]] || '#a0aec0') },
+        textinfo: 'label+percent',
+        textfont: { size: 10 },
+        hole: 0.5
+      }], { ...layoutBase }, config);
+    }
+
+    function drawComponentsChart(p) {
+      const cc = { discovery: colors.purple, proximity: colors.red, step: '#a0aec0', novelty: colors.cyan, rnd: '#4fd1c5', goal: colors.yellow };
+      const traces = [];
+      Object.entries(p.components).forEach(([n, d]) => {
+        if (d.values.length) traces.push({ x: d.times, y: d.values, type: 'scatter', mode: 'lines', name: n, line: { color: cc[n] || '#a0aec0', width: 1.5 } });
+      });
+      if (traces.length) {
+        Plotly.react('compChart', traces, { ...layoutBase, showlegend: true, legend: { bgcolor: 'rgba(0,0,0,0)', font: { size: 9 } }, xaxis: { ...layoutBase.xaxis, title: 'Time (s)' } }, config);
       }
     }
   </script>
@@ -752,59 +1000,37 @@ def create_app(stats: Dict[str, DomainStats], mgr: MultiDomainManager):
     def api_cameras():
         try:
             domain_id = int(request.args.get("domain_id", "0"))
-        except Exception:
+        except:
             domain_id = 0
-        topics = mgr.get_image_topics(domain_id)
-        return jsonify({"domain_id": domain_id, "topics": topics})
+        return jsonify({"domain_id": domain_id, "topics": mgr.get_image_topics(domain_id)})
 
     def mjpeg_generator(domain_id: int, topic: str):
         cam = mgr.get_camera(domain_id)
         if cam is None:
-            # domain camera not initialized (shouldn't happen if domain is added)
-            while True:
-                time.sleep(0.2)
-                yield b""
+            return
 
-        # ensure subscription to requested topic
         cam.ensure_subscription(topic)
-
         boundary = b"--frame\r\n"
-        content_type = b"Content-Type: image/jpeg\r\n"
-        while True:
-            # if frames are stale, still keep connection alive (blank wait)
-            frame = cam.latest_jpeg()
-            if frame is None:
-                time.sleep(0.05)
-                continue
 
-            yield boundary + content_type + b"Content-Length: " + str(len(frame)).encode("ascii") + b"\r\n\r\n" + frame + b"\r\n"
-            # throttle a bit; camera collector already throttles, but this avoids hot loop
-            time.sleep(0.001)
+        while True:
+            frame = cam.latest_jpeg()
+            if frame:
+                yield boundary + b"Content-Type: image/jpeg\r\nContent-Length: " + str(len(frame)).encode() + b"\r\n\r\n" + frame + b"\r\n"
+            time.sleep(0.03)
 
     @app.route("/stream/<int:domain_id>")
     def stream(domain_id: int):
         topic = request.args.get("topic", "").strip()
         if not topic:
-            return "Missing ?topic=/your/image/topic", 400
+            return "Missing ?topic=", 400
         if not topic.startswith("/"):
             topic = "/" + topic
-
-        return Response(
-            mjpeg_generator(domain_id, topic),
-            mimetype="multipart/x-mixed-replace; boundary=frame"
-        )
+        return Response(mjpeg_generator(domain_id, topic), mimetype="multipart/x-mixed-replace; boundary=frame")
 
     def updater():
         while True:
             time.sleep(1.0 / UPDATE_RATE_HZ)
-            data = {
-                "domains": {
-                    k: {
-                        "summary": v.get_summary(),
-                        "plot_data": v.get_plot_data(),
-                    } for k, v in stats.items()
-                }
-            }
+            data = {"domains": {k: {"summary": v.get_summary(), "plot_data": v.get_plot_data()} for k, v in stats.items()}}
             sio.emit("update", data)
 
     return app, sio, updater
@@ -824,23 +1050,18 @@ def main():
     args = parser.parse_args()
 
     print(f"""
-+--------------------------------------------------------------+
-|                   RL Training Monitor                        |
-+--------------------------------------------------------------+
-|  Browser:  http://localhost:{args.port}
-|  Stream:   http://localhost:{args.port}/stream/<domain>?topic=/sam3_goal_generator/visualization
-|  Scanning: domains {args.scan_start}-{args.scan_end} every {args.scan_interval}s
-+--------------------------------------------------------------+
+    RL Training Monitor
+    ===================
+    http://localhost:{args.port}
+    Scanning domains {args.scan_start}-{args.scan_end}
     """)
 
     stats: Dict[str, DomainStats] = {}
     mgr = MultiDomainManager(stats)
 
-    print("[Scan] Initial scan...")
     mgr.discover_domains(args.scan_start, args.scan_end)
 
     app, sio, updater = create_app(stats, mgr)
-
     threading.Thread(target=updater, daemon=True).start()
 
     def scan_loop():
@@ -852,25 +1073,17 @@ def main():
     threading.Thread(target=scan_loop, daemon=True).start()
 
     def shutdown(*_):
-        print("\n[Monitor] Shutting down...")
         mgr.stop_all()
         sys.exit(0)
 
     signal.signal(signal.SIGINT, shutdown)
     signal.signal(signal.SIGTERM, shutdown)
 
+    logging.getLogger("werkzeug").setLevel(logging.ERROR)
+
     try:
-        sio.run(
-            app,
-            host="0.0.0.0",
-            port=args.port,
-            debug=False,
-            use_reloader=False,
-            log_output=False,
-            allow_unsafe_werkzeug=True,
-        )
-    except Exception as e:
-        print(f"[Error] {e}")
+        sio.run(app, host="0.0.0.0", port=args.port, debug=False, use_reloader=False, log_output=False, allow_unsafe_werkzeug=True)
+    except:
         shutdown()
 
 
