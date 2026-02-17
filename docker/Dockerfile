@@ -356,7 +356,7 @@ RUN mkdir -p $AMENT_WS/install/stretch_description/share/stretch_description/urd
 
 
 # Copy custom MuJoCo scene (10x10m arena with obstacles)
-RUN cp $AMENT_WS/src/stretch_ros2/senior_project/config/scene.xml \
+RUN cp $AMENT_WS/src/senior_project/config/scene.xml \
        $AMENT_WS/src/stretch_mujoco/stretch_mujoco/models/scene.xml
 
 # =============================================================================
