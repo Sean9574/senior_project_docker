@@ -1807,6 +1807,10 @@ class StretchExploreEnv(gym.Env):
             "mode": "goal" if has_goal else "explore",
             "reward": float(reward),
             "reward_terms": info.get("reward_terms", {}),
+            "collision": info.get("collision", False),
+            "success": info.get("success", False),
+            "mission_complete": info.get("mission_complete", False),
+            "goals_reached": self._goals_reached_this_episode,
             "safety": {
                 "zone": info.get("safety_zone", "UNKNOWN"),
                 "blend": info.get("safety_blend", 0.0),

@@ -1,40 +1,30 @@
 #!/usr/bin/env python3
 """
-Multi-Domain Real-Time Reward Visualization Server
+Multi-Domain RL Training Monitor
 
-Automatically discovers and monitors ALL active ROS2 domains with reward topics.
-Displays individual domain metrics and cross-domain averages.
-
-Features:
-- Auto-discovery of all active ROS2 domains
-- Real-time graphs per domain
-- Cross-domain average metrics
-- Professional, clean UI design
+Automatically discovers and monitors all active ROS2 domains with reward topics.
+Professional, clean interface with soft colors and rounded design.
 """
 
 import argparse
 import json
-import math
-import os
 import signal
 import sys
 import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field
-from datetime import datetime
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional
 from concurrent.futures import ThreadPoolExecutor
 
 import rclpy
-from rclpy.node import Node
 from rclpy.context import Context
 from rclpy.executors import SingleThreadedExecutor
-from rclpy.qos import qos_profile_sensor_data, QoSProfile, ReliabilityPolicy, HistoryPolicy
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 from std_msgs.msg import Float32, String as StringMsg
 
 from flask import Flask, render_template_string, jsonify
-from flask_socketio import SocketIO, emit
+from flask_socketio import SocketIO
 from flask_cors import CORS
 
 # =============================================================================
@@ -44,9 +34,6 @@ from flask_cors import CORS
 DEFAULT_PORT = 5555
 MAX_HISTORY_LENGTH = 1000
 UPDATE_RATE_HZ = 10
-DISCOVERY_TIMEOUT = 2.0
-
-# Default scan range
 DEFAULT_SCAN_START = 0
 DEFAULT_SCAN_END = 50
 DEFAULT_SCAN_INTERVAL = 15.0
@@ -65,16 +52,17 @@ class DomainStats:
     timestamps: deque = field(default_factory=lambda: deque(maxlen=MAX_HISTORY_LENGTH))
     components: Dict[str, deque] = field(default_factory=dict)
     episode_returns: deque = field(default_factory=lambda: deque(maxlen=100))
-    episode_lengths: deque = field(default_factory=lambda: deque(maxlen=100))
     current_episode_return: float = 0.0
     current_episode_steps: int = 0
+    last_episode_num: int = 0
     episode_count: int = 0
     safety_zones: deque = field(default_factory=lambda: deque(maxlen=MAX_HISTORY_LENGTH))
     intervention_rates: deque = field(default_factory=lambda: deque(maxlen=MAX_HISTORY_LENGTH))
     total_steps: int = 0
     last_update: float = 0.0
-    active: bool = True
     goals_reached: int = 0
+    frontiers: int = 0
+    cells_discovered: int = 0
     
     def add_reward(self, reward: float, timestamp: float):
         self.rewards.append(reward)
@@ -87,34 +75,41 @@ class DomainStats:
     def add_breakdown(self, breakdown: Dict):
         timestamp = time.time()
         
+        # Track reward components
         reward_terms = breakdown.get("reward_terms", {})
         for key, value in reward_terms.items():
             if key not in self.components:
                 self.components[key] = deque(maxlen=MAX_HISTORY_LENGTH)
             self.components[key].append((timestamp, value))
         
+        # Track safety
         safety = breakdown.get("safety", {})
         zone = safety.get("zone", "UNKNOWN")
         intervention = safety.get("intervention", 0.0)
-        
         self.safety_zones.append((timestamp, zone))
         self.intervention_rates.append((timestamp, intervention))
         
-        # Track goals
-        if breakdown.get("success", False):
-            self.goals_reached += 1
+        # Track goals from breakdown
+        goals = breakdown.get("goals_reached", 0)
+        if goals > self.goals_reached:
+            self.goals_reached = goals
         
-        # Check for episode end
-        if breakdown.get("collision", False) or breakdown.get("mission_complete", False):
-            self.end_episode()
-    
-    def end_episode(self):
-        if self.current_episode_steps > 0:
-            self.episode_returns.append(self.current_episode_return)
-            self.episode_lengths.append(self.current_episode_steps)
-            self.episode_count += 1
+        # Track exploration stats
+        explore_stats = breakdown.get("explore_stats", {})
+        self.cells_discovered = explore_stats.get("total_discovered", self.cells_discovered)
+        self.frontiers = explore_stats.get("frontier_count", self.frontiers)
+        
+        # Detect episode changes by watching episode number
+        episode_num = breakdown.get("episode", 0)
+        if episode_num > self.last_episode_num and self.last_episode_num > 0:
+            # Episode changed - save the previous episode's return
+            if self.current_episode_steps > 0:
+                self.episode_returns.append(self.current_episode_return)
+                self.episode_count += 1
             self.current_episode_return = 0.0
             self.current_episode_steps = 0
+            self.goals_reached = 0  # Reset goals for new episode
+        self.last_episode_num = episode_num
     
     def get_summary(self) -> Dict:
         recent_rewards = list(self.rewards)[-100:] if self.rewards else [0]
@@ -127,13 +122,14 @@ class DomainStats:
             "total_steps": self.total_steps,
             "episode_count": self.episode_count,
             "goals_reached": self.goals_reached,
+            "cells_discovered": self.cells_discovered,
+            "frontiers": self.frontiers,
             "current_episode_return": self.current_episode_return,
             "current_episode_steps": self.current_episode_steps,
             "avg_reward_100": sum(recent_rewards) / len(recent_rewards) if recent_rewards else 0,
             "avg_episode_return": sum(self.episode_returns) / len(self.episode_returns) if self.episode_returns else 0,
             "avg_intervention": sum(recent_interventions) / len(recent_interventions) if recent_interventions else 0,
             "active": time.time() - self.last_update < 5.0,
-            "last_update": self.last_update,
         }
     
     def get_plot_data(self, max_points: int = 500) -> Dict:
@@ -141,25 +137,21 @@ class DomainStats:
         
         rewards = list(self.rewards)[::step]
         timestamps = list(self.timestamps)[::step]
-        
-        if timestamps:
-            t0 = timestamps[0]
-            rel_times = [(t - t0) for t in timestamps]
-        else:
-            rel_times = []
-            t0 = 0
+        t0 = timestamps[0] if timestamps else 0
+        rel_times = [(t - t0) for t in timestamps]
         
         episode_returns = list(self.episode_returns)
-        episode_indices = list(range(len(episode_returns)))
+        episode_indices = list(range(1, len(episode_returns) + 1))
         
         components_data = {}
         for key, values in self.components.items():
             vals = list(values)[::step]
-            t0_comp = vals[0][0] if vals else t0
-            components_data[key] = {
-                "times": [(v[0] - t0_comp) for v in vals],
-                "values": [v[1] for v in vals]
-            }
+            if vals:
+                t0_comp = vals[0][0]
+                components_data[key] = {
+                    "times": [(v[0] - t0_comp) for v in vals],
+                    "values": [v[1] for v in vals]
+                }
         
         zone_counts = {"FREE": 0, "AWARE": 0, "CAUTION": 0, "DANGER": 0, "EMERGENCY": 0}
         for _, zone in list(self.safety_zones)[-500:]:
@@ -167,9 +159,12 @@ class DomainStats:
                 zone_counts[zone] += 1
         
         interventions = list(self.intervention_rates)[::step]
-        t0_int = interventions[0][0] if interventions else t0
-        intervention_times = [(v[0] - t0_int) for v in interventions]
-        intervention_values = [v[1] for v in interventions]
+        if interventions:
+            t0_int = interventions[0][0]
+            intervention_times = [(v[0] - t0_int) for v in interventions]
+            intervention_values = [v[1] for v in interventions]
+        else:
+            intervention_times, intervention_values = [], []
         
         return {
             "domain_id": self.domain_id,
@@ -187,8 +182,6 @@ class DomainStats:
 # =============================================================================
 
 class DomainCollector:
-    """Collects reward data from a single ROS2 domain."""
-    
     def __init__(self, domain_id: int, stats_store: Dict[str, DomainStats], 
                  namespaces: List[str] = None):
         self.domain_id = domain_id
@@ -200,18 +193,15 @@ class DomainCollector:
         rclpy.init(context=self.context, domain_id=domain_id)
         
         self.node = rclpy.create_node(
-            f"reward_viz_domain_{domain_id}",
-            context=self.context,
-            automatically_declare_parameters_from_overrides=True
+            f"reward_monitor_{domain_id}",
+            context=self.context
         )
         
         self.executor = SingleThreadedExecutor(context=self.context)
         self.executor.add_node(self.node)
         
-        self._topic_subs = []
+        self._subs = []
         self._setup_subscriptions()
-        
-        self.node.get_logger().info(f"[Domain {domain_id}] Collector initialized")
     
     def _setup_subscriptions(self):
         for ns in self.namespaces:
@@ -242,48 +232,39 @@ class DomainCollector:
             depth=10
         )
         
-        reward_sub = self.node.create_subscription(
+        self._subs.append(self.node.create_subscription(
             Float32, reward_topic,
-            lambda msg, k=stats_key: self._reward_callback(msg, k),
-            qos
-        )
-        self._topic_subs.append(reward_sub)
+            lambda msg, k=stats_key: self._reward_cb(msg, k), qos
+        ))
         
-        breakdown_sub = self.node.create_subscription(
+        self._subs.append(self.node.create_subscription(
             StringMsg, breakdown_topic,
-            lambda msg, k=stats_key: self._breakdown_callback(msg, k),
-            qos
-        )
-        self._topic_subs.append(breakdown_sub)
+            lambda msg, k=stats_key: self._breakdown_cb(msg, k), qos
+        ))
         
-        self.node.get_logger().info(f"[Domain {self.domain_id}] Subscribed: {reward_topic}")
+        print(f"[Domain {self.domain_id}] Subscribed: {reward_topic}")
     
-    def _reward_callback(self, msg: Float32, stats_key: str):
-        if stats_key in self.stats:
-            self.stats[stats_key].add_reward(msg.data, time.time())
+    def _reward_cb(self, msg: Float32, key: str):
+        if key in self.stats:
+            self.stats[key].add_reward(msg.data, time.time())
     
-    def _breakdown_callback(self, msg: StringMsg, stats_key: str):
+    def _breakdown_cb(self, msg: StringMsg, key: str):
         try:
-            breakdown = json.loads(msg.data)
-            if stats_key in self.stats:
-                self.stats[stats_key].add_breakdown(breakdown)
-        except json.JSONDecodeError:
+            data = json.loads(msg.data)
+            if key in self.stats:
+                self.stats[key].add_breakdown(data)
+        except:
             pass
     
     def discover_namespaces(self) -> List[str]:
         discovered = []
-        topic_names_and_types = self.node.get_topic_names_and_types()
-        
-        for topic_name, _ in topic_names_and_types:
-            if topic_name.endswith("/reward"):
-                parts = topic_name.rsplit("/reward", 1)[0]
-                ns = parts.lstrip("/") if parts else ""
-                
+        for topic, _ in self.node.get_topic_names_and_types():
+            if topic.endswith("/reward"):
+                ns = topic.rsplit("/reward", 1)[0].lstrip("/")
                 if ns not in self.namespaces:
                     discovered.append(ns)
                     self._subscribe_namespace(ns)
                     self.namespaces.append(ns)
-        
         return discovered
     
     def spin(self):
@@ -291,8 +272,8 @@ class DomainCollector:
         while self.running:
             try:
                 self.executor.spin_once(timeout_sec=0.1)
-            except Exception as e:
-                self.node.get_logger().warn(f"[Domain {self.domain_id}] Spin error: {e}")
+            except:
+                pass
     
     def stop(self):
         self.running = False
@@ -300,7 +281,7 @@ class DomainCollector:
             self.executor.shutdown()
             self.node.destroy_node()
             rclpy.shutdown(context=self.context)
-        except Exception:
+        except:
             pass
 
 
@@ -309,8 +290,6 @@ class DomainCollector:
 # =============================================================================
 
 class MultiDomainManager:
-    """Manages collectors for multiple ROS2 domains."""
-    
     def __init__(self, stats_store: Dict[str, DomainStats]):
         self.stats = stats_store
         self.collectors: Dict[int, DomainCollector] = {}
@@ -321,83 +300,63 @@ class MultiDomainManager:
         with self.lock:
             if domain_id in self.collectors:
                 return False
-            
             try:
                 collector = DomainCollector(domain_id, self.stats, namespaces)
                 self.collectors[domain_id] = collector
-                
-                thread = threading.Thread(
-                    target=collector.spin,
-                    daemon=True,
-                    name=f"domain_{domain_id}_spin"
-                )
+                thread = threading.Thread(target=collector.spin, daemon=True)
                 thread.start()
                 self.threads[domain_id] = thread
-                
                 print(f"[Manager] Added domain {domain_id}")
                 return True
             except Exception as e:
                 print(f"[Manager] Failed to add domain {domain_id}: {e}")
                 return False
     
-    def discover_domains(self, scan_start: int, scan_end: int) -> List[int]:
+    def discover_domains(self, start: int, end: int) -> List[int]:
         discovered = []
         
-        print(f"[Manager] Scanning domains {scan_start}-{scan_end}...")
-        
-        def check_domain(domain_id: int) -> Optional[int]:
-            if domain_id in self.collectors:
+        def check(did):
+            if did in self.collectors:
                 return None
-            
             try:
                 ctx = Context()
-                rclpy.init(context=ctx, domain_id=domain_id)
-                node = rclpy.create_node(f"scanner_{domain_id}", context=ctx)
-                
+                rclpy.init(context=ctx, domain_id=did)
+                node = rclpy.create_node(f"scan_{did}", context=ctx)
                 time.sleep(0.3)
-                
                 topics = node.get_topic_names_and_types()
                 has_reward = any(t[0].endswith("/reward") for t in topics)
-                
                 node.destroy_node()
                 rclpy.shutdown(context=ctx)
-                
-                if has_reward:
-                    return domain_id
-                return None
-            except Exception:
+                return did if has_reward else None
+            except:
                 return None
         
-        scan_range = range(scan_start, scan_end + 1)
-        with ThreadPoolExecutor(max_workers=10) as executor:
-            results = list(executor.map(check_domain, scan_range))
+        with ThreadPoolExecutor(max_workers=10) as ex:
+            results = list(ex.map(check, range(start, end + 1)))
         
-        for domain_id in results:
-            if domain_id is not None and domain_id not in self.collectors:
-                if self.add_domain(domain_id):
-                    discovered.append(domain_id)
+        for did in results:
+            if did is not None and did not in self.collectors:
+                if self.add_domain(did):
+                    discovered.append(did)
         
         if discovered:
-            print(f"[Manager] Discovered {len(discovered)} domains: {discovered}")
-        
+            print(f"[Manager] Found domains: {discovered}")
         return discovered
     
     def discover_namespaces_all(self):
-        for domain_id, collector in self.collectors.items():
+        for c in self.collectors.values():
             try:
-                new_ns = collector.discover_namespaces()
-                if new_ns:
-                    print(f"[Manager] Domain {domain_id} new namespaces: {new_ns}")
-            except Exception as e:
-                print(f"[Manager] Discovery error in domain {domain_id}: {e}")
+                c.discover_namespaces()
+            except:
+                pass
     
     def stop_all(self):
-        for collector in self.collectors.values():
-            collector.stop()
+        for c in self.collectors.values():
+            c.stop()
 
 
 # =============================================================================
-# Flask Web Server - Professional Clean Design
+# Dashboard HTML - Soft, Professional Design
 # =============================================================================
 
 DASHBOARD_HTML = """
@@ -411,68 +370,70 @@ DASHBOARD_HTML = """
     <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.5.4/socket.io.min.js"></script>
     <style>
         :root {
-            --bg-primary: #1a1d23;
-            --bg-secondary: #22262e;
-            --bg-tertiary: #2a2f38;
-            --bg-hover: #323842;
-            --border-color: #3a3f4a;
-            --text-primary: #e4e6ea;
-            --text-secondary: #9ca3af;
-            --text-muted: #6b7280;
-            --accent-blue: #3b82f6;
-            --accent-green: #10b981;
-            --accent-yellow: #f59e0b;
+            --bg-base: #f8fafc;
+            --bg-card: #ffffff;
+            --bg-card-hover: #f1f5f9;
+            --border: #e2e8f0;
+            --border-hover: #cbd5e1;
+            --text-primary: #1e293b;
+            --text-secondary: #475569;
+            --text-muted: #94a3b8;
+            --accent-blue: #6366f1;
+            --accent-green: #22c55e;
+            --accent-yellow: #eab308;
             --accent-red: #ef4444;
-            --accent-purple: #8b5cf6;
+            --accent-purple: #a855f7;
             --accent-cyan: #06b6d4;
-            --radius-sm: 6px;
-            --radius-md: 10px;
-            --radius-lg: 14px;
+            --shadow-sm: 0 1px 2px rgba(0,0,0,0.04);
+            --shadow-md: 0 4px 12px rgba(0,0,0,0.06);
+            --radius: 16px;
+            --radius-sm: 10px;
         }
         
         * { margin: 0; padding: 0; box-sizing: border-box; }
         
         body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', sans-serif;
-            background: var(--bg-primary);
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+            background: var(--bg-base);
             color: var(--text-primary);
             min-height: 100vh;
-            line-height: 1.5;
+            line-height: 1.6;
         }
         
         .header {
-            background: var(--bg-secondary);
-            padding: 18px 28px;
-            border-bottom: 1px solid var(--border-color);
+            background: var(--bg-card);
+            padding: 20px 32px;
+            border-bottom: 1px solid var(--border);
             display: flex;
             justify-content: space-between;
             align-items: center;
+            box-shadow: var(--shadow-sm);
         }
         
         .header h1 {
-            font-size: 20px;
-            font-weight: 600;
+            font-size: 22px;
+            font-weight: 700;
             color: var(--text-primary);
-            letter-spacing: -0.3px;
+            letter-spacing: -0.5px;
         }
         
-        .header-info {
+        .header-right {
             display: flex;
             align-items: center;
-            gap: 16px;
+            gap: 20px;
         }
         
-        .domain-count {
-            background: var(--bg-tertiary);
-            padding: 6px 14px;
-            border-radius: var(--radius-md);
+        .domain-badge {
+            background: linear-gradient(135deg, #f0f4ff 0%, #e8f0fe 100%);
+            border: 1px solid #c7d2fe;
+            padding: 8px 16px;
+            border-radius: var(--radius-sm);
             font-size: 13px;
-            font-weight: 500;
-            color: var(--text-secondary);
-            border: 1px solid var(--border-color);
+            font-weight: 600;
+            color: var(--accent-blue);
         }
         
-        .connection-status {
+        .status {
             display: flex;
             align-items: center;
             gap: 8px;
@@ -481,298 +442,315 @@ DASHBOARD_HTML = """
         }
         
         .status-dot {
-            width: 8px;
-            height: 8px;
+            width: 10px;
+            height: 10px;
             border-radius: 50%;
             background: var(--accent-red);
-            transition: all 0.3s ease;
+            transition: all 0.3s;
         }
         
         .status-dot.connected {
             background: var(--accent-green);
-            box-shadow: 0 0 8px rgba(16, 185, 129, 0.5);
+            box-shadow: 0 0 0 3px rgba(34, 197, 94, 0.2);
         }
         
         .container {
-            padding: 24px;
-            max-width: 1600px;
+            padding: 28px 32px;
+            max-width: 1500px;
             margin: 0 auto;
         }
         
-        .domain-tabs {
+        .tabs {
             display: flex;
-            gap: 8px;
-            margin-bottom: 24px;
+            gap: 10px;
+            margin-bottom: 28px;
             flex-wrap: wrap;
         }
         
-        .domain-tab {
-            padding: 10px 18px;
-            background: var(--bg-secondary);
-            border: 1px solid var(--border-color);
-            border-radius: var(--radius-md);
+        .tab {
+            padding: 12px 20px;
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: var(--radius-sm);
             cursor: pointer;
-            transition: all 0.2s ease;
+            transition: all 0.2s;
+            font-size: 14px;
+            font-weight: 500;
+            color: var(--text-secondary);
             display: flex;
             align-items: center;
             gap: 10px;
-            font-size: 13px;
-            font-weight: 500;
-            color: var(--text-secondary);
+            box-shadow: var(--shadow-sm);
         }
         
-        .domain-tab:hover {
-            background: var(--bg-hover);
+        .tab:hover {
             border-color: var(--accent-blue);
+            color: var(--accent-blue);
+            transform: translateY(-1px);
         }
         
-        .domain-tab.active {
-            background: var(--accent-blue);
-            border-color: var(--accent-blue);
+        .tab.active {
+            background: linear-gradient(135deg, var(--accent-blue) 0%, #818cf8 100%);
+            border-color: transparent;
             color: white;
+            box-shadow: 0 4px 12px rgba(99, 102, 241, 0.3);
         }
         
-        .domain-tab .indicator {
-            width: 6px;
-            height: 6px;
+        .tab .dot {
+            width: 8px;
+            height: 8px;
             border-radius: 50%;
             background: var(--text-muted);
         }
         
-        .domain-tab.active-domain .indicator {
+        .tab.live .dot {
             background: var(--accent-green);
             animation: pulse 2s infinite;
         }
         
-        .domain-tab.active .indicator {
-            background: rgba(255,255,255,0.6);
+        .tab.active .dot {
+            background: rgba(255,255,255,0.7);
         }
         
-        .domain-tab.active.active-domain .indicator {
+        .tab.active.live .dot {
             background: white;
         }
         
         @keyframes pulse {
-            0%, 100% { opacity: 1; }
-            50% { opacity: 0.4; }
+            0%, 100% { opacity: 1; transform: scale(1); }
+            50% { opacity: 0.6; transform: scale(0.9); }
         }
         
-        .stats-grid {
+        .card {
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: var(--radius);
+            padding: 24px;
+            box-shadow: var(--shadow-sm);
+            transition: all 0.2s;
+        }
+        
+        .card:hover {
+            box-shadow: var(--shadow-md);
+        }
+        
+        .card h3 {
+            font-size: 14px;
+            font-weight: 600;
+            color: var(--text-secondary);
+            margin-bottom: 16px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+        
+        .stats-row {
             display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
-            gap: 14px;
-            margin-bottom: 24px;
+            grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+            gap: 16px;
+            margin-bottom: 28px;
         }
         
-        .stat-card {
-            background: var(--bg-secondary);
-            border: 1px solid var(--border-color);
-            border-radius: var(--radius-lg);
-            padding: 18px 20px;
-            transition: all 0.2s ease;
+        .stat {
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: var(--radius);
+            padding: 20px 24px;
+            box-shadow: var(--shadow-sm);
+            transition: all 0.2s;
         }
         
-        .stat-card:hover {
-            border-color: var(--accent-blue);
-            transform: translateY(-1px);
+        .stat:hover {
+            transform: translateY(-2px);
+            box-shadow: var(--shadow-md);
         }
         
-        .stat-card .label {
+        .stat .label {
             font-size: 11px;
+            font-weight: 600;
             color: var(--text-muted);
             text-transform: uppercase;
             letter-spacing: 0.5px;
             margin-bottom: 8px;
-            font-weight: 500;
         }
         
-        .stat-card .value {
-            font-size: 26px;
-            font-weight: 600;
+        .stat .value {
+            font-size: 28px;
+            font-weight: 700;
+            color: var(--text-primary);
             letter-spacing: -0.5px;
         }
         
-        .stat-card .value.positive { color: var(--accent-green); }
-        .stat-card .value.negative { color: var(--accent-red); }
-        .stat-card .value.neutral { color: var(--accent-yellow); }
+        .stat .value.green { color: var(--accent-green); }
+        .stat .value.red { color: var(--accent-red); }
+        .stat .value.yellow { color: var(--accent-yellow); }
+        .stat .value.blue { color: var(--accent-blue); }
+        .stat .value.purple { color: var(--accent-purple); }
         
         .charts-grid {
             display: grid;
             grid-template-columns: repeat(2, 1fr);
-            gap: 18px;
-            margin-bottom: 18px;
+            gap: 20px;
+            margin-bottom: 20px;
         }
         
-        @media (max-width: 1100px) {
+        @media (max-width: 1000px) {
             .charts-grid { grid-template-columns: 1fr; }
         }
         
-        .chart-container {
-            background: var(--bg-secondary);
-            border: 1px solid var(--border-color);
-            border-radius: var(--radius-lg);
-            padding: 20px;
-        }
+        .chart { height: 260px; }
+        .chart.tall { height: 320px; }
         
-        .chart-container h3 {
-            font-size: 14px;
-            font-weight: 600;
-            margin-bottom: 16px;
-            color: var(--text-primary);
-        }
-        
-        .chart { height: 280px; }
-        .chart.tall { height: 360px; }
-        
-        .safety-zones {
+        .zones {
             display: flex;
             gap: 8px;
             flex-wrap: wrap;
-            margin-top: 12px;
+            margin-top: 16px;
         }
         
-        .zone-badge {
-            padding: 4px 12px;
-            border-radius: var(--radius-sm);
-            font-size: 11px;
+        .zone {
+            padding: 6px 14px;
+            border-radius: 20px;
+            font-size: 12px;
             font-weight: 600;
         }
         
-        .zone-badge.FREE { background: rgba(16, 185, 129, 0.15); color: #34d399; }
-        .zone-badge.AWARE { background: rgba(132, 204, 22, 0.15); color: #a3e635; }
-        .zone-badge.CAUTION { background: rgba(245, 158, 11, 0.15); color: #fbbf24; }
-        .zone-badge.DANGER { background: rgba(249, 115, 22, 0.15); color: #fb923c; }
-        .zone-badge.EMERGENCY { background: rgba(239, 68, 68, 0.15); color: #f87171; }
+        .zone.FREE { background: #dcfce7; color: #166534; }
+        .zone.AWARE { background: #fef9c3; color: #854d0e; }
+        .zone.CAUTION { background: #fed7aa; color: #9a3412; }
+        .zone.DANGER { background: #fecaca; color: #991b1b; }
+        .zone.EMERGENCY { background: #fca5a5; color: #7f1d1d; }
         
-        .domain-list { margin-top: 20px; }
+        .domain-list {
+            margin-top: 28px;
+        }
         
-        .domain-row {
-            background: var(--bg-secondary);
-            border: 1px solid var(--border-color);
-            border-radius: var(--radius-lg);
-            padding: 16px 20px;
-            margin-bottom: 10px;
+        .domain-item {
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: var(--radius);
+            padding: 20px 24px;
+            margin-bottom: 12px;
             display: grid;
-            grid-template-columns: 180px 1fr repeat(4, 90px);
+            grid-template-columns: 200px 1fr repeat(4, 100px);
             align-items: center;
-            gap: 16px;
+            gap: 20px;
             cursor: pointer;
-            transition: all 0.2s ease;
+            transition: all 0.2s;
+            box-shadow: var(--shadow-sm);
         }
         
-        .domain-row:hover {
-            background: var(--bg-hover);
+        .domain-item:hover {
             border-color: var(--accent-blue);
+            transform: translateY(-2px);
+            box-shadow: var(--shadow-md);
         }
         
-        .domain-row .domain-name {
+        .domain-item .name {
             display: flex;
             flex-direction: column;
             gap: 4px;
         }
         
-        .domain-row .domain-name .title {
+        .domain-item .name .title {
             font-weight: 600;
-            font-size: 14px;
+            font-size: 15px;
             display: flex;
             align-items: center;
-            gap: 8px;
+            gap: 10px;
         }
         
-        .domain-row .domain-name .subtitle {
-            font-size: 11px;
+        .domain-item .name .sub {
+            font-size: 12px;
             color: var(--text-muted);
         }
         
-        .domain-row .mini-chart { height: 45px; }
+        .domain-item .mini { height: 50px; }
         
-        .domain-row .stat {
+        .domain-item .col {
             text-align: center;
         }
         
-        .domain-row .stat .label {
+        .domain-item .col .label {
             font-size: 10px;
             color: var(--text-muted);
             text-transform: uppercase;
             letter-spacing: 0.3px;
         }
         
-        .domain-row .stat .value {
-            font-size: 16px;
-            font-weight: 600;
-            margin-top: 2px;
+        .domain-item .col .value {
+            font-size: 18px;
+            font-weight: 700;
+            margin-top: 4px;
         }
         
-        .no-data {
+        .empty {
             text-align: center;
             padding: 80px 20px;
             color: var(--text-muted);
         }
         
-        .no-data h2 {
-            font-size: 18px;
-            font-weight: 500;
-            margin-bottom: 8px;
+        .empty h2 {
+            font-size: 20px;
+            font-weight: 600;
             color: var(--text-secondary);
+            margin-bottom: 8px;
         }
         
-        .no-data p {
+        .summary-card {
+            background: linear-gradient(135deg, #f0f4ff 0%, #faf5ff 100%);
+            border: 1px solid #e0e7ff;
+            border-radius: var(--radius);
+            padding: 24px;
+            margin-bottom: 28px;
+        }
+        
+        .summary-card h3 {
             font-size: 14px;
-        }
-        
-        .section-title {
-            font-size: 16px;
-            font-weight: 600;
-            margin-bottom: 16px;
-            color: var(--text-primary);
-        }
-        
-        .average-section {
-            background: linear-gradient(135deg, rgba(59, 130, 246, 0.08) 0%, rgba(139, 92, 246, 0.08) 100%);
-            border: 1px solid rgba(59, 130, 246, 0.2);
-            border-radius: var(--radius-lg);
-            padding: 20px;
-            margin-bottom: 24px;
-        }
-        
-        .average-section h3 {
-            font-size: 14px;
-            font-weight: 600;
-            margin-bottom: 16px;
+            font-weight: 700;
             color: var(--accent-blue);
+            margin-bottom: 20px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
         }
         
-        .average-stats {
+        .summary-stats {
             display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
-            gap: 16px;
+            grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+            gap: 20px;
         }
         
-        .average-stat {
+        .summary-stat {
             text-align: center;
         }
         
-        .average-stat .label {
+        .summary-stat .label {
             font-size: 11px;
             color: var(--text-muted);
             text-transform: uppercase;
             letter-spacing: 0.3px;
         }
         
-        .average-stat .value {
-            font-size: 22px;
-            font-weight: 600;
+        .summary-stat .value {
+            font-size: 24px;
+            font-weight: 700;
             color: var(--text-primary);
-            margin-top: 4px;
+            margin-top: 6px;
+        }
+        
+        .section-title {
+            font-size: 16px;
+            font-weight: 700;
+            color: var(--text-primary);
+            margin-bottom: 16px;
         }
     </style>
 </head>
 <body>
     <div class="header">
         <h1>RL Training Monitor</h1>
-        <div class="header-info">
-            <span class="domain-count" id="domainCount">Scanning...</span>
-            <div class="connection-status">
+        <div class="header-right">
+            <span class="domain-badge" id="domainBadge">Scanning...</span>
+            <div class="status">
                 <div class="status-dot" id="statusDot"></div>
                 <span id="statusText">Connecting</span>
             </div>
@@ -780,13 +758,11 @@ DASHBOARD_HTML = """
     </div>
     
     <div class="container">
-        <div class="domain-tabs" id="domainTabs">
-            <div class="domain-tab active" onclick="selectDomain('all')">All Domains</div>
-        </div>
+        <div class="tabs" id="tabs"></div>
         <div id="content">
-            <div class="no-data">
-                <h2>Scanning for active domains...</h2>
-                <p>Looking for ROS2 domains with reward topics</p>
+            <div class="empty">
+                <h2>Scanning for domains...</h2>
+                <p>Looking for active ROS2 domains with reward topics</p>
             </div>
         </div>
     </div>
@@ -794,19 +770,25 @@ DASHBOARD_HTML = """
     <script>
         const socket = io();
         let domains = {};
-        let selectedDomain = 'all';
+        let selected = 'all';
         
-        const plotlyLayout = {
+        const colors = {
+            blue: '#6366f1', green: '#22c55e', yellow: '#eab308',
+            red: '#ef4444', purple: '#a855f7', cyan: '#06b6d4',
+            pink: '#ec4899', orange: '#f97316'
+        };
+        
+        const layout = {
             paper_bgcolor: 'rgba(0,0,0,0)',
             plot_bgcolor: 'rgba(0,0,0,0)',
-            font: { color: '#9ca3af', size: 11 },
-            margin: { l: 45, r: 15, t: 25, b: 35 },
-            xaxis: { gridcolor: '#3a3f4a', zerolinecolor: '#3a3f4a', tickfont: { size: 10 } },
-            yaxis: { gridcolor: '#3a3f4a', zerolinecolor: '#3a3f4a', tickfont: { size: 10 } },
+            font: { color: '#64748b', size: 11 },
+            margin: { l: 50, r: 20, t: 30, b: 40 },
+            xaxis: { gridcolor: '#e2e8f0', zerolinecolor: '#e2e8f0' },
+            yaxis: { gridcolor: '#e2e8f0', zerolinecolor: '#e2e8f0' },
             showlegend: true,
-            legend: { bgcolor: 'rgba(0,0,0,0)', font: { color: '#9ca3af', size: 10 } }
+            legend: { bgcolor: 'rgba(0,0,0,0)', font: { size: 10 } }
         };
-        const plotlyConfig = { displayModeBar: false, responsive: true };
+        const config = { displayModeBar: false, responsive: true };
         
         socket.on('connect', () => {
             document.getElementById('statusDot').classList.add('connected');
@@ -818,319 +800,165 @@ DASHBOARD_HTML = """
             document.getElementById('statusText').textContent = 'Disconnected';
         });
         
-        socket.on('update', (data) => {
-            domains = data.domains;
-            updateUI();
-        });
+        socket.on('update', data => { domains = data.domains; render(); });
         
-        function updateUI() {
-            const count = Object.keys(domains).length;
-            document.getElementById('domainCount').textContent = count + ' Domain' + (count !== 1 ? 's' : '');
-            updateTabs();
-            updateContent();
+        function render() {
+            const keys = Object.keys(domains);
+            document.getElementById('domainBadge').textContent = keys.length + ' Domain' + (keys.length !== 1 ? 's' : '');
+            renderTabs(keys);
+            if (selected === 'all') renderAll();
+            else renderSingle(selected);
         }
         
-        function updateTabs() {
-            const tabsContainer = document.getElementById('domainTabs');
-            const domainKeys = Object.keys(domains);
-            
-            let html = '<div class="domain-tab ' + (selectedDomain === 'all' ? 'active' : '') + '" onclick="selectDomain(\\'all\\')">All Domains (' + domainKeys.length + ')</div>';
-            
-            domainKeys.forEach(key => {
-                const d = domains[key];
-                const stats = d.summary;
-                const isActive = selectedDomain === key;
-                const isLive = stats.active;
-                html += '<div class="domain-tab ' + (isActive ? 'active' : '') + ' ' + (isLive ? 'active-domain' : '') + '" onclick="selectDomain(\\'' + key + '\\')">' +
-                    '<div class="indicator"></div>' +
-                    '<span>' + stats.display_name + '</span>' +
-                '</div>';
+        function renderTabs(keys) {
+            let h = '<div class="tab ' + (selected === 'all' ? 'active' : '') + '" onclick="select(\\'all\\')">All Domains (' + keys.length + ')</div>';
+            keys.forEach(k => {
+                const s = domains[k].summary;
+                h += '<div class="tab ' + (selected === k ? 'active' : '') + ' ' + (s.active ? 'live' : '') + '" onclick="select(\\'' + k + '\\')">' +
+                    '<div class="dot"></div>' + s.display_name + '</div>';
             });
-            
-            tabsContainer.innerHTML = html;
+            document.getElementById('tabs').innerHTML = h;
         }
         
-        function selectDomain(key) {
-            selectedDomain = key;
-            updateTabs();
-            updateContent();
-        }
+        function select(k) { selected = k; render(); }
         
-        function updateContent() {
-            const container = document.getElementById('content');
-            if (Object.keys(domains).length === 0) {
-                container.innerHTML = '<div class="no-data"><h2>Scanning for active domains...</h2><p>Looking for ROS2 domains with reward topics</p></div>';
+        function renderAll() {
+            const vals = Object.values(domains);
+            if (!vals.length) {
+                document.getElementById('content').innerHTML = '<div class="empty"><h2>No domains found</h2><p>Waiting for domains...</p></div>';
                 return;
             }
-            if (selectedDomain === 'all') {
-                renderAllDomainsView(container);
-            } else {
-                renderSingleDomainView(container, selectedDomain);
-            }
-        }
-        
-        function renderAllDomainsView(container) {
-            const vals = Object.values(domains);
             
-            // Calculate averages across all domains
-            const totalSteps = vals.reduce((s, d) => s + d.summary.total_steps, 0);
-            const totalEpisodes = vals.reduce((s, d) => s + d.summary.episode_count, 0);
-            const totalGoals = vals.reduce((s, d) => s + d.summary.goals_reached, 0);
-            const activeCount = vals.filter(d => d.summary.active).length;
+            const totSteps = vals.reduce((a, d) => a + d.summary.total_steps, 0);
+            const totEp = vals.reduce((a, d) => a + d.summary.episode_count, 0);
+            const totGoals = vals.reduce((a, d) => a + d.summary.goals_reached, 0);
+            const active = vals.filter(d => d.summary.active).length;
+            const returns = vals.filter(d => d.summary.episode_count > 0).map(d => d.summary.avg_episode_return);
+            const avgRet = returns.length ? returns.reduce((a,b) => a+b, 0) / returns.length : 0;
+            const ints = vals.filter(d => d.summary.total_steps > 0).map(d => d.summary.avg_intervention);
+            const avgInt = ints.length ? ints.reduce((a,b) => a+b, 0) / ints.length : 0;
             
-            const avgReturns = vals.filter(d => d.summary.episode_count > 0).map(d => d.summary.avg_episode_return);
-            const avgReturn = avgReturns.length > 0 ? avgReturns.reduce((a, b) => a + b, 0) / avgReturns.length : 0;
+            let h = '<div class="summary-card"><h3>Cross-Domain Summary</h3><div class="summary-stats">' +
+                '<div class="summary-stat"><div class="label">Total Steps</div><div class="value">' + totSteps.toLocaleString() + '</div></div>' +
+                '<div class="summary-stat"><div class="label">Episodes</div><div class="value">' + totEp + '</div></div>' +
+                '<div class="summary-stat"><div class="label">Goals</div><div class="value">' + totGoals + '</div></div>' +
+                '<div class="summary-stat"><div class="label">Avg Return</div><div class="value" style="color:' + (avgRet >= 0 ? colors.green : colors.red) + '">' + avgRet.toFixed(1) + '</div></div>' +
+                '<div class="summary-stat"><div class="label">Avg Intervention</div><div class="value">' + (avgInt * 100).toFixed(1) + '%</div></div>' +
+                '<div class="summary-stat"><div class="label">Active</div><div class="value" style="color:' + colors.green + '">' + active + '/' + vals.length + '</div></div>' +
+            '</div></div>';
             
-            const avgInterventions = vals.filter(d => d.summary.total_steps > 0).map(d => d.summary.avg_intervention);
-            const avgIntervention = avgInterventions.length > 0 ? avgInterventions.reduce((a, b) => a + b, 0) / avgInterventions.length : 0;
+            h += '<div class="card" style="margin-bottom:28px"><h3>Episode Returns</h3><div id="cmpChart" class="chart tall"></div></div>';
             
-            let html = '<div class="average-section">' +
-                '<h3>Cross-Domain Averages</h3>' +
-                '<div class="average-stats">' +
-                    '<div class="average-stat"><div class="label">Total Steps</div><div class="value">' + totalSteps.toLocaleString() + '</div></div>' +
-                    '<div class="average-stat"><div class="label">Total Episodes</div><div class="value">' + totalEpisodes + '</div></div>' +
-                    '<div class="average-stat"><div class="label">Total Goals</div><div class="value">' + totalGoals + '</div></div>' +
-                    '<div class="average-stat"><div class="label">Avg Return</div><div class="value" style="color:' + (avgReturn >= 0 ? '#10b981' : '#ef4444') + '">' + avgReturn.toFixed(1) + '</div></div>' +
-                    '<div class="average-stat"><div class="label">Avg Intervention</div><div class="value">' + (avgIntervention * 100).toFixed(1) + '%</div></div>' +
-                    '<div class="average-stat"><div class="label">Active</div><div class="value" style="color:#10b981">' + activeCount + ' / ' + vals.length + '</div></div>' +
-                '</div>' +
-            '</div>';
-            
-            html += '<div class="chart-container" style="margin-bottom:20px"><h3>Episode Returns - All Domains</h3><div id="comparisonChart" class="chart tall"></div></div>';
-            
-            html += '<div class="section-title">Individual Domains</div><div class="domain-list">';
-            
-            Object.entries(domains).forEach(([key, data]) => {
-                const s = data.summary;
-                const safeKey = key.replace(/[^a-zA-Z0-9]/g, '_');
-                html += '<div class="domain-row" onclick="selectDomain(\\'' + key + '\\')">' +
-                    '<div class="domain-name">' +
-                        '<div class="title"><div style="width:6px;height:6px;border-radius:50%;background:' + (s.active ? '#10b981' : '#6b7280') + '"></div>' + s.display_name + '</div>' +
-                        '<div class="subtitle">Domain ' + s.domain_id + '</div>' +
-                    '</div>' +
-                    '<div class="mini-chart" id="mini_' + safeKey + '"></div>' +
-                    '<div class="stat"><div class="label">Steps</div><div class="value">' + s.total_steps.toLocaleString() + '</div></div>' +
-                    '<div class="stat"><div class="label">Episodes</div><div class="value">' + s.episode_count + '</div></div>' +
-                    '<div class="stat"><div class="label">Avg Return</div><div class="value" style="color:' + (s.avg_episode_return >= 0 ? '#10b981' : '#ef4444') + '">' + s.avg_episode_return.toFixed(1) + '</div></div>' +
-                    '<div class="stat"><div class="label">Goals</div><div class="value" style="color:#8b5cf6">' + s.goals_reached + '</div></div>' +
+            h += '<div class="section-title">Individual Domains</div><div class="domain-list">';
+            Object.entries(domains).forEach(([k, d]) => {
+                const s = d.summary;
+                const sk = k.replace(/[^a-zA-Z0-9]/g, '_');
+                h += '<div class="domain-item" onclick="select(\\'' + k + '\\')">' +
+                    '<div class="name"><div class="title"><div style="width:8px;height:8px;border-radius:50%;background:' + (s.active ? colors.green : '#cbd5e1') + '"></div>' + s.display_name + '</div>' +
+                    '<div class="sub">Domain ' + s.domain_id + ' | Cells: ' + s.cells_discovered + '</div></div>' +
+                    '<div class="mini" id="m_' + sk + '"></div>' +
+                    '<div class="col"><div class="label">Steps</div><div class="value">' + s.total_steps.toLocaleString() + '</div></div>' +
+                    '<div class="col"><div class="label">Episodes</div><div class="value">' + s.episode_count + '</div></div>' +
+                    '<div class="col"><div class="label">Avg Return</div><div class="value" style="color:' + (s.avg_episode_return >= 0 ? colors.green : colors.red) + '">' + s.avg_episode_return.toFixed(1) + '</div></div>' +
+                    '<div class="col"><div class="label">Goals</div><div class="value" style="color:' + colors.purple + '">' + s.goals_reached + '</div></div>' +
                 '</div>';
             });
+            h += '</div>';
             
-            html += '</div>';
-            container.innerHTML = html;
+            document.getElementById('content').innerHTML = h;
             
-            // Draw comparison chart
+            // Comparison chart
             const traces = [];
-            const colors = ['#3b82f6', '#10b981', '#f59e0b', '#ef4444', '#8b5cf6', '#06b6d4', '#ec4899', '#84cc16'];
+            const cls = [colors.blue, colors.green, colors.yellow, colors.red, colors.purple, colors.cyan, colors.pink, colors.orange];
             let ci = 0;
-            
-            Object.entries(domains).forEach(([key, data]) => {
-                const pd = data.plot_data;
-                if (pd.episode_returns.values.length > 0) {
-                    traces.push({
-                        x: pd.episode_returns.episodes,
-                        y: pd.episode_returns.values,
-                        type: 'scatter',
-                        mode: 'lines',
-                        name: pd.display_name,
-                        line: { color: colors[ci++ % colors.length], width: 2 }
-                    });
+            Object.values(domains).forEach(d => {
+                const p = d.plot_data;
+                if (p.episode_returns.values.length) {
+                    traces.push({ x: p.episode_returns.episodes, y: p.episode_returns.values, type: 'scatter', mode: 'lines', name: p.display_name, line: { color: cls[ci++ % cls.length], width: 2.5 } });
                 }
             });
-            
-            if (traces.length > 0) {
-                Plotly.newPlot('comparisonChart', traces, {
-                    ...plotlyLayout,
-                    xaxis: { ...plotlyLayout.xaxis, title: 'Episode' },
-                    yaxis: { ...plotlyLayout.yaxis, title: 'Return' }
-                }, plotlyConfig);
-            }
+            if (traces.length) Plotly.newPlot('cmpChart', traces, { ...layout, xaxis: { ...layout.xaxis, title: 'Episode' }, yaxis: { ...layout.yaxis, title: 'Return' } }, config);
             
             // Mini charts
-            Object.entries(domains).forEach(([key, data]) => {
-                const safeKey = key.replace(/[^a-zA-Z0-9]/g, '_');
-                const el = document.getElementById('mini_' + safeKey);
-                if (el && data.plot_data.rewards.values.length > 0) {
-                    const recentRewards = data.plot_data.rewards.values.slice(-100);
-                    const recentTimes = data.plot_data.rewards.times.slice(-100);
-                    Plotly.newPlot('mini_' + safeKey, [{
-                        x: recentTimes,
-                        y: recentRewards,
-                        type: 'scatter',
-                        mode: 'lines',
-                        line: { color: '#3b82f6', width: 1.5 },
-                        fill: 'tozeroy',
-                        fillcolor: 'rgba(59, 130, 246, 0.15)'
-                    }], {
-                        paper_bgcolor: 'rgba(0,0,0,0)',
-                        plot_bgcolor: 'rgba(0,0,0,0)',
-                        margin: { l: 0, r: 0, t: 0, b: 0 },
-                        xaxis: { visible: false },
-                        yaxis: { visible: false },
-                        showlegend: false
-                    }, plotlyConfig);
+            Object.entries(domains).forEach(([k, d]) => {
+                const sk = k.replace(/[^a-zA-Z0-9]/g, '_');
+                const el = document.getElementById('m_' + sk);
+                if (el && d.plot_data.rewards.values.length) {
+                    Plotly.newPlot('m_' + sk, [{ x: d.plot_data.rewards.times.slice(-100), y: d.plot_data.rewards.values.slice(-100), type: 'scatter', mode: 'lines', line: { color: colors.blue, width: 1.5 }, fill: 'tozeroy', fillcolor: 'rgba(99,102,241,0.1)' }],
+                        { paper_bgcolor: 'rgba(0,0,0,0)', plot_bgcolor: 'rgba(0,0,0,0)', margin: { l: 0, r: 0, t: 0, b: 0 }, xaxis: { visible: false }, yaxis: { visible: false }, showlegend: false }, config);
                 }
             });
         }
         
-        function renderSingleDomainView(container, key) {
-            const data = domains[key];
-            if (!data) return;
+        function renderSingle(k) {
+            const d = domains[k];
+            if (!d) return;
+            const s = d.summary, p = d.plot_data;
             
-            const s = data.summary;
-            const pd = data.plot_data;
+            let h = '<div style="margin-bottom:24px"><h2 style="font-size:24px;font-weight:700">' + s.display_name + '</h2>' +
+                '<p style="color:#64748b;margin-top:4px">Domain ' + s.domain_id + ' | Cells discovered: ' + s.cells_discovered + ' | Frontiers: ' + s.frontiers + '</p></div>';
             
-            let html = '<div style="margin-bottom:24px">' +
-                '<h2 style="font-size:20px;font-weight:600;margin-bottom:4px">' + s.display_name + '</h2>' +
-                '<p style="color:#6b7280;font-size:13px">Domain ' + s.domain_id + '</p>' +
+            h += '<div class="stats-row">' +
+                '<div class="stat"><div class="label">Steps</div><div class="value">' + s.total_steps.toLocaleString() + '</div></div>' +
+                '<div class="stat"><div class="label">Episodes</div><div class="value">' + s.episode_count + '</div></div>' +
+                '<div class="stat"><div class="label">Goals</div><div class="value green">' + s.goals_reached + '</div></div>' +
+                '<div class="stat"><div class="label">Current Return</div><div class="value ' + (s.current_episode_return >= 0 ? 'green' : 'red') + '">' + s.current_episode_return.toFixed(1) + '</div></div>' +
+                '<div class="stat"><div class="label">Avg Return</div><div class="value ' + (s.avg_episode_return >= 0 ? 'green' : 'red') + '">' + s.avg_episode_return.toFixed(1) + '</div></div>' +
+                '<div class="stat"><div class="label">Intervention</div><div class="value ' + (s.avg_intervention < 0.3 ? 'green' : 'yellow') + '">' + (s.avg_intervention * 100).toFixed(1) + '%</div></div>' +
             '</div>';
             
-            html += '<div class="stats-grid">' +
-                '<div class="stat-card"><div class="label">Total Steps</div><div class="value">' + s.total_steps.toLocaleString() + '</div></div>' +
-                '<div class="stat-card"><div class="label">Episodes</div><div class="value">' + s.episode_count + '</div></div>' +
-                '<div class="stat-card"><div class="label">Goals Reached</div><div class="value positive">' + s.goals_reached + '</div></div>' +
-                '<div class="stat-card"><div class="label">Current Return</div><div class="value ' + (s.current_episode_return >= 0 ? 'positive' : 'negative') + '">' + s.current_episode_return.toFixed(1) + '</div></div>' +
-                '<div class="stat-card"><div class="label">Avg Return</div><div class="value ' + (s.avg_episode_return >= 0 ? 'positive' : 'negative') + '">' + s.avg_episode_return.toFixed(1) + '</div></div>' +
-                '<div class="stat-card"><div class="label">Avg Intervention</div><div class="value ' + (s.avg_intervention < 0.2 ? 'positive' : 'neutral') + '">' + (s.avg_intervention * 100).toFixed(1) + '%</div></div>' +
+            h += '<div class="charts-grid">' +
+                '<div class="card"><h3>Real-Time Reward</h3><div id="rewChart" class="chart"></div></div>' +
+                '<div class="card"><h3>Episode Returns</h3><div id="epChart" class="chart"></div></div>' +
+                '<div class="card"><h3>Intervention Rate</h3><div id="intChart" class="chart"></div></div>' +
+                '<div class="card"><h3>Safety Zones</h3><div id="zoneChart" class="chart"></div>' +
+                '<div class="zones">' + Object.entries(p.safety_zones).filter(z => z[1] > 0).map(z => '<span class="zone ' + z[0] + '">' + z[0] + ': ' + z[1] + '</span>').join('') + '</div></div>' +
             '</div>';
             
-            html += '<div class="charts-grid">' +
-                '<div class="chart-container"><h3>Real-Time Reward</h3><div id="rewardChart" class="chart"></div></div>' +
-                '<div class="chart-container"><h3>Episode Returns</h3><div id="episodeChart" class="chart"></div></div>' +
-                '<div class="chart-container"><h3>Safety Intervention Rate</h3><div id="interventionChart" class="chart"></div></div>' +
-                '<div class="chart-container"><h3>Safety Zone Distribution</h3><div id="zoneChart" class="chart"></div>' +
-                    '<div class="safety-zones">' + Object.entries(pd.safety_zones).map(function(z) { return '<span class="zone-badge ' + z[0] + '">' + z[0] + ': ' + z[1] + '</span>'; }).join('') + '</div>' +
-                '</div>' +
-            '</div>';
+            h += '<div class="card"><h3>Reward Components</h3><div id="compChart" class="chart tall"></div></div>';
             
-            html += '<div class="chart-container"><h3>Reward Components</h3><div id="componentsChart" class="chart tall"></div></div>';
-            
-            container.innerHTML = html;
+            document.getElementById('content').innerHTML = h;
             
             // Reward chart
-            if (pd.rewards.values.length > 0) {
-                Plotly.newPlot('rewardChart', [{
-                    x: pd.rewards.times,
-                    y: pd.rewards.values,
-                    type: 'scatter',
-                    mode: 'lines',
-                    line: { color: '#3b82f6', width: 1.5 },
-                    fill: 'tozeroy',
-                    fillcolor: 'rgba(59, 130, 246, 0.15)'
-                }], {
-                    ...plotlyLayout,
-                    xaxis: { ...plotlyLayout.xaxis, title: 'Time (s)' },
-                    yaxis: { ...plotlyLayout.yaxis, title: 'Reward' }
-                }, plotlyConfig);
+            if (p.rewards.values.length) {
+                Plotly.newPlot('rewChart', [{ x: p.rewards.times, y: p.rewards.values, type: 'scatter', mode: 'lines', line: { color: colors.blue, width: 2 }, fill: 'tozeroy', fillcolor: 'rgba(99,102,241,0.1)' }],
+                    { ...layout, xaxis: { ...layout.xaxis, title: 'Time (s)' }, yaxis: { ...layout.yaxis, title: 'Reward' } }, config);
             }
             
-            // Episode returns chart
-            if (pd.episode_returns.values.length > 0) {
-                const windowSize = 10;
-                const rollingAvg = [];
-                for (let i = 0; i < pd.episode_returns.values.length; i++) {
-                    const window = pd.episode_returns.values.slice(Math.max(0, i - windowSize + 1), i + 1);
-                    rollingAvg.push(window.reduce((a, b) => a + b, 0) / window.length);
+            // Episode chart
+            if (p.episode_returns.values.length) {
+                const ra = [];
+                for (let i = 0; i < p.episode_returns.values.length; i++) {
+                    const w = p.episode_returns.values.slice(Math.max(0, i - 9), i + 1);
+                    ra.push(w.reduce((a, b) => a + b, 0) / w.length);
                 }
-                Plotly.newPlot('episodeChart', [
-                    {
-                        x: pd.episode_returns.episodes,
-                        y: pd.episode_returns.values,
-                        type: 'scatter',
-                        mode: 'lines+markers',
-                        name: 'Return',
-                        line: { color: '#10b981', width: 2 },
-                        marker: { size: 5 }
-                    },
-                    {
-                        x: pd.episode_returns.episodes,
-                        y: rollingAvg,
-                        type: 'scatter',
-                        mode: 'lines',
-                        name: 'Rolling Avg',
-                        line: { color: '#f59e0b', width: 2.5 }
-                    }
-                ], {
-                    ...plotlyLayout,
-                    xaxis: { ...plotlyLayout.xaxis, title: 'Episode' },
-                    yaxis: { ...plotlyLayout.yaxis, title: 'Return' }
-                }, plotlyConfig);
+                Plotly.newPlot('epChart', [
+                    { x: p.episode_returns.episodes, y: p.episode_returns.values, type: 'scatter', mode: 'lines+markers', name: 'Return', line: { color: colors.green, width: 2 }, marker: { size: 5 } },
+                    { x: p.episode_returns.episodes, y: ra, type: 'scatter', mode: 'lines', name: 'Rolling Avg', line: { color: colors.yellow, width: 3 } }
+                ], { ...layout, xaxis: { ...layout.xaxis, title: 'Episode' }, yaxis: { ...layout.yaxis, title: 'Return' } }, config);
             }
             
             // Intervention chart
-            if (pd.interventions.values.length > 0) {
-                Plotly.newPlot('interventionChart', [{
-                    x: pd.interventions.times,
-                    y: pd.interventions.values.map(v => v * 100),
-                    type: 'scatter',
-                    mode: 'lines',
-                    line: { color: '#ef4444', width: 1.5 },
-                    fill: 'tozeroy',
-                    fillcolor: 'rgba(239, 68, 68, 0.15)'
-                }], {
-                    ...plotlyLayout,
-                    xaxis: { ...plotlyLayout.xaxis, title: 'Time (s)' },
-                    yaxis: { ...plotlyLayout.yaxis, title: '%', range: [0, 100] }
-                }, plotlyConfig);
+            if (p.interventions.values.length) {
+                Plotly.newPlot('intChart', [{ x: p.interventions.times, y: p.interventions.values.map(v => v * 100), type: 'scatter', mode: 'lines', line: { color: colors.red, width: 2 }, fill: 'tozeroy', fillcolor: 'rgba(239,68,68,0.1)' }],
+                    { ...layout, xaxis: { ...layout.xaxis, title: 'Time (s)' }, yaxis: { ...layout.yaxis, title: '%', range: [0, 100] } }, config);
             }
             
             // Zone chart
-            const zoneColors = {
-                'FREE': '#10b981',
-                'AWARE': '#84cc16',
-                'CAUTION': '#f59e0b',
-                'DANGER': '#f97316',
-                'EMERGENCY': '#ef4444'
-            };
-            const zones = Object.entries(pd.safety_zones).filter(z => z[1] > 0);
-            if (zones.length > 0) {
-                Plotly.newPlot('zoneChart', [{
-                    values: zones.map(z => z[1]),
-                    labels: zones.map(z => z[0]),
-                    type: 'pie',
-                    marker: { colors: zones.map(z => zoneColors[z[0]] || '#6b7280') },
-                    textinfo: 'label+percent',
-                    textfont: { color: '#fff', size: 11 },
-                    hole: 0.45
-                }], {
-                    ...plotlyLayout,
-                    showlegend: false
-                }, plotlyConfig);
+            const zc = { FREE: colors.green, AWARE: '#84cc16', CAUTION: colors.yellow, DANGER: colors.orange, EMERGENCY: colors.red };
+            const zones = Object.entries(p.safety_zones).filter(z => z[1] > 0);
+            if (zones.length) {
+                Plotly.newPlot('zoneChart', [{ values: zones.map(z => z[1]), labels: zones.map(z => z[0]), type: 'pie', marker: { colors: zones.map(z => zc[z[0]] || '#94a3b8') }, textinfo: 'label+percent', textfont: { size: 11 }, hole: 0.5 }],
+                    { ...layout, showlegend: false }, config);
             }
             
             // Components chart
-            const componentColors = {
-                'progress': '#10b981',
-                'discovery': '#8b5cf6',
-                'proximity': '#ef4444',
-                'intervention_penalty': '#dc2626',
-                'step': '#6b7280',
-                'novelty': '#ec4899',
-                'rnd': '#06b6d4',
-                'goal': '#f59e0b',
-                'alignment': '#3b82f6',
-                'mission_complete': '#22d3ee'
-            };
-            const compTraces = [];
-            Object.entries(pd.components).forEach(([name, d]) => {
-                if (d.values.length > 0) {
-                    compTraces.push({
-                        x: d.times,
-                        y: d.values,
-                        type: 'scatter',
-                        mode: 'lines',
-                        name: name,
-                        line: { color: componentColors[name] || '#6b7280', width: 1.5 }
-                    });
-                }
+            const cc = { progress: colors.green, discovery: colors.purple, proximity: colors.red, intervention_penalty: '#dc2626', step: '#94a3b8', novelty: colors.pink, rnd: colors.cyan, goal: colors.yellow, alignment: colors.blue };
+            const traces = [];
+            Object.entries(p.components).forEach(([n, d]) => {
+                if (d.values.length) traces.push({ x: d.times, y: d.values, type: 'scatter', mode: 'lines', name: n, line: { color: cc[n] || '#94a3b8', width: 1.5 } });
             });
-            if (compTraces.length > 0) {
-                Plotly.newPlot('componentsChart', compTraces, {
-                    ...plotlyLayout,
-                    xaxis: { ...plotlyLayout.xaxis, title: 'Time (s)' },
-                    yaxis: { ...plotlyLayout.yaxis, title: 'Value' }
-                }, plotlyConfig);
-            }
+            if (traces.length) Plotly.newPlot('compChart', traces, { ...layout, xaxis: { ...layout.xaxis, title: 'Time (s)' }, yaxis: { ...layout.yaxis, title: 'Value' } }, config);
         }
     </script>
 </body>
@@ -1138,115 +966,73 @@ DASHBOARD_HTML = """
 """
 
 
-def create_app(stats_store: Dict[str, DomainStats]):
-    """Create Flask app with SocketIO."""
+def create_app(stats: Dict[str, DomainStats]):
     app = Flask(__name__)
-    app.config['SECRET_KEY'] = 'multi_domain_viz'
+    app.config['SECRET_KEY'] = 'rl_monitor'
     CORS(app)
-    socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
+    sio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
     
     @app.route('/')
     def index():
         return render_template_string(DASHBOARD_HTML)
     
-    @app.route('/api/domains')
-    def get_domains():
-        result = {}
-        for key, stats in stats_store.items():
-            result[key] = {"summary": stats.get_summary(), "plot_data": stats.get_plot_data()}
-        return jsonify(result)
-    
-    def background_update():
+    def updater():
         while True:
             time.sleep(1.0 / UPDATE_RATE_HZ)
-            data = {"domains": {}}
-            for key, stats in stats_store.items():
-                data["domains"][key] = {"summary": stats.get_summary(), "plot_data": stats.get_plot_data()}
-            socketio.emit('update', data)
+            data = {"domains": {k: {"summary": v.get_summary(), "plot_data": v.get_plot_data()} for k, v in stats.items()}}
+            sio.emit('update', data)
     
-    return app, socketio, background_update
+    return app, sio, updater
 
-
-# =============================================================================
-# Main
-# =============================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description="Multi-domain RL reward visualization")
-    parser.add_argument("--port", type=int, default=DEFAULT_PORT,
-                        help=f"Web server port (default: {DEFAULT_PORT})")
-    parser.add_argument("--domains", nargs="*", type=int, default=None,
-                        help="Specific domain IDs to monitor")
-    parser.add_argument("--scan-start", type=int, default=DEFAULT_SCAN_START,
-                        help=f"Start of scan range (default: {DEFAULT_SCAN_START})")
-    parser.add_argument("--scan-end", type=int, default=DEFAULT_SCAN_END,
-                        help=f"End of scan range (default: {DEFAULT_SCAN_END})")
-    parser.add_argument("--scan-interval", type=float, default=DEFAULT_SCAN_INTERVAL,
-                        help=f"Seconds between scans (default: {DEFAULT_SCAN_INTERVAL})")
-    parser.add_argument("--namespaces", nargs="*", default=["", "stretch"],
-                        help="Namespaces to monitor")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--port", type=int, default=DEFAULT_PORT)
+    parser.add_argument("--scan-start", type=int, default=DEFAULT_SCAN_START)
+    parser.add_argument("--scan-end", type=int, default=DEFAULT_SCAN_END)
+    parser.add_argument("--scan-interval", type=float, default=DEFAULT_SCAN_INTERVAL)
+    parser.add_argument("--namespaces", nargs="*", default=["", "stretch"])
     args = parser.parse_args()
     
-    print("""
+    print(f"""
 +--------------------------------------------------------------+
 |                   RL Training Monitor                        |
 +--------------------------------------------------------------+
-|  Open in browser:  http://localhost:{}                    |
-|  Scan range: {}-{}                                           |
-|  Auto-scanning for active domains...                         |
+|  Browser:  http://localhost:{args.port}                           |
+|  Scanning: domains {args.scan_start}-{args.scan_end} every {args.scan_interval}s                   |
 +--------------------------------------------------------------+
-    """.format(args.port, args.scan_start, args.scan_end))
+    """)
     
-    # Shared stats store
-    stats_store: Dict[str, DomainStats] = {}
+    stats: Dict[str, DomainStats] = {}
+    mgr = MultiDomainManager(stats)
     
-    # Create domain manager
-    manager = MultiDomainManager(stats_store)
+    print(f"[Scan] Initial scan...")
+    mgr.discover_domains(args.scan_start, args.scan_end)
     
-    # Add specific domains if provided
-    if args.domains:
-        for domain_id in args.domains:
-            manager.add_domain(domain_id, args.namespaces.copy())
+    app, sio, updater = create_app(stats)
     
-    # Initial scan
-    print(f"[Scan] Initial scan of domains {args.scan_start}-{args.scan_end}...")
-    manager.discover_domains(args.scan_start, args.scan_end)
+    threading.Thread(target=updater, daemon=True).start()
     
-    # Create Flask app
-    app, socketio, background_update = create_app(stats_store)
-    
-    # Start background update thread
-    update_thread = threading.Thread(target=background_update, daemon=True)
-    update_thread.start()
-    
-    # Continuous scanning thread
     def scan_loop():
         while True:
             time.sleep(args.scan_interval)
-            try:
-                manager.discover_domains(args.scan_start, args.scan_end)
-                manager.discover_namespaces_all()
-            except Exception as e:
-                print(f"[Scan] Error: {e}")
+            mgr.discover_domains(args.scan_start, args.scan_end)
+            mgr.discover_namespaces_all()
     
-    scan_thread = threading.Thread(target=scan_loop, daemon=True)
-    scan_thread.start()
+    threading.Thread(target=scan_loop, daemon=True).start()
     
-    # Shutdown handler
-    def shutdown(signum=None, frame=None):
+    def shutdown(*_):
         print("\n[Monitor] Shutting down...")
-        manager.stop_all()
+        mgr.stop_all()
         sys.exit(0)
     
     signal.signal(signal.SIGINT, shutdown)
     signal.signal(signal.SIGTERM, shutdown)
     
-    # Run Flask server
     try:
-        socketio.run(app, host='0.0.0.0', port=args.port, debug=False,
-                     use_reloader=False, log_output=False, allow_unsafe_werkzeug=True)
+        sio.run(app, host='0.0.0.0', port=args.port, debug=False, use_reloader=False, log_output=False, allow_unsafe_werkzeug=True)
     except Exception as e:
-        print(f"[Monitor] Server error: {e}")
+        print(f"[Error] {e}")
         shutdown()
 
 
