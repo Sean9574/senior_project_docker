@@ -9,25 +9,8 @@ KEY FEATURE: Monitors multiple ROS_DOMAIN_IDs at once!
 
 Each ROS2 domain is isolated, so we spawn a separate rclpy context for each
 domain we want to monitor.
-
-Usage:
-    # Monitor specific domains
-    python3 reward_visualizer_multi.py --domains 10 11 12
-    
-    # Monitor domain range (e.g., sims 0-4 starting at base domain 10)
-    python3 reward_visualizer_multi.py --domain-range 10 14
-    
-    # Scan for active domains and continuously watch for new ones
-    python3 reward_visualizer_multi.py --scan
-    
-    # Scan a specific range continuously
-    python3 reward_visualizer_multi.py --scan --scan-range 10 20
-    
-    # Combine: start with known domains, but also scan for new ones
-    python3 reward_visualizer_multi.py --domains 10 --scan --scan-range 10 15
-    
-Then open http://localhost:5555 in your browser
 """
+
 
 import argparse
 import json
