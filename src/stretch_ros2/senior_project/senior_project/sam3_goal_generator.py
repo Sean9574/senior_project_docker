@@ -988,42 +988,22 @@ class SAM3GoalGeneratorV2(Node):
                 # Overlay with the detection color
                 self._overlay_mask(viz, mask_rs, item["color"], self.seg_overlay_alpha)
 
-        # 2) Draw bounding boxes and labels ON TOP of overlay
+        # 2) Draw bounding boxes and center dots ON TOP of overlay (NO TEXT - shown in UI instead)
         for item in overlays:
             x1, y1, x2, y2 = item["rect"]
             cx, cy = item["center"]
             color = item["color"]
-            label = item["label"]
 
             if self.rotate_viz_90_clockwise:
                 rx1, ry1, rx2, ry2 = self._rect_rot90_cw(x1, y1, x2, y2, orig_h)
                 rcx, rcy = self._pt_rot90_cw(cx, cy, orig_h)
-                tx, ty = rx1, max(15, ry1 - 10)
             else:
                 rx1, ry1, rx2, ry2 = x1, y1, x2, y2
                 rcx, rcy = cx, cy
-                tx, ty = x1, max(15, y1 - 10)
 
             cv2.rectangle(viz, (rx1, ry1), (rx2, ry2), color, 2)
-            cv2.circle(viz, (rcx, rcy), 5, color, -1)
-            
-            # Add background for text readability
-            (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)
-            cv2.rectangle(viz, (tx, ty - th - 4), (tx + tw, ty + 4), (0, 0, 0), -1)
-            cv2.putText(viz, label, (tx, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
-
-        # HUD text
-        mode_str = f"Mode: {self.depth_mode.value} | Available: {', '.join(depth_status)}"
-        cv2.putText(viz, f"Target: {prompt} | Robot: ({self.robot_x:.1f}, {self.robot_y:.1f})",
-                    (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-        cv2.putText(viz, mode_str, (10, viz.shape[0] - 10),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
-
-        if best_detection and status.get("found") and "goal_position" in status:
-            gx, gy = status["goal_position"]
-            method_name = best_detection['method'].replace('_', ' ').title()
-            cv2.putText(viz, f"GOAL: ({gx:.1f}, {gy:.1f}) via {method_name}",
-                        (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            cv2.circle(viz, (rcx, rcy), 6, color, -1)
+            cv2.circle(viz, (rcx, rcy), 8, (255, 255, 255), 2)  # White ring around center
 
         # Publish visualization
         self.viz_pub.publish(self.bridge.cv2_to_imgmsg(viz, 'bgr8'))

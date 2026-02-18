@@ -17,22 +17,23 @@ import sys
 import threading
 import time
 from collections import deque
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
+from concurrent.futures import ThreadPoolExecutor
 
-import cv2
 import rclpy
-from cv_bridge import CvBridge
-from flask import Flask, Response, jsonify, render_template_string, request
-from flask_cors import CORS
-from flask_socketio import SocketIO
 from rclpy.context import Context
 from rclpy.executors import SingleThreadedExecutor
-from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, qos_profile_sensor_data
+from std_msgs.msg import Float32, String as StringMsg
 from sensor_msgs.msg import Image as RosImage
-from std_msgs.msg import Float32
-from std_msgs.msg import String as StringMsg
+
+from flask import Flask, render_template_string, Response, request, jsonify
+from flask_socketio import SocketIO
+from flask_cors import CORS
+
+import cv2
+from cv_bridge import CvBridge
 
 # =============================================================================
 # Configuration
@@ -73,6 +74,10 @@ class DomainStats:
     goals_reached: int = 0
     frontiers: int = 0
     cells_discovered: int = 0
+    
+    # Goal generator status
+    goal_status: Dict = field(default_factory=dict)
+    goal_status_time: float = 0.0
 
     def add_reward(self, reward: float, timestamp: float):
         self.rewards.append(reward)
@@ -115,9 +120,17 @@ class DomainStats:
             self.goals_reached = 0
         self.last_episode_num = episode_num
 
+    def update_goal_status(self, status: Dict):
+        """Update goal generator status."""
+        self.goal_status = status
+        self.goal_status_time = time.time()
+
     def get_summary(self) -> Dict:
         recent_rewards = list(self.rewards)[-100:] if self.rewards else [0]
         recent_interventions = [x[1] for x in list(self.intervention_rates)[-100:]] if self.intervention_rates else [0]
+        
+        # Goal status freshness (stale after 2 seconds)
+        goal_status_fresh = (time.time() - self.goal_status_time) < 2.0
 
         return {
             "domain_id": self.domain_id,
@@ -134,6 +147,7 @@ class DomainStats:
             "avg_episode_return": sum(self.episode_returns) / len(self.episode_returns) if self.episode_returns else 0,
             "avg_intervention": sum(recent_interventions) / len(recent_interventions) if recent_interventions else 0,
             "active": time.time() - self.last_update < 5.0,
+            "goal_status": self.goal_status if goal_status_fresh else {},
         }
 
     def get_plot_data(self, max_points: int = 300) -> Dict:
@@ -228,6 +242,10 @@ class DomainCollector:
 
         self._subs.append(self.node.create_subscription(Float32, reward_topic, lambda msg, k=stats_key: self._reward_cb(msg, k), qos))
         self._subs.append(self.node.create_subscription(StringMsg, breakdown_topic, lambda msg, k=stats_key: self._breakdown_cb(msg, k), qos))
+        
+        # Subscribe to goal generator status topic
+        goal_status_topic = "/sam3_goal_generator/status"
+        self._subs.append(self.node.create_subscription(StringMsg, goal_status_topic, lambda msg, k=stats_key: self._goal_status_cb(msg, k), qos))
 
     def _reward_cb(self, msg: Float32, key: str):
         if key in self.stats:
@@ -237,6 +255,13 @@ class DomainCollector:
         try:
             if key in self.stats:
                 self.stats[key].add_breakdown(json.loads(msg.data))
+        except:
+            pass
+
+    def _goal_status_cb(self, msg: StringMsg, key: str):
+        try:
+            if key in self.stats:
+                self.stats[key].update_goal_status(json.loads(msg.data))
         except:
             pass
 
@@ -730,6 +755,49 @@ DASHBOARD_HTML = """
       font-weight: 700;
       margin-top: 4px;
     }
+
+    .goal-status {
+      margin-top: 12px;
+      padding: 12px 16px;
+      background: linear-gradient(135deg, #f0fdf4 0%, #ecfdf5 100%);
+      border: 1px solid #bbf7d0;
+      border-radius: 12px;
+      font-size: 13px;
+    }
+
+    .goal-status.searching {
+      background: linear-gradient(135deg, #fefce8 0%, #fef9c3 100%);
+      border-color: #fde047;
+    }
+
+    .goal-status .status-row {
+      display: flex;
+      justify-content: space-between;
+      padding: 4px 0;
+      border-bottom: 1px solid rgba(0,0,0,0.05);
+    }
+
+    .goal-status .status-row:last-child {
+      border-bottom: none;
+    }
+
+    .goal-status .status-label {
+      color: var(--text-muted);
+      font-weight: 500;
+    }
+
+    .goal-status .status-value {
+      font-weight: 600;
+      color: var(--text);
+    }
+
+    .goal-status .status-value.found {
+      color: var(--green);
+    }
+
+    .goal-status .status-value.searching {
+      color: #ca8a04;
+    }
   </style>
 </head>
 <body>
@@ -774,6 +842,11 @@ DASHBOARD_HTML = """
       const n = Object.keys(domains).length;
       document.getElementById('badge').textContent = n + ' Domain' + (n !== 1 ? 's' : '');
       render();
+      
+      // After render, update goal status for live updates
+      if (selected !== 'all' && domains[selected]) {
+        updateGoalStatus(domains[selected].summary.goal_status);
+      }
     });
 
     function render() {
@@ -885,7 +958,8 @@ DASHBOARD_HTML = """
         '<div class="card"><h3>Camera Feed</h3>' +
         '<div style="margin-bottom:12px"><select class="camera-select" id="camSelect">' + options + '</select></div>' +
         '<div class="camera-container"><img class="camera-img" id="camImg" src="' +
-        (defaultTopic ? '/stream/' + s.domain_id + '?topic=' + encodeURIComponent(defaultTopic) : '') + '"/></div></div>' +
+        (defaultTopic ? '/stream/' + s.domain_id + '?topic=' + encodeURIComponent(defaultTopic) : '') + '"/></div>' +
+        '<div class="goal-status" id="goalStatus"></div></div>' +
         '<div class="card"><h3>Real-Time Reward</h3><div id="rewChart" class="chart"></div></div>' +
       '</div>';
 
@@ -910,12 +984,49 @@ DASHBOARD_HTML = """
         camImg.src = t ? '/stream/' + s.domain_id + '?topic=' + encodeURIComponent(t) + '&_t=' + Date.now() : '';
       };
 
+      // Update goal status panel
+      updateGoalStatus(s.goal_status);
+
       // Draw charts using Plotly.react for smooth updates
       drawRewardChart(p);
       drawEpisodeChart(p);
       drawInterventionChart(p);
       drawZoneChart(p);
       drawComponentsChart(p);
+    }
+
+    function updateGoalStatus(gs) {
+      const el = document.getElementById('goalStatus');
+      if (!el) return;
+
+      if (!gs || Object.keys(gs).length === 0) {
+        el.innerHTML = '<div style="color:var(--text-muted);text-align:center;padding:8px;">No goal generator data</div>';
+        el.className = 'goal-status';
+        return;
+      }
+
+      const found = gs.found === true;
+      el.className = 'goal-status' + (found ? '' : ' searching');
+
+      let html = '<div class="status-row"><span class="status-label">Target</span><span class="status-value">' + (gs.target || '—') + '</span></div>';
+      html += '<div class="status-row"><span class="status-label">Status</span><span class="status-value ' + (found ? 'found' : 'searching') + '">' + (found ? '✓ Found' : '○ Searching...') + '</span></div>';
+
+      if (found) {
+        html += '<div class="status-row"><span class="status-label">Distance</span><span class="status-value">' + (gs.distance ? gs.distance.toFixed(2) + 'm' : '—') + '</span></div>';
+        html += '<div class="status-row"><span class="status-label">Confidence</span><span class="status-value">' + (gs.confidence ? (gs.confidence * 100).toFixed(0) + '%' : '—') + '</span></div>';
+        html += '<div class="status-row"><span class="status-label">Depth Method</span><span class="status-value">' + (gs.depth_method || '—') + '</span></div>';
+        if (gs.goal_position) {
+          html += '<div class="status-row"><span class="status-label">Goal Position</span><span class="status-value">(' + gs.goal_position[0].toFixed(2) + ', ' + gs.goal_position[1].toFixed(2) + ')</span></div>';
+        }
+      } else if (gs.message) {
+        html += '<div class="status-row"><span class="status-label">Info</span><span class="status-value" style="font-size:11px">' + gs.message + '</span></div>';
+      }
+
+      if (gs.available_methods) {
+        html += '<div class="status-row"><span class="status-label">Available</span><span class="status-value" style="font-size:11px">' + gs.available_methods.join(', ') + '</span></div>';
+      }
+
+      el.innerHTML = html;
     }
 
     function drawRewardChart(p) {

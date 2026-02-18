@@ -95,7 +95,36 @@ R_CLEARANCE_BONUS = 0.3        # Bonus for maintaining good clearance (was 0.5)
 R_SAFETY_INTERVENTION = -5.0   # Penalty scaled by how much safety overrode RL (was -10)
 
 # =============================================================================
-# EXISTING CONFIG (preserved from original)
+# GOAL-SEEKING REWARDS (PRIMARY BEHAVIOR)
+# =============================================================================
+
+R_GOAL = 2000.0               # Reaching goal
+R_COLLISION = -1500.0         # Collision penalty
+R_TIMEOUT = -50.0             # Episode timeout
+
+PROGRESS_SCALE = 300.0        # Reward for getting closer to goal
+ALIGN_SCALE = 5.0             # Reward for facing goal
+STEP_COST = -0.1              # Small step cost to encourage efficiency
+GOAL_RADIUS = 0.45            # Distance to count as "reached"
+
+# =============================================================================
+# EXPLORATION REWARDS (SECONDARY - only when no goal)
+# =============================================================================
+
+R_NEW_CELL = 1.5              # Per new cell discovered (reduced)
+R_NOVELTY_SCALE = 0.3         # Bonus for unvisited areas (reduced)
+R_FRONTIER_BONUS = 2.0        # Moving toward frontiers (reduced)
+R_COLLISION_EXPLORE = -500.0  # Collision during exploration
+R_STEP_EXPLORE = -0.02        # Step cost during exploration
+
+# =============================================================================
+# MISSION REWARDS
+# =============================================================================
+
+R_MISSION_COMPLETE = 5000.0   # Fully explored AND goals reached
+
+# =============================================================================
+# GENERAL CONFIG
 # =============================================================================
 
 CHECKPOINT_FILENAME = "td3_safe_rl_agent.pt"
@@ -112,24 +141,6 @@ GRID_MAX_RANGE = 12.0
 V_MAX = 1.25
 W_MAX = 7.0
 V_MIN_REVERSE = -0.05
-
-# Goal Seeking Rewards
-R_GOAL = 2500.0
-R_COLLISION = -2000.0
-R_TIMEOUT = -100.0
-R_MISSION_COMPLETE = 5000.0  # Bonus for fully exploring AND finding goal(s)
-GOAL_RADIUS = 0.45
-
-PROGRESS_SCALE = 500.0
-ALIGN_SCALE = 3.0
-STEP_COST = -0.05
-
-# Exploration Rewards
-R_NEW_CELL = 2.0
-R_NOVELTY_SCALE = 0.5
-R_FRONTIER_BONUS = 5.0
-R_COLLISION_EXPLORE = -500.0
-R_STEP_EXPLORE = -0.02
 
 # RND Config
 RND_WEIGHT_INITIAL = 1.0
@@ -1417,7 +1428,7 @@ class StretchExploreEnv(gym.Env):
                 self._last_goal_reached_pos = None
         
         if has_goal:
-            reward, terminated, info = self._compute_goal_reward(safe_v, safe_w)
+            reward, terminated, info = self._compute_goal_reward(safe_v, safe_w, new_cells)
         else:
             reward, terminated, info = self._compute_explore_reward(new_cells, st, obs)
         
@@ -1575,8 +1586,12 @@ class StretchExploreEnv(gym.Env):
         
         return float(reward), terminated, info
     
-    def _compute_goal_reward(self, v_cmd: float, w_cmd: float) -> Tuple[float, bool, Dict]:
-        """Compute reward for goal-seeking mode."""
+    def _compute_goal_reward(self, v_cmd: float, w_cmd: float, new_cells: int) -> Tuple[float, bool, Dict]:
+        """
+        Compute reward for goal-seeking mode.
+        PRIMARY: Get to the goal
+        SECONDARY: Still reward exploration (but reduced)
+        """
         reward = 0.0
         terminated = False
         collision = False
@@ -1585,6 +1600,7 @@ class StretchExploreEnv(gym.Env):
         d_goal = self._goal_distance()
         ang = self._goal_angle()
         
+        # === PRIMARY: Goal-seeking rewards ===
         progress = self.prev_goal_dist - d_goal
         r_progress = PROGRESS_SCALE * progress
         
@@ -1594,29 +1610,28 @@ class StretchExploreEnv(gym.Env):
         
         r_goal = 0.0
         if d_goal <= GOAL_RADIUS:
-            # Goal reached! Give reward but DON'T terminate
-            # Robot can't reset/teleport, so continue in explore mode
             success = True
             r_goal = R_GOAL
             
-            # Track goals reached
             self._goals_reached_this_episode += 1
-            
-            # Record where the goal was so we don't immediately re-trigger
             self._last_goal_reached_pos = (self.ros.last_goal.point.x, self.ros.last_goal.point.y)
-            
-            # Clear the goal so robot transitions to explore mode
             self.ros.last_goal = None
             
-            # Log the goal success
             self.ros.get_logger().info(
                 f"[GOAL REACHED #{self._goals_reached_this_episode}] dist={d_goal:.2f}m, reward={r_goal:.0f}, continuing exploration"
             )
-            
-            # DON'T set terminated = True here
-            # Termination happens later if fully explored
         
-        # Collision based on safety zone
+        # === SECONDARY: Reduced exploration bonus (even while pursuing goal) ===
+        # This encourages the robot to discover new areas on its way to the goal
+        EXPLORE_WEIGHT_DURING_GOAL = 0.25  # 25% of normal exploration rewards
+        
+        r_discovery = R_NEW_CELL * new_cells * EXPLORE_WEIGHT_DURING_GOAL
+        
+        st = self._get_robot_state()
+        novelty = self.occ_grid.get_novelty(st["x"], st["y"])
+        r_novelty = R_NOVELTY_SCALE * novelty * EXPLORE_WEIGHT_DURING_GOAL
+        
+        # === Collision check ===
         r_collision = 0.0
         if self.last_safety_state and self.last_safety_state.min_distance < ZONE_EMERGENCY:
             if self.step_count > 10:
@@ -1624,6 +1639,7 @@ class StretchExploreEnv(gym.Env):
                 collision = True
                 r_collision = R_COLLISION
         
+        # === Timeout ===
         r_timeout = 0.0
         if not terminated and self.step_count + 1 >= self.max_steps:
             terminated = True
@@ -1631,7 +1647,8 @@ class StretchExploreEnv(gym.Env):
         
         self.prev_goal_dist = d_goal
         
-        reward = r_progress + r_align + r_step + r_goal + r_collision + r_timeout
+        # Combine: goal rewards dominant, exploration secondary
+        reward = r_progress + r_align + r_step + r_goal + r_collision + r_timeout + r_discovery + r_novelty
         
         info = {
             "collision": collision,
@@ -1645,6 +1662,8 @@ class StretchExploreEnv(gym.Env):
                 "goal": r_goal,
                 "collision": r_collision,
                 "timeout": r_timeout,
+                "discovery_secondary": r_discovery,
+                "novelty_secondary": r_novelty,
             }
         }
         
