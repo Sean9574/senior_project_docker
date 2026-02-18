@@ -20,11 +20,11 @@
     <!-- 10x10m floor -->
     <geom name="floor" size="5 5 0.05" type="plane" material="floor"/>
 
-    <!-- Border walls (10x10m) -->
-    <geom name="wall_n" type="box" pos="0 5 0.5" size="5 0.1 0.5" rgba="0.2 0.2 0.2 1"/>
-    <geom name="wall_s" type="box" pos="0 -5 0.5" size="5 0.1 0.5" rgba="0.2 0.2 0.2 1"/>
-    <geom name="wall_e" type="box" pos="5 0 0.5" size="0.1 5 0.5" rgba="0.2 0.2 0.2 1"/>
-    <geom name="wall_w" type="box" pos="-5 0 0.5" size="0.1 5 0.5" rgba="0.2 0.2 0.2 1"/>
+    <!-- Border walls (10x10m) - light gray/concrete color for visibility -->
+    <geom name="wall_n" type="box" pos="0 5 0.5" size="5 0.1 0.5" rgba="0.6 0.58 0.55 1"/>
+    <geom name="wall_s" type="box" pos="0 -5 0.5" size="5 0.1 0.5" rgba="0.6 0.58 0.55 1"/>
+    <geom name="wall_e" type="box" pos="5 0 0.5" size="0.1 5 0.5" rgba="0.6 0.58 0.55 1"/>
+    <geom name="wall_w" type="box" pos="-5 0 0.5" size="0.1 5 0.5" rgba="0.6 0.58 0.55 1"/>
 
     <!-- Obstacles -->
     <geom name="obs_box_1" type="box" pos="2 2 0.4" size="0.5 0.5 0.4" rgba="0.55 0.35 0.20 1"/>
