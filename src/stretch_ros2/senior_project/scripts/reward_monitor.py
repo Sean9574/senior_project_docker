@@ -17,22 +17,23 @@ import sys
 import threading
 import time
 from collections import deque
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
+from concurrent.futures import ThreadPoolExecutor
 
-import cv2
 import rclpy
-from cv_bridge import CvBridge
-from flask import Flask, Response, jsonify, render_template_string, request
-from flask_cors import CORS
-from flask_socketio import SocketIO
 from rclpy.context import Context
 from rclpy.executors import SingleThreadedExecutor
-from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, qos_profile_sensor_data
+from std_msgs.msg import Float32, String as StringMsg
 from sensor_msgs.msg import Image as RosImage
-from std_msgs.msg import Float32
-from std_msgs.msg import String as StringMsg
+
+from flask import Flask, render_template_string, Response, request, jsonify
+from flask_socketio import SocketIO
+from flask_cors import CORS
+
+import cv2
+from cv_bridge import CvBridge
 
 # =============================================================================
 # Configuration
@@ -1007,23 +1008,15 @@ DASHBOARD_HTML = """
       }
     }
 
-    async function renderDomainView(k) {
+    function renderDomainView(k) {
       const d = domains[k];
       if (!d) return;
 
       const s = d.summary;
       const p = d.plot_data;
 
-      // Fetch camera topics
-      const resp = await fetch('/api/cameras?domain_id=' + s.domain_id);
-      const camData = await resp.json();
-      const topics = camData.topics || [];
-      const defaultTopic = topics.includes('/sam3_goal_generator/visualization')
-        ? '/sam3_goal_generator/visualization' : (topics[0] || '');
-
-      let options = topics.length
-        ? topics.map(t => '<option value="' + t + '"' + (t === defaultTopic ? ' selected' : '') + '>' + t + '</option>').join('')
-        : '<option value="">No image topics</option>';
+      // Fetch camera topics - but we only care about sam3_goal_generator/visualization
+      const defaultTopic = '/sam3_goal_generator/visualization';
 
       let h = '<div class="stats-row">' +
         '<div class="stat"><div class="label">Steps</div><div class="value">' + s.total_steps.toLocaleString() + '</div></div>' +
@@ -1037,9 +1030,7 @@ DASHBOARD_HTML = """
 
       h += '<div class="grid">' +
         '<div class="card"><h3>Camera Feed</h3>' +
-        '<div style="margin-bottom:12px"><select class="camera-select" id="camSelect">' + options + '</select></div>' +
-        '<div class="camera-container"><img class="camera-img" id="camImg" src="' +
-        (defaultTopic ? '/stream/' + s.domain_id + '?topic=' + encodeURIComponent(defaultTopic) : '') + '"/></div>' +
+        '<div class="camera-container"><img class="camera-img" id="camImg" src="/stream/' + s.domain_id + '?topic=' + encodeURIComponent(defaultTopic) + '"/></div>' +
         '<div class="goal-status" id="goalStatus"></div></div>' +
         '<div class="card"><h3>Real-Time Reward</h3><div id="rewChart" class="chart"></div></div>' +
       '</div>';
@@ -1056,14 +1047,6 @@ DASHBOARD_HTML = """
       '</div>';
 
       document.getElementById('content').innerHTML = h;
-
-      // Camera select handler
-      const camSelect = document.getElementById('camSelect');
-      const camImg = document.getElementById('camImg');
-      camSelect.onchange = () => {
-        const t = camSelect.value;
-        camImg.src = t ? '/stream/' + s.domain_id + '?topic=' + encodeURIComponent(t) + '&_t=' + Date.now() : '';
-      };
 
       // Update goal status panel
       updateGoalStatus(s.goal_status);
