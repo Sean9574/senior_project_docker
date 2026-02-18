@@ -171,7 +171,8 @@ RUN pip3 install \
     python-socketio
 
 
-
+# Step 5: Robocasa (after torch to avoid conflicts)
+RUN pip3 install --no-cache-dir robocasa || true
 
 
 RUN pip3 install "coverage<7"
@@ -190,7 +191,6 @@ RUN pip3 install \
 RUN pip3 install --no-deps robocasa || true
 RUN pip3 install --no-deps git+https://github.com/robocasa/robocasa.git || true
 RUN pip3 install --no-deps robosuite || true
-
 
 # Step 9: CRITICAL - Pin setuptools LAST for ROS2/colcon compatibility
 RUN pip3 install setuptools==58.2.0
@@ -236,6 +236,7 @@ RUN echo "Cache busting: $CACHEBUST"
 RUN git clone https://github.com/Sean9574/senior_project_docker.git /tmp/senior_project && \
     cp -r /tmp/senior_project/src/* . && \
     rm -rf /tmp/senior_project
+
 
 # =============================================================================
 # Install stretch_mujoco Python package
