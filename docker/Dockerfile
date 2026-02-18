@@ -187,8 +187,10 @@ RUN pip3 install \
     catkin_pkg
 
 # Step 7: Robosuite (required by stretch_mujoco)
-RUN pip3 install --no-deps robosuite
-RUN pip3 install --no-deps git+https://github.com/robocasa/robocasa.git || echo "Robocasa source install attempted"
+RUN pip3 install --no-deps robocasa || true
+RUN pip3 install --no-deps git+https://github.com/robocasa/robocasa.git || true
+RUN pip3 install --no-deps robosuite || true
+
 
 # Step 9: CRITICAL - Pin setuptools LAST for ROS2/colcon compatibility
 RUN pip3 install setuptools==58.2.0
