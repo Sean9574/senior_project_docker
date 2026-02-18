@@ -15,10 +15,12 @@ fi
 HF_TOKEN=$(grep -E "^(HUGGINGFACE_HUB_TOKEN|HF_TOKEN)=" "$HOME/.hf.env" 2>/dev/null | head -1 | cut -d'=' -f2 || true)
 
 # Flags:
-#   CLEAN=1 -> disables cache
-#   PULL=1  -> pulls latest base images
+#   CLEAN=1  -> disables build cache
+#   PULL=1   -> pulls latest base images
+#   DETACH=1 -> run in background (container stays running after exit)
 CLEAN="${CLEAN:-0}"
 PULL="${PULL:-0}"
+DETACH="${DETACH:-0}"
 
 BUILD_FLAGS=()
 if [ "$CLEAN" = "1" ]; then
@@ -39,13 +41,15 @@ docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
 
 echo ""
 echo "=== Starting container with performance optimizations ==="
+if [ "$DETACH" = "1" ]; then
+  echo "=== DETACHED MODE: Container will stay running after exit ==="
+fi
 echo ""
 
 # If DISPLAY is not set (headless), don't pass X11 env/mounts.
 DISPLAY_VALUE="${DISPLAY:-}"
 
 DOCKER_RUN_ARGS=(
-  -it --rm
   --gpus all
   --pid=host
   --ipc=host
@@ -75,4 +79,24 @@ else
   echo "NOTE: DISPLAY is not set; running headless (no X11 forwarding)."
 fi
 
-docker run "${DOCKER_RUN_ARGS[@]}" "$IMAGE_NAME" bash
+if [ "$DETACH" = "1" ]; then
+  # Detached mode: container stays running
+  DOCKER_RUN_ARGS+=(-d --restart unless-stopped)
+  
+  docker run "${DOCKER_RUN_ARGS[@]}" "$IMAGE_NAME" \
+    bash -c "while true; do sleep 3600; done"
+  
+  echo ""
+  echo "Container started in background!"
+  echo ""
+  echo "Commands:"
+  echo "  docker exec -it $CONTAINER_NAME bash     # Open shell"
+  echo "  docker stop $CONTAINER_NAME              # Stop container"
+  echo "  docker logs $CONTAINER_NAME              # View logs"
+  echo ""
+else
+  # Interactive mode: container removed on exit
+  DOCKER_RUN_ARGS+=(-it --rm)
+  
+  docker run "${DOCKER_RUN_ARGS[@]}" "$IMAGE_NAME" bash
+fi
