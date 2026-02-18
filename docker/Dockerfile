@@ -223,8 +223,21 @@ WORKDIR $AMENT_WS/src
 RUN git clone https://github.com/hello-robot/stretch_mujoco.git
 
 # ROBOCASA FIX: Replace robocasa_gen.py with a stub (we use custom scene.xml)
-RUN echo 'LayoutType = None\nStyleType = None\nclass RobocasaSceneBuilder:\n    pass' > \
-    $AMENT_WS/src/stretch_mujoco/stretch_mujoco/robocasa_gen.py
+# ROBOCASA FIX: Replace robocasa_gen.py with a stub (we use custom scene.xml)
+RUN echo '# Stub - robocasa kitchen generation disabled' > $AMENT_WS/src/stretch_mujoco/stretch_mujoco/robocasa_gen.py && \
+    echo 'LayoutType = None' >> $AMENT_WS/src/stretch_mujoco/stretch_mujoco/robocasa_gen.py && \
+    echo 'StyleType = None' >> $AMENT_WS/src/stretch_mujoco/stretch_mujoco/robocasa_gen.py && \
+    echo 'def get_styles(*args, **kwargs): return []' >> $AMENT_WS/src/stretch_mujoco/stretch_mujoco/robocasa_gen.py && \
+    echo 'def layout_from_str(*args, **kwargs): return None' >> $AMENT_WS/src/stretch_mujoco/stretch_mujoco/robocasa_gen.py && \
+    echo 'def layouts(*args, **kwargs): return []' >> $AMENT_WS/src/stretch_mujoco/stretch_mujoco/robocasa_gen.py && \
+    echo 'def model_generation_wizard(*args, **kwargs): return None' >> $AMENT_WS/src/stretch_mujoco/stretch_mujoco/robocasa_gen.py && \
+    echo 'def style_from_str(*args, **kwargs): return None' >> $AMENT_WS/src/stretch_mujoco/stretch_mujoco/robocasa_gen.py && \
+    echo 'class RobocasaSceneBuilder:' >> $AMENT_WS/src/stretch_mujoco/stretch_mujoco/robocasa_gen.py && \
+    echo '    def __init__(self, *args, **kwargs): pass' >> $AMENT_WS/src/stretch_mujoco/stretch_mujoco/robocasa_gen.py && \
+    echo '    def generate(self, *args, **kwargs): return None' >> $AMENT_WS/src/stretch_mujoco/stretch_mujoco/robocasa_gen.py
+
+
+
 
 # PERFORMANCE PATCH: Reduce camera resolution for Docker (424x240 -> 212x120)
 RUN sed -i 's/width=424/width=212/g; s/height=240/height=120/g' \
