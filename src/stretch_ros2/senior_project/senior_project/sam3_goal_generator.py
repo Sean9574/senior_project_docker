@@ -838,85 +838,87 @@ class SAM3GoalGeneratorV2(Node):
 
         with self._sam3_lock:
             result = getattr(self, '_last_sam3_result', None)
-        if result is None or not result.get('success'):
-            return
-
-        boxes = result.get('boxes', [])
-        scores = result.get('scores', [])
-        masks_b64 = result.get('masks_base64', [])
-        prompt = result.get('prompt', self.target)
-
-        best_detection = None
-        best_score = 0.0
-
+        
+        # Initialize visualization with current frame
         viz_base = rgb.copy()
         overlays = []
+        best_detection = None
+        best_score = 0.0
+        prompt = self.target
+        
+        # Process SAM3 results if available
+        if result is not None and result.get('success'):
+            boxes = result.get('boxes', [])
+            scores = result.get('scores', [])
+            masks_b64 = result.get('masks_base64', [])
+            prompt = result.get('prompt', self.target)
 
-        # Color palette for multiple detections (more saturated/visible)
-        colors = [
-            (0, 255, 0),    # Green
-            (255, 200, 0),  # Cyan-ish
-            (0, 200, 255),  # Orange
-            (255, 0, 255),  # Magenta
-            (255, 255, 0),  # Yellow
-        ]
+            # Color palette for multiple detections (more saturated/visible)
+            colors = [
+                (0, 255, 0),    # Green
+                (255, 200, 0),  # Cyan-ish
+                (0, 200, 255),  # Orange
+                (255, 0, 255),  # Magenta
+                (255, 255, 0),  # Yellow
+            ]
 
-        for idx, (box, score, mask_b64) in enumerate(zip(boxes, scores, masks_b64)):
-            mask = self.decode_mask(mask_b64)
-            
-            # Debug: log if mask was decoded
-            if mask is not None:
-                mask_pixels = np.sum(mask > 127)
-                self.get_logger().debug(f'Mask {idx}: {mask.shape}, pixels={mask_pixels}')
-            else:
-                self.get_logger().debug(f'Mask {idx}: FAILED TO DECODE')
+            for idx, (box, score, mask_b64) in enumerate(zip(boxes, scores, masks_b64)):
+                mask = self.decode_mask(mask_b64)
+                
+                # Debug: log if mask was decoded
+                if mask is not None:
+                    mask_pixels = np.sum(mask > 127)
+                    self.get_logger().debug(f'Mask {idx}: {mask.shape}, pixels={mask_pixels}')
+                else:
+                    self.get_logger().debug(f'Mask {idx}: FAILED TO DECODE')
 
-            cx, cy = self.get_mask_center(mask, box, rgb)
-            dist, method = self.get_distance_auto(mask, depth, box, prompt, rgb)
-            if dist is None or dist < self.min_dist or dist > self.max_dist:
-                continue
+                cx, cy = self.get_mask_center(mask, box, rgb)
+                dist, method = self.get_distance_auto(mask, depth, box, prompt, rgb)
+                if dist is None or dist < self.min_dist or dist > self.max_dist:
+                    continue
 
-            cam_point = self.pixel_to_3d(cx, cy, dist)
-            if cam_point is None:
-                continue
+                cam_point = self.pixel_to_3d(cx, cy, dist)
+                if cam_point is None:
+                    continue
 
-            odom_x, odom_y = self.camera_to_odom(*cam_point)
+                odom_x, odom_y = self.camera_to_odom(*cam_point)
 
-            x1, y1, x2, y2 = [int(v) for v in box]
-            
-            # Use different colors for different detections
-            color = colors[idx % len(colors)]
-            if float(score) > best_score:
-                color = (0, 255, 0)  # Best detection is always green
+                x1, y1, x2, y2 = [int(v) for v in box]
+                
+                # Use different colors for different detections
+                color = colors[idx % len(colors)]
+                if float(score) > best_score:
+                    color = (0, 255, 0)  # Best detection is always green
 
-            method_short = {
-                "depth_camera": "D",
-                "mono_depth": "M",
-                "size_width": "S",
-                "bbox_size": "B",
-                "none": "?"
-            }.get(method, "?")
+                method_short = {
+                    "depth_camera": "D",
+                    "mono_depth": "M",
+                    "size_width": "S",
+                    "bbox_size": "B",
+                    "none": "?"
+                }.get(method, "?")
 
-            label = f"{prompt}: {float(score):.2f} | {float(dist):.2f}m [{method_short}]"
+                label = f"{prompt}: {float(score):.2f} | {float(dist):.2f}m [{method_short}]"
 
-            overlays.append({
-                "rect": (x1, y1, x2, y2),
-                "center": (cx, cy),
-                "color": color,
-                "label": label,
-                "mask": mask,
-            })
+                overlays.append({
+                    "rect": (x1, y1, x2, y2),
+                    "center": (cx, cy),
+                    "color": color,
+                    "label": label,
+                    "mask": mask,
+                })
 
-            if float(score) > best_score:
-                best_score = float(score)
-                best_detection = {
-                    'distance': float(dist),
-                    'odom_x': float(odom_x),
-                    'odom_y': float(odom_y),
-                    'score': float(score),
-                    'method': method
-                }
+                if float(score) > best_score:
+                    best_score = float(score)
+                    best_detection = {
+                        'distance': float(dist),
+                        'odom_x': float(odom_x),
+                        'odom_y': float(odom_y),
+                        'score': float(score),
+                        'method': method
+                    }
 
+        # Depth status (always compute)
         depth_status = []
         if self._depth_is_fresh():
             depth_status.append("depth_cam")
