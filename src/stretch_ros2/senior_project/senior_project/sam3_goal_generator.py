@@ -1,15 +1,11 @@
-# ✅ FULL UPDATED FILE (your file + mask overlay + explains goal behavior)
-# Only changes:
-#  - Added mask overlay helpers
-#  - Stored mask per overlay item
-#  - Drew segmentation overlay (alpha-blended) after rotation using rotated mask
-#  - Kept your rotated/text-upright approach intact
-
 #!/usr/bin/env python3
 """
-SAM3 Goal Generator V2 (Updated)
+SAM3 Goal Generator V2 - With Visible Segmentation Overlay
 
-... (header unchanged)
+Changes from original:
+- Increased segmentation overlay alpha (0.55 instead of 0.35)
+- Added contour outline around segmented regions
+- Better color choices for visibility
 """
 
 import base64
@@ -185,9 +181,11 @@ class SAM3GoalGeneratorV2(Node):
         # Rotate visualization 90° (camera is sideways)
         self.rotate_viz_90_clockwise = True
 
-        # ===== NEW: mask overlay settings =====
+        # ===== Segmentation overlay settings - MORE VISIBLE =====
         self.show_segmentation_overlay = True
-        self.seg_overlay_alpha = 0.35  # 0..1 transparency
+        self.seg_overlay_alpha = 0.55  # Increased from 0.35 for visibility
+        self.show_contours = True  # Draw contour around segmented region
+        self.contour_thickness = 2
 
         # TF
         self.tf_buffer = Buffer()
@@ -278,9 +276,8 @@ class SAM3GoalGeneratorV2(Node):
         self.get_logger().info(f'  Target: "{self.target}"')
         self.get_logger().info(f'  SAM3 Server: {self.server_url}')
         self.get_logger().info(f'  Mono Depth Server: {self.mono_depth_url}')
-        self.get_logger().info(f'  Depth Mode: {self.depth_mode.value} (AUTO prefers depth if detected)')
-        self.get_logger().info(f'  Calibration: {"LOADED" if self._calib_loaded else "not loaded"} | file={self.camera_calib_path}')
-        self.get_logger().info(f'  GUI: {"ON" if self.gui_ready else "OFF"} (default={DEFAULT_SHOW_GUI})')
+        self.get_logger().info(f'  Depth Mode: {self.depth_mode.value}')
+        self.get_logger().info(f'  Segmentation Overlay: alpha={self.seg_overlay_alpha}, contours={self.show_contours}')
 
     # ==================== Rotation helpers ====================
 
@@ -302,20 +299,29 @@ class SAM3GoalGeneratorV2(Node):
             return cv2.resize(mask, (w, h), interpolation=cv2.INTER_NEAREST)
         return mask
 
-    def _overlay_mask(self, img_bgr: np.ndarray, mask_u8: np.ndarray, color_bgr: Tuple[int, int, int], alpha: float):
-        """
-        Alpha-blend a colored segmentation mask onto img_bgr in-place.
-        mask_u8: 0..255 mask image
-        """
+    def _overlay_mask(self, img_bgr: np.ndarray, mask_u8: np.ndarray, 
+                      color_bgr: Tuple[int, int, int], alpha: float):
+        """Alpha-blend a colored segmentation mask onto img_bgr in-place."""
         if mask_u8 is None:
             return
+        
         m = mask_u8 > 127
         if not np.any(m):
+            self.get_logger().warn('Mask has no pixels > 127!')
             return
 
+        # Create colored overlay
         overlay = img_bgr.copy()
         overlay[m] = color_bgr
-        cv2.addWeighted(overlay, float(alpha), img_bgr, 1.0 - float(alpha), 0.0, dst=img_bgr)
+        
+        # Blend
+        cv2.addWeighted(overlay, alpha, img_bgr, 1.0 - alpha, 0, dst=img_bgr)
+        
+        # Draw contour in CYAN to distinguish from green bounding box
+        if self.show_contours:
+            contours, _ = cv2.findContours(mask_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            # Use CYAN (255, 255, 0 in BGR) for mask contour - easy to spot
+            cv2.drawContours(img_bgr, contours, -1, (255, 255, 0), self.contour_thickness + 1)
 
     # ==================== Calibration Helpers ====================
 
@@ -357,7 +363,6 @@ class SAM3GoalGeneratorV2(Node):
             newK, _ = cv2.getOptimalNewCameraMatrix(self._K, self._D, (w, h), alpha=0)
             map1, map2 = cv2.initUndistortRectifyMap(self._K, self._D, None, newK, (w, h), cv2.CV_16SC2)
             self._undistort_maps = (map1, map2, newK, (w, h))
-            self.get_logger().info(f"Undistort maps ready for size {w}x{h}")
         except Exception as e:
             self.get_logger().warn(f"Failed to create undistort maps: {e}")
             self._undistort_maps = None
@@ -389,7 +394,7 @@ class SAM3GoalGeneratorV2(Node):
             return
 
         if os.name != "nt" and "DISPLAY" not in os.environ:
-            self.get_logger().warn("GUI enabled in code, but DISPLAY is not set (headless). Disabling GUI.")
+            self.get_logger().warn("GUI enabled but DISPLAY not set. Disabling GUI.")
             self.gui_ready = False
             return
 
@@ -397,9 +402,8 @@ class SAM3GoalGeneratorV2(Node):
             cv2.namedWindow(self.gui_window_name, cv2.WINDOW_NORMAL)
             cv2.resizeWindow(self.gui_window_name, 960, 540)
             self.gui_ready = True
-            self.get_logger().info("OpenCV window opened. Keys: q/ESC=quit, p=pause, s=screenshot")
         except Exception as e:
-            self.get_logger().warn(f"Could not open OpenCV window (disabling GUI): {e}")
+            self.get_logger().warn(f"Could not open OpenCV window: {e}")
             self.gui_ready = False
 
     def destroy_node(self):
@@ -426,8 +430,6 @@ class SAM3GoalGeneratorV2(Node):
         try:
             r = self.session.get(f"{self.mono_depth_url}/health", timeout=2)
             self.mono_depth_available = (r.status_code == 200)
-            if self.mono_depth_available:
-                self.get_logger().info('✓ Monocular depth server available')
         except Exception:
             self.mono_depth_available = False
             self.get_logger().warn('Monocular depth server not available')
@@ -522,7 +524,8 @@ class SAM3GoalGeneratorV2(Node):
         h = max(1, y2 - y1)
         return (w, h, x1, y1, x2, y2)
 
-    def estimate_distance_from_mask_width(self, mask: np.ndarray, object_class: str, rgb_shape: Tuple[int, int, int]) -> Optional[float]:
+    def estimate_distance_from_mask_width(self, mask: np.ndarray, object_class: str, 
+                                          rgb_shape: Tuple[int, int, int]) -> Optional[float]:
         if mask is None:
             return None
 
@@ -594,7 +597,8 @@ class SAM3GoalGeneratorV2(Node):
                                       center_x: int, center_y: int) -> Optional[float]:
         if mask is not None:
             if mask.shape != depth_img.shape:
-                mask_rs = cv2.resize(mask, (depth_img.shape[1], depth_img.shape[0]), interpolation=cv2.INTER_NEAREST)
+                mask_rs = cv2.resize(mask, (depth_img.shape[1], depth_img.shape[0]), 
+                                     interpolation=cv2.INTER_NEAREST)
             else:
                 mask_rs = mask
             mask_bool = mask_rs > 127
@@ -604,11 +608,13 @@ class SAM3GoalGeneratorV2(Node):
                 return float(np.median(depths[valid]))
         return self.get_depth_at_point(center_x, center_y, depth_img)
 
-    def get_mask_center(self, mask: Optional[np.ndarray], box: List[float], rgb: np.ndarray) -> Tuple[int, int]:
+    def get_mask_center(self, mask: Optional[np.ndarray], box: List[float], 
+                        rgb: np.ndarray) -> Tuple[int, int]:
         if mask is not None:
             mask_rs = mask
             if mask_rs.shape[:2] != rgb.shape[:2]:
-                mask_rs = cv2.resize(mask_rs, (rgb.shape[1], rgb.shape[0]), interpolation=cv2.INTER_LINEAR)
+                mask_rs = cv2.resize(mask_rs, (rgb.shape[1], rgb.shape[0]), 
+                                     interpolation=cv2.INTER_LINEAR)
             ys, xs = np.where(mask_rs > 127)
             if len(xs) > 0:
                 return int(np.mean(xs)), int(np.mean(ys))
@@ -621,7 +627,8 @@ class SAM3GoalGeneratorV2(Node):
         return (time.time() - self._last_depth_msg_time) <= self.depth_stale_sec
 
     def get_distance_auto(self, mask: Optional[np.ndarray], depth_img: Optional[np.ndarray],
-                          box: List[float], object_class: str, rgb: np.ndarray) -> Tuple[Optional[float], str]:
+                          box: List[float], object_class: str, 
+                          rgb: np.ndarray) -> Tuple[Optional[float], str]:
         depth_ok = depth_img is not None and self._depth_is_fresh()
         cx, cy = self.get_mask_center(mask, box, rgb)
 
@@ -648,6 +655,7 @@ class SAM3GoalGeneratorV2(Node):
             d = self.estimate_distance_from_bbox(box, object_class, rgb.shape[1], rgb.shape[0])
             return d, "bbox_size"
 
+        # AUTO mode
         if depth_ok:
             d = self._get_depth_from_mask_or_point(mask, depth_img, cx, cy)
             if d is not None:
@@ -710,9 +718,7 @@ class SAM3GoalGeneratorV2(Node):
             self.tf_available = True
             return rot_matrix
 
-        except TransformException as e:
-            if self.tf_available:
-                self.get_logger().debug(f'TF lookup failed: {e}')
+        except TransformException:
             self.tf_available = False
             return None
 
@@ -728,7 +734,6 @@ class SAM3GoalGeneratorV2(Node):
 
         robot_forward = cam_z * cos_pitch - cam_y * sin_pitch
         robot_left = -cam_x
-        robot_up = cam_z * sin_pitch + cam_y * cos_pitch
 
         robot_forward += self.camera_forward_offset
 
@@ -745,8 +750,18 @@ class SAM3GoalGeneratorV2(Node):
         try:
             mask_bytes = base64.b64decode(mask_b64)
             mask_np = np.frombuffer(mask_bytes, np.uint8)
-            return cv2.imdecode(mask_np, cv2.IMREAD_GRAYSCALE)
-        except Exception:
+            mask = cv2.imdecode(mask_np, cv2.IMREAD_GRAYSCALE)
+            
+            if mask is not None:
+                # Log mask info
+                nonzero = np.sum(mask > 127)
+                self.get_logger().info(f'Mask decoded: shape={mask.shape}, pixels={nonzero}')
+            else:
+                self.get_logger().warn('Mask decode returned None!')
+            
+            return mask
+        except Exception as e:
+            self.get_logger().warn(f'Failed to decode mask: {e}')
             return None
 
     # ==================== Goal publish ====================
@@ -837,8 +852,24 @@ class SAM3GoalGeneratorV2(Node):
         viz_base = rgb.copy()
         overlays = []
 
-        for box, score, mask_b64 in zip(boxes, scores, masks_b64):
+        # Color palette for multiple detections (more saturated/visible)
+        colors = [
+            (0, 255, 0),    # Green
+            (255, 200, 0),  # Cyan-ish
+            (0, 200, 255),  # Orange
+            (255, 0, 255),  # Magenta
+            (255, 255, 0),  # Yellow
+        ]
+
+        for idx, (box, score, mask_b64) in enumerate(zip(boxes, scores, masks_b64)):
             mask = self.decode_mask(mask_b64)
+            
+            # Debug: log if mask was decoded
+            if mask is not None:
+                mask_pixels = np.sum(mask > 127)
+                self.get_logger().debug(f'Mask {idx}: {mask.shape}, pixels={mask_pixels}')
+            else:
+                self.get_logger().debug(f'Mask {idx}: FAILED TO DECODE')
 
             cx, cy = self.get_mask_center(mask, box, rgb)
             dist, method = self.get_distance_auto(mask, depth, box, prompt, rgb)
@@ -852,7 +883,11 @@ class SAM3GoalGeneratorV2(Node):
             odom_x, odom_y = self.camera_to_odom(*cam_point)
 
             x1, y1, x2, y2 = [int(v) for v in box]
-            color = (0, 255, 0) if float(score) > best_score else (255, 255, 0)
+            
+            # Use different colors for different detections
+            color = colors[idx % len(colors)]
+            if float(score) > best_score:
+                color = (0, 255, 0)  # Best detection is always green
 
             method_short = {
                 "depth_camera": "D",
@@ -869,7 +904,7 @@ class SAM3GoalGeneratorV2(Node):
                 "center": (cx, cy),
                 "color": color,
                 "label": label,
-                "mask": mask,  # ✅ store mask so we can overlay it
+                "mask": mask,
             })
 
             if float(score) > best_score:
@@ -895,7 +930,6 @@ class SAM3GoalGeneratorV2(Node):
             dy = best_detection['odom_y'] - self.robot_y
             dist_to_obj = math.sqrt(dx * dx + dy * dy)
 
-            # ✅ goal offset: stop short by goal_offset meters
             if dist_to_obj > self.goal_offset:
                 scale = (dist_to_obj - self.goal_offset) / dist_to_obj
                 goal_x = self.robot_x + dx * scale
@@ -916,7 +950,6 @@ class SAM3GoalGeneratorV2(Node):
             }
 
             if self.auto_publish and not self.goal_sent:
-                # ✅ publish goal to /{ns}/goal as PointStamped in odom frame
                 self.publish_goal(goal_x, goal_y)
                 self.goal_sent = True
         else:
@@ -929,31 +962,33 @@ class SAM3GoalGeneratorV2(Node):
 
         self.status_pub.publish(String(data=json.dumps(status)))
 
-        # ===== Rotate FIRST, then draw segmentation overlay + boxes/text =====
+        # ===== Build visualization =====
         orig_h, orig_w = viz_base.shape[0], viz_base.shape[1]
         viz = viz_base
 
         if self.rotate_viz_90_clockwise:
             viz = self._rotate90_cw(viz)
 
-        # 1) SEGMENTATION OVERLAY (so you actually "see" SAM3 segmentation)
+        # 1) SEGMENTATION OVERLAY - Draw colored masks FIRST
         if self.show_segmentation_overlay:
             for item in overlays:
-                mask = item.get("mask", None)
+                mask = item.get("mask")
                 if mask is None:
                     continue
 
                 # Resize mask to original RGB size
                 mask_rs = self._mask_to_rgb_size(mask, orig_h, orig_w)
+                if mask_rs is None:
+                    continue
 
-                # Rotate mask to match viz orientation (same rotation as image)
+                # Rotate mask to match viz orientation
                 if self.rotate_viz_90_clockwise:
                     mask_rs = self._rotate90_cw(mask_rs)
 
-                # Overlay using the same color as box
+                # Overlay with the detection color
                 self._overlay_mask(viz, mask_rs, item["color"], self.seg_overlay_alpha)
 
-        # 2) BOXES/TEXT/CENTER (on top of overlay)
+        # 2) Draw bounding boxes and labels ON TOP of overlay
         for item in overlays:
             x1, y1, x2, y2 = item["rect"]
             cx, cy = item["center"]
@@ -971,8 +1006,11 @@ class SAM3GoalGeneratorV2(Node):
 
             cv2.rectangle(viz, (rx1, ry1), (rx2, ry2), color, 2)
             cv2.circle(viz, (rcx, rcy), 5, color, -1)
-            cv2.putText(viz, label, (tx, ty),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+            
+            # Add background for text readability
+            (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)
+            cv2.rectangle(viz, (tx, ty - th - 4), (tx + tw, ty + 4), (0, 0, 0), -1)
+            cv2.putText(viz, label, (tx, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
 
         # HUD text
         mode_str = f"Mode: {self.depth_mode.value} | Available: {', '.join(depth_status)}"
@@ -987,7 +1025,7 @@ class SAM3GoalGeneratorV2(Node):
             cv2.putText(viz, f"GOAL: ({gx:.1f}, {gy:.1f}) via {method_name}",
                         (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
 
-        # Publish rotated visualization
+        # Publish visualization
         self.viz_pub.publish(self.bridge.cv2_to_imgmsg(viz, 'bgr8'))
 
         self._last_viz_for_gui = viz
@@ -1019,12 +1057,11 @@ class SAM3GoalGeneratorV2(Node):
             cv2.imshow(self.gui_window_name, frame)
             key = cv2.waitKey(1) & 0xFF
         except Exception as e:
-            self.get_logger().warn(f"GUI error; disabling GUI: {e}")
+            self.get_logger().warn(f"GUI error: {e}")
             self.gui_ready = False
             return
 
         if key in (ord('q'), 27):
-            self.get_logger().info("GUI quit key pressed. Shutting down.")
             rclpy.shutdown()
         elif key == ord('p'):
             self.gui_paused = not self.gui_paused
