@@ -165,8 +165,6 @@ RUN pip3 install \
     flask \
     flask-socketio \
     termcolor \
-    flask \
-    flask-socketio \
     flask-cors \
     python-socketio
 
