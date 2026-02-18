@@ -183,9 +183,9 @@ class SAM3GoalGeneratorV2(Node):
 
         # ===== Segmentation overlay settings - MORE VISIBLE =====
         self.show_segmentation_overlay = True
-        self.seg_overlay_alpha = 0.55  # Increased from 0.35 for visibility
+        self.seg_overlay_alpha = 0.65  # Increased for better visibility
         self.show_contours = True  # Draw contour around segmented region
-        self.contour_thickness = 2
+        self.contour_thickness = 3  # Thicker contours
 
         # TF
         self.tf_buffer = Buffer()
@@ -317,11 +317,11 @@ class SAM3GoalGeneratorV2(Node):
         # Blend
         cv2.addWeighted(overlay, alpha, img_bgr, 1.0 - alpha, 0, dst=img_bgr)
         
-        # Draw contour in CYAN to distinguish from green bounding box
+        # Draw contour in BRIGHT MAGENTA to distinguish from green bounding box
         if self.show_contours:
             contours, _ = cv2.findContours(mask_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            # Use CYAN (255, 255, 0 in BGR) for mask contour - easy to spot
-            cv2.drawContours(img_bgr, contours, -1, (255, 255, 0), self.contour_thickness + 1)
+            # Use MAGENTA (255, 0, 255 in BGR) for mask contour - very visible
+            cv2.drawContours(img_bgr, contours, -1, (255, 0, 255), self.contour_thickness + 1)
 
     # ==================== Calibration Helpers ====================
 
@@ -873,6 +873,21 @@ class SAM3GoalGeneratorV2(Node):
                     self.get_logger().debug(f'Mask {idx}: FAILED TO DECODE')
 
                 cx, cy = self.get_mask_center(mask, box, rgb)
+                x1, y1, x2, y2 = [int(v) for v in box]
+                
+                # Use different colors for different detections
+                color = colors[idx % len(colors)]
+                
+                # ALWAYS add to overlays for visualization (show all detections)
+                overlays.append({
+                    "rect": (x1, y1, x2, y2),
+                    "center": (cx, cy),
+                    "color": color,
+                    "label": f"{prompt}: {float(score):.2f}",
+                    "mask": mask,
+                })
+                
+                # Only consider for goal if distance is valid
                 dist, method = self.get_distance_auto(mask, depth, box, prompt, rgb)
                 if dist is None or dist < self.min_dist or dist > self.max_dist:
                     continue
@@ -882,33 +897,11 @@ class SAM3GoalGeneratorV2(Node):
                     continue
 
                 odom_x, odom_y = self.camera_to_odom(*cam_point)
-
-                x1, y1, x2, y2 = [int(v) for v in box]
                 
-                # Use different colors for different detections
-                color = colors[idx % len(colors)]
+                # Update overlay color to green if this is the best detection
                 if float(score) > best_score:
-                    color = (0, 255, 0)  # Best detection is always green
-
-                method_short = {
-                    "depth_camera": "D",
-                    "mono_depth": "M",
-                    "size_width": "S",
-                    "bbox_size": "B",
-                    "none": "?"
-                }.get(method, "?")
-
-                label = f"{prompt}: {float(score):.2f} | {float(dist):.2f}m [{method_short}]"
-
-                overlays.append({
-                    "rect": (x1, y1, x2, y2),
-                    "center": (cx, cy),
-                    "color": color,
-                    "label": label,
-                    "mask": mask,
-                })
-
-                if float(score) > best_score:
+                    overlays[-1]["color"] = (0, 255, 0)  # Best detection is green
+                    overlays[-1]["label"] = f"{prompt}: {float(score):.2f} | {float(dist):.2f}m"
                     best_score = float(score)
                     best_detection = {
                         'distance': float(dist),

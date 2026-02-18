@@ -64,35 +64,35 @@ MIN_SAFE_DISTANCE = ROBOT_HALF_WIDTH_M + DESIRED_CLEARANCE_M  # ~0.77m
 # SAFETY ZONE THRESHOLDS (from LIDAR/center of robot)
 # =============================================================================
 
-ZONE_FREE = 1.0         # Full RL control (reduced from 1.5m)
-ZONE_AWARE = 0.7        # Gentle safety influence begins
-ZONE_CAUTION = 0.45     # Blended control
-ZONE_DANGER = 0.28      # Safety takes priority
-ZONE_EMERGENCY = 0.18   # Hard override
+ZONE_FREE = 1.2         # Full RL control (restored for better obstacle clearance)
+ZONE_AWARE = 0.85       # Gentle safety influence begins
+ZONE_CAUTION = 0.55     # Blended control
+ZONE_DANGER = 0.35      # Safety takes priority
+ZONE_EMERGENCY = 0.20   # Hard override
 
-# Safety blend ratios at each zone boundary (REDUCED for more RL freedom)
+# Safety blend ratios at each zone boundary (INCREASED for better avoidance)
 BLEND_FREE = 0.0        # 0% safety
-BLEND_AWARE = 0.05      # 5% safety (was 10%)
-BLEND_CAUTION = 0.20    # 20% safety (was 40%)
-BLEND_DANGER = 0.50     # 50% safety (was 70%)
-BLEND_EMERGENCY = 0.90  # 90% safety (was 100%)
+BLEND_AWARE = 0.10      # 10% safety
+BLEND_CAUTION = 0.30    # 30% safety
+BLEND_DANGER = 0.60     # 60% safety
+BLEND_EMERGENCY = 0.95  # 95% safety
 
 # =============================================================================
-# POTENTIAL FIELD PARAMETERS (REDUCED for less aggressive avoidance)
+# POTENTIAL FIELD PARAMETERS (INCREASED for better obstacle avoidance)
 # =============================================================================
 
-REPULSIVE_GAIN = 1.0           # Strength of obstacle repulsion (was 2.0)
-REPULSIVE_INFLUENCE = 0.8      # Distance at which repulsion starts (was 1.5)
+REPULSIVE_GAIN = 1.5           # Strength of obstacle repulsion
+REPULSIVE_INFLUENCE = 1.0      # Distance at which repulsion starts
 ATTRACTIVE_GAIN = 0.5          # Strength of goal attraction (when goal exists)
 
 # =============================================================================
 # REWARD SHAPING PARAMETERS
 # =============================================================================
 
-# Proximity penalties (graduated) - REDUCED
-R_PROXIMITY_SCALE = -30.0      # Max penalty per step when very close (was -50)
-R_CLEARANCE_BONUS = 0.3        # Bonus for maintaining good clearance (was 0.5)
-R_SAFETY_INTERVENTION = -5.0   # Penalty scaled by how much safety overrode RL (was -10)
+# Proximity penalties (graduated)
+R_PROXIMITY_SCALE = -50.0      # Max penalty per step when very close (increased)
+R_CLEARANCE_BONUS = 0.5        # Bonus for maintaining good clearance (increased)
+R_SAFETY_INTERVENTION = -8.0   # Penalty scaled by how much safety overrode RL (increased)
 
 # =============================================================================
 # GOAL-SEEKING REWARDS (PRIMARY BEHAVIOR)
@@ -111,11 +111,11 @@ GOAL_RADIUS = 0.45            # Distance to count as "reached"
 # EXPLORATION REWARDS (SECONDARY - only when no goal)
 # =============================================================================
 
-R_NEW_CELL = 1.5              # Per new cell discovered (reduced)
-R_NOVELTY_SCALE = 0.3         # Bonus for unvisited areas (reduced)
-R_FRONTIER_BONUS = 2.0        # Moving toward frontiers (reduced)
+R_NEW_CELL = 3.0              # Per new cell discovered (increased)
+R_NOVELTY_SCALE = 0.8         # Bonus for unvisited areas (increased)
+R_FRONTIER_BONUS = 5.0        # Moving toward frontiers (increased)
 R_COLLISION_EXPLORE = -500.0  # Collision during exploration
-R_STEP_EXPLORE = -0.02        # Step cost during exploration
+R_STEP_EXPLORE = -0.01        # Step cost during exploration (reduced penalty)
 
 # =============================================================================
 # MISSION REWARDS
@@ -1549,8 +1549,8 @@ class StretchExploreEnv(gym.Env):
         r_novelty = R_NOVELTY_SCALE * novelty
         
         frontier_angle = self.occ_grid.get_frontier_direction(st["x"], st["y"], st["yaw"])
-        if abs(frontier_angle) < math.pi / 4 and st["v_lin"] > 0.1:
-            r_frontier = R_FRONTIER_BONUS * math.cos(frontier_angle) * 0.1
+        if abs(frontier_angle) < math.pi / 3 and st["v_lin"] > 0.05:  # More lenient angle, lower velocity threshold
+            r_frontier = R_FRONTIER_BONUS * math.cos(frontier_angle)
         else:
             r_frontier = 0.0
         
@@ -1558,6 +1558,15 @@ class StretchExploreEnv(gym.Env):
         
         # RND intrinsic reward
         r_rnd = self.rnd.compute_intrinsic_reward(obs) * self.rnd_weight
+        
+        # Movement bonus - encourage forward movement during exploration
+        r_movement = 0.0
+        if st["v_lin"] > 0.2:
+            r_movement = 0.5  # Bonus for moving forward
+        elif st["v_lin"] < 0.05 and abs(st["v_ang"]) < 0.1:
+            r_movement = -0.3  # Penalty for being stuck (not moving at all)
+        elif abs(st["v_ang"]) > 0.5:
+            r_movement = 0.2  # Small bonus for turning (trying to find a way)
         
         # Collision - now based on ZONE_EMERGENCY (hard safety should prevent this)
         if self.last_safety_state and self.last_safety_state.min_distance < ZONE_EMERGENCY:
@@ -1568,7 +1577,7 @@ class StretchExploreEnv(gym.Env):
         else:
             r_collision = 0.0
         
-        reward = r_discovery + r_novelty + r_frontier + r_step + r_collision + r_rnd
+        reward = r_discovery + r_novelty + r_frontier + r_step + r_collision + r_rnd + r_movement
         
         info = {
             "collision": collision,
@@ -1581,6 +1590,7 @@ class StretchExploreEnv(gym.Env):
                 "step": r_step,
                 "collision": r_collision,
                 "rnd": r_rnd,
+                "movement": r_movement,
             }
         }
         

@@ -17,23 +17,22 @@ import sys
 import threading
 import time
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
-from concurrent.futures import ThreadPoolExecutor
-
-import rclpy
-from rclpy.context import Context
-from rclpy.executors import SingleThreadedExecutor
-from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, qos_profile_sensor_data
-from std_msgs.msg import Float32, String as StringMsg
-from sensor_msgs.msg import Image as RosImage
-
-from flask import Flask, render_template_string, Response, request, jsonify
-from flask_socketio import SocketIO
-from flask_cors import CORS
 
 import cv2
+import rclpy
 from cv_bridge import CvBridge
+from flask import Flask, Response, jsonify, render_template_string, request
+from flask_cors import CORS
+from flask_socketio import SocketIO
+from rclpy.context import Context
+from rclpy.executors import SingleThreadedExecutor
+from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
+from sensor_msgs.msg import Image as RosImage
+from std_msgs.msg import Float32
+from std_msgs.msg import String as StringMsg
 
 # =============================================================================
 # Configuration
@@ -243,9 +242,17 @@ class DomainCollector:
         self._subs.append(self.node.create_subscription(Float32, reward_topic, lambda msg, k=stats_key: self._reward_cb(msg, k), qos))
         self._subs.append(self.node.create_subscription(StringMsg, breakdown_topic, lambda msg, k=stats_key: self._breakdown_cb(msg, k), qos))
         
-        # Subscribe to goal generator status topic
-        goal_status_topic = "/sam3_goal_generator/status"
-        self._subs.append(self.node.create_subscription(StringMsg, goal_status_topic, lambda msg, k=stats_key: self._goal_status_cb(msg, k), qos))
+        # Subscribe to goal generator status topic (try multiple patterns)
+        goal_status_topics = [
+            "/sam3_goal_generator/status",
+            f"/{namespace}/sam3_goal_generator/status" if namespace else None,
+        ]
+        for topic in goal_status_topics:
+            if topic:
+                try:
+                    self._subs.append(self.node.create_subscription(StringMsg, topic, lambda msg, k=stats_key: self._goal_status_cb(msg, k), qos))
+                except:
+                    pass
 
     def _reward_cb(self, msg: Float32, key: str):
         if key in self.stats:
@@ -841,10 +848,15 @@ DASHBOARD_HTML = """
       domains = data.domains || {};
       const n = Object.keys(domains).length;
       document.getElementById('badge').textContent = n + ' Domain' + (n !== 1 ? 's' : '');
-      render();
       
-      // After render, update goal status for live updates
-      if (selected !== 'all' && domains[selected]) {
+      // Only rebuild tabs, not full content
+      renderTabs();
+      
+      // Update charts without rebuilding HTML
+      if (selected === 'all') {
+        updateAllCharts();
+      } else if (domains[selected]) {
+        updateDomainCharts(selected);
         updateGoalStatus(domains[selected].summary.goal_status);
       }
     });
@@ -869,7 +881,76 @@ DASHBOARD_HTML = """
     function sel(k) {
       selected = k;
       chartsInitialized = {};
-      render();
+      render();  // Full render only on tab switch
+    }
+    
+    function updateAllCharts() {
+      if (!document.getElementById('allChart')) return;
+      const vals = Object.values(domains);
+      if (!vals.length) return;
+      
+      const traces = [];
+      const cls = [colors.blue, colors.green, colors.purple, colors.red, colors.cyan, colors.yellow];
+      let ci = 0;
+      Object.values(domains).forEach(d => {
+        const p = d.plot_data;
+        if (p.episode_returns.values.length) {
+          traces.push({
+            x: p.episode_returns.episodes,
+            y: p.episode_returns.values,
+            type: 'scatter',
+            mode: 'lines',
+            name: p.display_name,
+            line: { color: cls[ci++ % cls.length], width: 2 }
+          });
+        }
+      });
+      if (traces.length) {
+        Plotly.react('allChart', traces, {
+          ...layoutBase,
+          showlegend: true,
+          legend: { bgcolor: 'rgba(0,0,0,0)', font: { size: 10 } },
+          xaxis: { ...layoutBase.xaxis, title: 'Episode' },
+          yaxis: { ...layoutBase.yaxis, title: 'Return' }
+        }, config);
+      }
+      
+      // Update summary stats
+      const totSteps = vals.reduce((a, d) => a + d.summary.total_steps, 0);
+      const totEp = vals.reduce((a, d) => a + d.summary.episode_count, 0);
+      const active = vals.filter(d => d.summary.active).length;
+      document.querySelectorAll('.summary-stat .value').forEach((el, i) => {
+        if (i === 0) el.textContent = totSteps.toLocaleString();
+        if (i === 1) el.textContent = totEp;
+        if (i === 4) el.textContent = active + '/' + vals.length;
+      });
+    }
+    
+    function updateDomainCharts(k) {
+      const d = domains[k];
+      if (!d) return;
+      
+      const s = d.summary;
+      const p = d.plot_data;
+      
+      // Update stat values without rebuilding HTML
+      const statEls = document.querySelectorAll('.stat .value');
+      if (statEls.length >= 7) {
+        statEls[0].textContent = s.total_steps.toLocaleString();
+        statEls[1].textContent = s.episode_count;
+        statEls[2].textContent = s.goals_reached;
+        statEls[3].textContent = s.cells_discovered;
+        statEls[4].textContent = s.current_episode_return.toFixed(1);
+        statEls[5].textContent = s.avg_episode_return.toFixed(1);
+        statEls[6].textContent = (s.avg_intervention * 100).toFixed(0) + '%';
+      }
+      
+      // Update charts
+      drawRewardChart(p);
+      drawEpisodeChart(p);
+      drawInterventionChart(p);
+      drawZoneChart(p);
+      drawComponentsChart(p);
     }
 
     function renderAllView() {
