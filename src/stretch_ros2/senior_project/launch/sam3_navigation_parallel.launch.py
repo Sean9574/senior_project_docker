@@ -1,16 +1,15 @@
 #!/usr/bin/env python3
 """
-SAM3 Navigation - PARALLEL ONLY (ament_python friendly)
+SAM3 Navigation - PARALLEL with DEDICATED SAM3 Servers
 
 This launch file starts:
-  1. A SINGLE shared SAM3 server in a dedicated domain (sam3_domain)
-  2. Multiple parallel simulations, each in their own domain (sim_base_domain + sim_index)
+  1. Multiple SAM3 servers (one per sim) on ports 8100, 8101, 8102, etc.
+  2. Multiple parallel simulations, each in their own domain with dedicated SAM3 server
 
 Usage:
   ros2 launch senior_project sam3_navigation_parallel.launch.py
   ros2 launch senior_project sam3_navigation_parallel.launch.py num_sims:=4 target:=cup headless:=true
-  ros2 launch senior_project sam3_navigation_parallel.launch.py sam3_domain:=0 sim_base_domain:=10
-  ros2 launch senior_project sam3_navigation_parallel.launch.py extra:="use_mono_depth_server=true mono_depth_model=depth_anything"
+  ros2 launch senior_project sam3_navigation_parallel.launch.py sam3_mode:=shared  # Fall back to single shared server
 """
 
 import os
@@ -35,7 +34,7 @@ def generate_launch_description():
     # ─────────────────────────────────────────────────────────────────────────
     ld.add_action(DeclareLaunchArgument(
         "sam3_domain", default_value="0",
-        description="ROS_DOMAIN_ID for the shared SAM3 server"
+        description="ROS_DOMAIN_ID for SAM3 servers (only used if sam3_mode=shared)"
     ))
     ld.add_action(DeclareLaunchArgument(
         "sim_base_domain", default_value="10",
@@ -46,6 +45,14 @@ def generate_launch_description():
     # SAM3 Server configuration
     # ─────────────────────────────────────────────────────────────────────────
     ld.add_action(DeclareLaunchArgument(
+        "sam3_mode", default_value="dedicated",
+        description="SAM3 server mode: 'dedicated' (one per sim) or 'shared' (single server)"
+    ))
+    ld.add_action(DeclareLaunchArgument(
+        "sam3_base_port", default_value="8100",
+        description="Base port for SAM3 servers (sim N uses base_port + N)"
+    ))
+    ld.add_action(DeclareLaunchArgument(
         "sam3_server_package", default_value="senior_project",
         description="Package containing the SAM3 server node"
     ))
@@ -54,8 +61,8 @@ def generate_launch_description():
         description="SAM3 server executable name"
     ))
     ld.add_action(DeclareLaunchArgument(
-        "sam3_startup_delay", default_value="5.0",
-        description="Seconds to wait for SAM3 server before starting sims"
+        "sam3_startup_delay", default_value="15.0",
+        description="Seconds to wait for SAM3 servers before starting sims"
     ))
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -101,45 +108,71 @@ def generate_launch_description():
 
     ld.add_action(LogInfo(msg=""))
     ld.add_action(LogInfo(msg="============================================================"))
-    ld.add_action(LogInfo(msg="  SAM3 Navigation - PARALLEL ONLY (Shared SAM3 Server)"))
+    ld.add_action(LogInfo(msg="  SAM3 Navigation - PARALLEL with Dedicated SAM3 Servers"))
     ld.add_action(LogInfo(msg="============================================================"))
     ld.add_action(LogInfo(msg=""))
 
-    # Start SAM3 server first, then sims after a delay
-    ld.add_action(OpaqueFunction(function=_start_sam3_server))
+    # Start SAM3 server(s) first, then sims after a delay
+    ld.add_action(OpaqueFunction(function=_start_sam3_servers))
     ld.add_action(OpaqueFunction(function=_start_parallel_runner_delayed))
 
     return ld
 
 
-def _start_sam3_server(context):
-    """Start the shared SAM3 server in its dedicated domain."""
+def _start_sam3_servers(context):
+    """Start SAM3 server(s) - either dedicated (one per sim) or shared (single)."""
+    sam3_mode = LaunchConfiguration("sam3_mode").perform(context)
+    sam3_base_port = int(LaunchConfiguration("sam3_base_port").perform(context))
+    num_sims = int(LaunchConfiguration("num_sims").perform(context))
     sam3_domain = LaunchConfiguration("sam3_domain").perform(context)
     home = os.path.expanduser("~")
 
-    # Build command as single string for bash -c
-    cmd_string = (
-        f"source /opt/ros/humble/setup.bash && "
-        f"source {home}/ament_ws/install/setup.bash && "
-        f"python3 -m senior_project.sam3_server --port 8100"
-    )
+    actions = []
 
-    return [
-        LogInfo(msg=f"[SAM3] Starting shared SAM3 server in domain {sam3_domain}"),
-        ExecuteProcess(
+    if sam3_mode == "dedicated":
+        # Start one SAM3 server per sim
+        actions.append(LogInfo(msg=f"[SAM3] Starting {num_sims} DEDICATED SAM3 servers (ports {sam3_base_port}-{sam3_base_port + num_sims - 1})"))
+        
+        for sim_id in range(num_sims):
+            port = sam3_base_port + sim_id
+            cmd_string = (
+                f"source /opt/ros/humble/setup.bash && "
+                f"source {home}/ament_ws/install/setup.bash && "
+                f"python3 -m senior_project.sam3_server --port {port}"
+            )
+            
+            actions.append(LogInfo(msg=f"[SAM3] Server {sim_id}: port {port}"))
+            actions.append(ExecuteProcess(
+                cmd=["bash", "-c", cmd_string],
+                output="screen",
+                name=f"sam3_server_{sim_id}",
+                additional_env={"ROS_DOMAIN_ID": str(sam3_domain)},
+            ))
+    else:
+        # Shared mode - single server
+        actions.append(LogInfo(msg=f"[SAM3] Starting SHARED SAM3 server on port {sam3_base_port}"))
+        cmd_string = (
+            f"source /opt/ros/humble/setup.bash && "
+            f"source {home}/ament_ws/install/setup.bash && "
+            f"python3 -m senior_project.sam3_server --port {sam3_base_port}"
+        )
+        actions.append(ExecuteProcess(
             cmd=["bash", "-c", cmd_string],
             output="screen",
             name="sam3_server_shared",
             additional_env={"ROS_DOMAIN_ID": str(sam3_domain)},
-        ),
-    ]
+        ))
+
+    return actions
 
 
 def _start_parallel_runner_delayed(context):
-    """Start the parallel runner after SAM3 server has initialized."""
+    """Start the parallel runner after SAM3 servers have initialized."""
     sam3_startup_delay = float(LaunchConfiguration("sam3_startup_delay").perform(context))
     sam3_domain = LaunchConfiguration("sam3_domain").perform(context)
     sim_base_domain = LaunchConfiguration("sim_base_domain").perform(context)
+    sam3_mode = LaunchConfiguration("sam3_mode").perform(context)
+    sam3_base_port = LaunchConfiguration("sam3_base_port").perform(context)
 
     num_sims = LaunchConfiguration("num_sims").perform(context)
     target = LaunchConfiguration("target").perform(context)
@@ -165,21 +198,24 @@ def _start_parallel_runner_delayed(context):
         # Domain configuration for the runner
         "--sam3_domain", str(sam3_domain),
         "--sim_base_domain", str(sim_base_domain),
+        # SAM3 server configuration
+        "--sam3_mode", str(sam3_mode),
+        "--sam3_base_port", str(sam3_base_port),
     ]
 
     if merge_on_exit in ("true", "1", "yes", "on"):
         cmd.append("--merge_on_exit")
 
     if extra:
-        cmd.append("--extra")
-        cmd.extend(extra.split())
+        cmd.extend(["--extra", extra])
 
     return [
+        LogInfo(msg=f"[parallel] SAM3 mode: {sam3_mode}, base port: {sam3_base_port}"),
+        LogInfo(msg=f"[parallel] Sim base domain: {sim_base_domain}"),
+        LogInfo(msg=f"[parallel] cmd: {' '.join(cmd)}"),
         TimerAction(
             period=sam3_startup_delay,
             actions=[
-                LogInfo(msg=f"[parallel] SAM3 domain: {sam3_domain}, Sim base domain: {sim_base_domain}"),
-                LogInfo(msg=f"[parallel] cmd: {' '.join(cmd)}"),
                 ExecuteProcess(
                     cmd=cmd,
                     output="screen",

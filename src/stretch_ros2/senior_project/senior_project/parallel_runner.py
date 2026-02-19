@@ -7,14 +7,19 @@ Spawns multiple simulations in parallel, each with its own:
   - Server ports (with offsets)
   - Checkpoint directory
 
-All simulations connect to a SHARED SAM3 server running in sam3_domain.
+Supports two SAM3 server modes:
+  - dedicated: Each sim gets its own SAM3 server (ports 8100, 8101, 8102, ...)
+  - shared: All sims share one SAM3 server (port 8100)
 
 Usage:
-    # Run 4 parallel sims with shared SAM3 server in domain 0, sims in domains 10-13
-    python parallel_runner.py --num_sims 4 --target "cup" --sam3_domain 0 --sim_base_domain 10
+    # Run 4 parallel sims with dedicated SAM3 servers (recommended for multi-GPU)
+    python parallel_runner.py --num_sims 4 --target "cup" --sam3_mode dedicated
+
+    # Run 4 parallel sims with shared SAM3 server (lower memory usage)
+    python parallel_runner.py --num_sims 4 --target "cup" --sam3_mode shared
 
     # Run and merge on completion
-    python parallel_runner.py --num_sims 4 --target "cup" --merge_on_exit --sam3_domain 0
+    python parallel_runner.py --num_sims 4 --target "cup" --merge_on_exit
 """
 
 import argparse
@@ -47,6 +52,8 @@ class ParallelRunner:
         headless: bool = True,
         sam3_domain: int = 0,
         sim_base_domain: int = 10,
+        sam3_mode: str = "dedicated",
+        sam3_base_port: int = 8100,
     ):
         self.num_sims = num_sims
         self.target = target
@@ -61,6 +68,8 @@ class ParallelRunner:
         self.headless = bool(headless)
         self.sam3_domain = sam3_domain
         self.sim_base_domain = sim_base_domain
+        self.sam3_mode = sam3_mode
+        self.sam3_base_port = sam3_base_port
 
         self.processes: List[subprocess.Popen] = []
         self.start_time: Optional[datetime] = None
@@ -97,10 +106,16 @@ class ParallelRunner:
         """Build the ros2 launch command for a simulation."""
         ckpt_dir = os.path.join(self.base_ckpt_dir, f"sim_{sim_id}")
 
-        # CRITICAL FIX: Calculate unique port for each sim (in case they need local servers)
-        # Base port 8100, each sim gets 100 port offset
-        sam3_port = 8100 + (sim_id * 100)
-        mono_port = 8101 + (sim_id * 100)
+        # Determine SAM3 port based on mode
+        if self.sam3_mode == "dedicated":
+            # Each sim gets its own SAM3 server
+            sam3_port = self.sam3_base_port + sim_id
+        else:
+            # All sims share one SAM3 server
+            sam3_port = self.sam3_base_port
+        
+        # Mono depth port (offset from SAM3 port)
+        mono_port = sam3_port + 50  # e.g., 8150 for sim 0 if sam3 is 8100
 
         cmd = [
             "ros2", "launch", self.package, self.launch_file,
@@ -110,10 +125,10 @@ class ParallelRunner:
             f"rollout_steps:={self.rollout_steps}",
             f"ckpt_dir:={ckpt_dir}",
             f"headless:={str(self.headless).lower()}",
-            # CRITICAL FIX: Tell child simulations NOT to start their own SAM3 server
+            # Tell child simulations NOT to start their own SAM3 server
             "start_sam3_server:=false",
-            # Point to the shared SAM3 server (domain agnostic, uses HTTP)
-            f"sam3_server_port:=8100",  # Shared server is on port 8100
+            # Point to the correct SAM3 server port
+            f"sam3_server_port:={sam3_port}",
             f"sam3_server_host:=localhost",
             # Also disable local mono depth server (unless explicitly requested)
             "start_mono_depth_server:=false",
@@ -150,10 +165,18 @@ class ParallelRunner:
         stdout_log = None
         stderr_log = None
 
+        # Determine SAM3 port for logging
+        if self.sam3_mode == "dedicated":
+            sam3_port = self.sam3_base_port + sim_id
+            port_info = f"SAM3_PORT={sam3_port} [dedicated]"
+        else:
+            sam3_port = self.sam3_base_port
+            port_info = f"SAM3_PORT={sam3_port} [shared]"
+
         print(
             f"[Runner] Starting sim {sim_id} "
             f"(DOMAIN_ID={sim_domain}, SAM3_DOMAIN={self.sam3_domain}, "
-            f"SAM3_PORT=8100 [shared], headless={self.headless})"
+            f"{port_info}, headless={self.headless})"
         )
 
         proc = subprocess.Popen(
@@ -182,7 +205,10 @@ class ParallelRunner:
         print(f"  Headless: {self.headless}")
         print(f"  Checkpoint Dir: {self.base_ckpt_dir}")
         print(f"  Merge on Exit: {self.merge_on_exit}")
-        print(f"  SAM3 Server Domain: {self.sam3_domain} (shared, port 8100)")
+        if self.sam3_mode == "dedicated":
+            print(f"  SAM3 Server Mode: DEDICATED (ports {self.sam3_base_port}-{self.sam3_base_port + self.num_sims - 1})")
+        else:
+            print(f"  SAM3 Server Mode: SHARED (port {self.sam3_base_port})")
         print(f"  Sim Domains: {self.sim_base_domain} - {self.sim_base_domain + self.num_sims - 1}")
         print(f"  NOTE: All sims use SHARED SAM3 server (not starting their own)")
         print(f"{'='*60}\n")
@@ -311,7 +337,10 @@ class ParallelRunner:
         print(f"  Total Time: {elapsed/60:.1f} minutes")
         print(f"  Simulations: {self.num_sims}")
         print(f"  Headless: {self.headless}")
-        print(f"  SAM3 Server Domain: {self.sam3_domain} (shared)")
+        if self.sam3_mode == "dedicated":
+            print(f"  SAM3 Server Mode: DEDICATED")
+        else:
+            print(f"  SAM3 Server Mode: SHARED")
         print(f"  Sim Domains: {self.sim_base_domain} - {self.sim_base_domain + self.num_sims - 1}")
         print(f"  Checkpoints: {self.base_ckpt_dir}/sim_*/")
         if self.merge_on_exit:
@@ -370,11 +399,22 @@ def main():
     # Domain configuration
     parser.add_argument(
         "--sam3_domain", type=int, default=0,
-        help="ROS_DOMAIN_ID where the shared SAM3 server is running (default: 0)"
+        help="ROS_DOMAIN_ID where the SAM3 server(s) are running (default: 0)"
     )
     parser.add_argument(
         "--sim_base_domain", type=int, default=10,
         help="Base ROS_DOMAIN_ID for simulations; sim N uses base + N (default: 10)"
+    )
+    
+    # SAM3 server configuration
+    parser.add_argument(
+        "--sam3_mode", type=str, default="dedicated",
+        choices=["dedicated", "shared"],
+        help="SAM3 server mode: 'dedicated' (one per sim) or 'shared' (single server)"
+    )
+    parser.add_argument(
+        "--sam3_base_port", type=int, default=8100,
+        help="Base port for SAM3 servers (sim N uses base_port + N in dedicated mode)"
     )
 
     # Collect any extra launch arguments
@@ -406,6 +446,8 @@ def main():
         headless=_str2bool(args.headless),
         sam3_domain=args.sam3_domain,
         sim_base_domain=args.sim_base_domain,
+        sam3_mode=args.sam3_mode,
+        sam3_base_port=args.sam3_base_port,
     )
 
     runner.start_all()
