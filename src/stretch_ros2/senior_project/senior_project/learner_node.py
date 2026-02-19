@@ -406,23 +406,23 @@ class GraduatedSafetyBlender:
         
         # SYMMETRY BREAKING: If obstacle is directly ahead and forces are balanced,
         # force a turn toward the clearer side
-        if front_obstacle and abs(force_y) < 0.5:
+        if front_obstacle and abs(force_y) < 1.0:
             # Pick direction based on which side has fewer obstacles
             if left_weight < right_weight:
-                force_y = 3.0  # Turn left
+                force_y = 5.0  # Turn left - stronger
             else:
-                force_y = -3.0  # Turn right
+                force_y = -5.0  # Turn right - stronger
             
-            # Also slow down more aggressively when facing obstacle
-            force_x = min(force_x, -2.0)
+            # Also back up more aggressively when facing obstacle
+            force_x = min(force_x, -3.0)
         
         # Convert forces to velocity commands
         # force_x negative means "go backward", positive means "go forward"
         # force_y positive means "turn left", negative means "turn right"
         
-        # Scale to velocity limits - INCREASED angular response
-        repulsive_v = np.clip(force_x * 0.3, -V_MAX * 0.5, V_MAX * 0.3)
-        repulsive_w = np.clip(force_y * 2.5, -W_MAX * 0.9, W_MAX * 0.9)  # Stronger turning
+        # Scale to velocity limits - STRONG response to escape obstacles
+        repulsive_v = np.clip(force_x * 0.5, -V_MAX * 0.6, V_MAX * 0.3)  # Stronger backward
+        repulsive_w = np.clip(force_y * 3.0, -W_MAX * 0.9, W_MAX * 0.9)  # Stronger turning
         
         return float(repulsive_v), float(repulsive_w)
     
@@ -475,34 +475,48 @@ class GraduatedSafetyBlender:
                     # Also allow slight backward motion to clear obstacle
                     safety_v = -V_MAX * 0.2
         
-        # In emergency/critical, stronger override
-        if safety_state.zone in ["EMERGENCY", "CRITICAL"]:
-            danger_ahead = abs(safety_state.danger_direction) < math.pi / 3
+        # ACTIVE ESCAPE: When very close, don't just block - actively move away!
+        if safety_state.zone in ["DANGER", "EMERGENCY", "CRITICAL"]:
+            # Override with strong escape behavior
+            escape_strength = 0.6 if safety_state.zone == "DANGER" else 0.9
             
-            if danger_ahead and rl_v > 0:
-                # Force backward motion
-                safety_v = -V_MAX * 0.3
-                blend = 1.0
+            # Always back up when this close
+            safety_v = -V_MAX * 0.4 * escape_strength
+            
+            # Strong turn away from obstacle
+            if safety_state.danger_direction > 0:
+                safety_w = -W_MAX * escape_strength  # Turn right
+            else:
+                safety_w = W_MAX * escape_strength   # Turn left
+            
+            # Higher blend to enforce escape
+            blend = max(blend, escape_strength)
+        
+        # In emergency/critical, maximum escape effort
+        if safety_state.zone in ["EMERGENCY", "CRITICAL"]:
+            # Full escape mode - ignore RL completely
+            blend = 0.98
+            safety_v = -V_MAX * 0.5  # Strong backup
             
             # Turn away from danger
             if safety_state.danger_direction > 0:
-                safety_w = -W_MAX * 0.6  # Turn right
+                safety_w = -W_MAX * 0.8  # Turn right
             else:
-                safety_w = W_MAX * 0.6   # Turn left
+                safety_w = W_MAX * 0.8   # Turn left
         
         # Blend RL and safety actions
         blended_v = lerp(rl_v, safety_v, blend)
         blended_w = lerp(rl_w, safety_w, blend)
         
-        # FINAL STALL CHECK: If we're about to output near-zero velocity in a danger zone, force movement
+        # FINAL STALL CHECK: If we're about to output near-zero velocity near obstacles, force movement
         if safety_state.zone in ["CAUTION", "DANGER", "EMERGENCY", "CRITICAL"]:
-            if abs(blended_v) < 0.05 and abs(blended_w) < 0.1:
-                # Robot would stall - force a turn
+            if abs(blended_v) < 0.1 and abs(blended_w) < 0.2:
+                # Robot would stall - force active escape
                 if safety_state.danger_direction > 0:
-                    blended_w = -W_MAX * 0.5
+                    blended_w = -W_MAX * 0.6
                 else:
-                    blended_w = W_MAX * 0.5
-                blended_v = -0.1  # Slight backup
+                    blended_w = W_MAX * 0.6
+                blended_v = -V_MAX * 0.3  # Back up!
         
         # Apply velocity limits
         blended_v = np.clip(blended_v, V_MIN_REVERSE, V_MAX)
