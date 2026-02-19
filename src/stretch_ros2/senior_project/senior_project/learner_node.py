@@ -377,6 +377,11 @@ class GraduatedSafetyBlender:
         force_x = 0.0  # Forward/backward
         force_y = 0.0  # Left/right
         
+        # Track which side has more obstacles (for symmetry breaking)
+        left_weight = 0.0
+        right_weight = 0.0
+        front_obstacle = False
+        
         for i, (r, angle) in enumerate(zip(ranges, angles)):
             if r >= REPULSIVE_INFLUENCE:
                 continue
@@ -390,14 +395,34 @@ class GraduatedSafetyBlender:
             # angle=0 means obstacle is ahead
             force_x += -magnitude * math.cos(angle)  # Push backward if obstacle ahead
             force_y += -magnitude * math.sin(angle)  # Push away laterally
+            
+            # Track obstacle distribution for symmetry breaking
+            if abs(angle) < math.pi / 4:  # Front 90 degrees
+                front_obstacle = True
+            if angle > 0:  # Left side
+                left_weight += magnitude
+            else:  # Right side
+                right_weight += magnitude
+        
+        # SYMMETRY BREAKING: If obstacle is directly ahead and forces are balanced,
+        # force a turn toward the clearer side
+        if front_obstacle and abs(force_y) < 0.5:
+            # Pick direction based on which side has fewer obstacles
+            if left_weight < right_weight:
+                force_y = 3.0  # Turn left
+            else:
+                force_y = -3.0  # Turn right
+            
+            # Also slow down more aggressively when facing obstacle
+            force_x = min(force_x, -2.0)
         
         # Convert forces to velocity commands
         # force_x negative means "go backward", positive means "go forward"
-        # force_y negative means "turn right", positive means "turn left"
+        # force_y positive means "turn left", negative means "turn right"
         
-        # Scale to velocity limits
+        # Scale to velocity limits - INCREASED angular response
         repulsive_v = np.clip(force_x * 0.3, -V_MAX * 0.5, V_MAX * 0.3)
-        repulsive_w = np.clip(force_y * 2.0, -W_MAX * 0.7, W_MAX * 0.7)
+        repulsive_w = np.clip(force_y * 2.5, -W_MAX * 0.9, W_MAX * 0.9)  # Stronger turning
         
         return float(repulsive_v), float(repulsive_w)
     
@@ -432,9 +457,26 @@ class GraduatedSafetyBlender:
             goal_w = ATTRACTIVE_GAIN * math.sin(goal_angle) * W_MAX
             safety_w = safety_w + goal_w * (1.0 - blend)
         
-        # In emergency/critical, if RL wants to go forward toward danger, override
+        # STALL PREVENTION: In DANGER or worse, if blended action would be near-zero, force turning
+        if safety_state.zone in ["DANGER", "EMERGENCY", "CRITICAL"]:
+            # Check if obstacle is ahead
+            danger_ahead = abs(safety_state.danger_direction) < math.pi / 3
+            
+            if danger_ahead:
+                # If RL wants forward and safety wants backward, we'll get ~0 velocity
+                # Force a strong turn instead of stalling
+                if rl_v > 0.1 and safety_v < 0:
+                    # Turn away from danger direction
+                    if safety_state.danger_direction > 0:
+                        safety_w = -W_MAX * 0.7  # Turn right (obstacle on left)
+                    else:
+                        safety_w = W_MAX * 0.7   # Turn left (obstacle on right)
+                    
+                    # Also allow slight backward motion to clear obstacle
+                    safety_v = -V_MAX * 0.2
+        
+        # In emergency/critical, stronger override
         if safety_state.zone in ["EMERGENCY", "CRITICAL"]:
-            # Check if RL is trying to move toward the obstacle
             danger_ahead = abs(safety_state.danger_direction) < math.pi / 3
             
             if danger_ahead and rl_v > 0:
@@ -444,13 +486,23 @@ class GraduatedSafetyBlender:
             
             # Turn away from danger
             if safety_state.danger_direction > 0:
-                safety_w = -W_MAX * 0.5  # Turn right
+                safety_w = -W_MAX * 0.6  # Turn right
             else:
-                safety_w = W_MAX * 0.5   # Turn left
+                safety_w = W_MAX * 0.6   # Turn left
         
         # Blend RL and safety actions
         blended_v = lerp(rl_v, safety_v, blend)
         blended_w = lerp(rl_w, safety_w, blend)
+        
+        # FINAL STALL CHECK: If we're about to output near-zero velocity in a danger zone, force movement
+        if safety_state.zone in ["DANGER", "EMERGENCY", "CRITICAL"]:
+            if abs(blended_v) < 0.05 and abs(blended_w) < 0.1:
+                # Robot would stall - force a turn
+                if safety_state.danger_direction > 0:
+                    blended_w = -W_MAX * 0.5
+                else:
+                    blended_w = W_MAX * 0.5
+                blended_v = -0.1  # Slight backup
         
         # Apply velocity limits
         blended_v = np.clip(blended_v, V_MIN_REVERSE, V_MAX)
