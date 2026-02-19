@@ -57,49 +57,49 @@ from visualization_msgs.msg import Marker, MarkerArray
 
 ROBOT_WIDTH_M = 0.33  # 13 inches in meters
 ROBOT_HALF_WIDTH_M = 0.165
-DESIRED_CLEARANCE_M = 0.15  # Reduced - robot can get close to obstacles
-MIN_SAFE_DISTANCE = ROBOT_HALF_WIDTH_M + DESIRED_CLEARANCE_M  # ~0.31m
+DESIRED_CLEARANCE_M = 0.25  # Moderate - can get close but not touch
+MIN_SAFE_DISTANCE = ROBOT_HALF_WIDTH_M + DESIRED_CLEARANCE_M  # ~0.41m
 
 # =============================================================================
 # SAFETY ZONE THRESHOLDS (from LIDAR/center of robot)
 # =============================================================================
 
-ZONE_FREE = 0.6         # Full RL control - reduced to allow closer approach
-ZONE_AWARE = 0.4        # Gentle safety influence begins
-ZONE_CAUTION = 0.30     # Blended control
-ZONE_DANGER = 0.22      # Safety takes priority
-ZONE_EMERGENCY = 0.15   # Hard override - only when about to collide
+ZONE_FREE = 0.8         # Full RL control
+ZONE_AWARE = 0.55       # Gentle safety influence begins
+ZONE_CAUTION = 0.40     # Blended control
+ZONE_DANGER = 0.30      # Safety takes priority
+ZONE_EMERGENCY = 0.20   # Hard override - about to collide
 
-# Safety blend ratios at each zone boundary (LOW - let RL learn)
+# Safety blend ratios - LOW for learning, but STRONG emergency stop
 BLEND_FREE = 0.0        # 0% safety
 BLEND_AWARE = 0.05      # 5% safety - barely noticeable
-BLEND_CAUTION = 0.15    # 15% safety - gentle nudge
-BLEND_DANGER = 0.35     # 35% safety - moderate override
-BLEND_EMERGENCY = 0.80  # 80% safety - strong but not total
+BLEND_CAUTION = 0.15    # 15% safety - gentle guidance
+BLEND_DANGER = 0.40     # 40% safety - noticeable but allows goal pursuit
+BLEND_EMERGENCY = 0.98  # 98% safety - HARD STOP to prevent collision
 
 # =============================================================================
-# POTENTIAL FIELD PARAMETERS (REDUCED - let robot get close to obstacles)
+# POTENTIAL FIELD PARAMETERS (BALANCED)
 # =============================================================================
 
-REPULSIVE_GAIN = 0.8           # Reduced obstacle repulsion
-REPULSIVE_INFLUENCE = 0.5      # Only repel when very close
-ATTRACTIVE_GAIN = 1.0          # Increased goal attraction
+REPULSIVE_GAIN = 1.2           # Moderate obstacle repulsion
+REPULSIVE_INFLUENCE = 0.7      # Start repelling at reasonable distance
+ATTRACTIVE_GAIN = 0.8          # Strong goal attraction
 
 # =============================================================================
 # REWARD SHAPING PARAMETERS
 # =============================================================================
 
-# Proximity penalties (graduated) - REDUCED to allow close approach
-R_PROXIMITY_SCALE = -15.0      # Reduced from -50 - don't punish closeness so much
-R_CLEARANCE_BONUS = 0.1        # Small bonus for clearance, not essential
-R_SAFETY_INTERVENTION = -2.0   # Reduced from -8 - intervention is guidance, not punishment
+# Proximity penalties (graduated) - BALANCED
+R_PROXIMITY_SCALE = -25.0      # Moderate penalty for being too close
+R_CLEARANCE_BONUS = 0.2        # Small bonus for clearance
+R_SAFETY_INTERVENTION = -3.0   # Moderate intervention penalty
 
 # =============================================================================
 # GOAL-SEEKING REWARDS (PRIMARY BEHAVIOR)
 # =============================================================================
 
 R_GOAL = 2000.0               # Reaching goal
-R_COLLISION = -1500.0         # Collision penalty
+R_COLLISION = -800.0          # Collision penalty (reduced from -1500)
 R_TIMEOUT = -50.0             # Episode timeout
 
 PROGRESS_SCALE = 300.0        # Reward for getting closer to goal
@@ -114,7 +114,7 @@ GOAL_RADIUS = 0.45            # Distance to count as "reached"
 R_NEW_CELL = 3.0              # Per new cell discovered (increased)
 R_NOVELTY_SCALE = 0.8         # Bonus for unvisited areas (increased)
 R_FRONTIER_BONUS = 5.0        # Moving toward frontiers (increased)
-R_COLLISION_EXPLORE = -500.0  # Collision during exploration
+R_COLLISION_EXPLORE = -300.0  # Collision during exploration (reduced)
 R_STEP_EXPLORE = -0.01        # Step cost during exploration (reduced penalty)
 
 # =============================================================================
