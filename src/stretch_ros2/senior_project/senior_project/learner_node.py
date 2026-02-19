@@ -64,17 +64,17 @@ MIN_SAFE_DISTANCE = ROBOT_HALF_WIDTH_M + DESIRED_CLEARANCE_M  # ~0.41m
 # SAFETY ZONE THRESHOLDS (from LIDAR/center of robot)
 # =============================================================================
 
-ZONE_FREE = 0.8         # Full RL control
-ZONE_AWARE = 0.55       # Gentle safety influence begins
-ZONE_CAUTION = 0.40     # Blended control
-ZONE_DANGER = 0.30      # Safety takes priority
-ZONE_EMERGENCY = 0.20   # Hard override - about to collide
+ZONE_FREE = 1.0         # Full RL control
+ZONE_AWARE = 0.70       # Gentle safety influence begins
+ZONE_CAUTION = 0.50     # Blended control - turning starts here
+ZONE_DANGER = 0.38      # Safety takes priority - strong turning
+ZONE_EMERGENCY = 0.25   # Hard override - about to collide
 
 # Safety blend ratios - LOW for learning, but STRONG emergency stop
 BLEND_FREE = 0.0        # 0% safety
 BLEND_AWARE = 0.05      # 5% safety - barely noticeable
-BLEND_CAUTION = 0.15    # 15% safety - gentle guidance
-BLEND_DANGER = 0.40     # 40% safety - noticeable but allows goal pursuit
+BLEND_CAUTION = 0.20    # 20% safety - turning behavior active
+BLEND_DANGER = 0.50     # 50% safety - strong turning
 BLEND_EMERGENCY = 0.98  # 98% safety - HARD STOP to prevent collision
 
 # =============================================================================
@@ -82,7 +82,7 @@ BLEND_EMERGENCY = 0.98  # 98% safety - HARD STOP to prevent collision
 # =============================================================================
 
 REPULSIVE_GAIN = 1.2           # Moderate obstacle repulsion
-REPULSIVE_INFLUENCE = 0.7      # Start repelling at reasonable distance
+REPULSIVE_INFLUENCE = 0.9      # Start repelling earlier
 ATTRACTIVE_GAIN = 0.8          # Strong goal attraction
 
 # =============================================================================
@@ -457,8 +457,8 @@ class GraduatedSafetyBlender:
             goal_w = ATTRACTIVE_GAIN * math.sin(goal_angle) * W_MAX
             safety_w = safety_w + goal_w * (1.0 - blend)
         
-        # STALL PREVENTION: In DANGER or worse, if blended action would be near-zero, force turning
-        if safety_state.zone in ["DANGER", "EMERGENCY", "CRITICAL"]:
+        # STALL PREVENTION: In CAUTION or worse, if blended action would be near-zero, force turning
+        if safety_state.zone in ["CAUTION", "DANGER", "EMERGENCY", "CRITICAL"]:
             # Check if obstacle is ahead
             danger_ahead = abs(safety_state.danger_direction) < math.pi / 3
             
@@ -495,7 +495,7 @@ class GraduatedSafetyBlender:
         blended_w = lerp(rl_w, safety_w, blend)
         
         # FINAL STALL CHECK: If we're about to output near-zero velocity in a danger zone, force movement
-        if safety_state.zone in ["DANGER", "EMERGENCY", "CRITICAL"]:
+        if safety_state.zone in ["CAUTION", "DANGER", "EMERGENCY", "CRITICAL"]:
             if abs(blended_v) < 0.05 and abs(blended_w) < 0.1:
                 # Robot would stall - force a turn
                 if safety_state.danger_direction > 0:
