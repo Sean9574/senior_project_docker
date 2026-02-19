@@ -57,42 +57,42 @@ from visualization_msgs.msg import Marker, MarkerArray
 
 ROBOT_WIDTH_M = 0.33  # 13 inches in meters
 ROBOT_HALF_WIDTH_M = 0.165
-DESIRED_CLEARANCE_M = 0.61  # 2 feet in meters
-MIN_SAFE_DISTANCE = ROBOT_HALF_WIDTH_M + DESIRED_CLEARANCE_M  # ~0.77m
+DESIRED_CLEARANCE_M = 0.15  # Reduced - robot can get close to obstacles
+MIN_SAFE_DISTANCE = ROBOT_HALF_WIDTH_M + DESIRED_CLEARANCE_M  # ~0.31m
 
 # =============================================================================
 # SAFETY ZONE THRESHOLDS (from LIDAR/center of robot)
 # =============================================================================
 
-ZONE_FREE = 1.2         # Full RL control (restored for better obstacle clearance)
-ZONE_AWARE = 0.85       # Gentle safety influence begins
-ZONE_CAUTION = 0.55     # Blended control
-ZONE_DANGER = 0.35      # Safety takes priority
-ZONE_EMERGENCY = 0.20   # Hard override
+ZONE_FREE = 0.6         # Full RL control - reduced to allow closer approach
+ZONE_AWARE = 0.4        # Gentle safety influence begins
+ZONE_CAUTION = 0.30     # Blended control
+ZONE_DANGER = 0.22      # Safety takes priority
+ZONE_EMERGENCY = 0.15   # Hard override - only when about to collide
 
-# Safety blend ratios at each zone boundary (INCREASED for better avoidance)
+# Safety blend ratios at each zone boundary (LOW - let RL learn)
 BLEND_FREE = 0.0        # 0% safety
-BLEND_AWARE = 0.10      # 10% safety
-BLEND_CAUTION = 0.30    # 30% safety
-BLEND_DANGER = 0.60     # 60% safety
-BLEND_EMERGENCY = 0.95  # 95% safety
+BLEND_AWARE = 0.05      # 5% safety - barely noticeable
+BLEND_CAUTION = 0.15    # 15% safety - gentle nudge
+BLEND_DANGER = 0.35     # 35% safety - moderate override
+BLEND_EMERGENCY = 0.80  # 80% safety - strong but not total
 
 # =============================================================================
-# POTENTIAL FIELD PARAMETERS (INCREASED for better obstacle avoidance)
+# POTENTIAL FIELD PARAMETERS (REDUCED - let robot get close to obstacles)
 # =============================================================================
 
-REPULSIVE_GAIN = 1.5           # Strength of obstacle repulsion
-REPULSIVE_INFLUENCE = 1.0      # Distance at which repulsion starts
-ATTRACTIVE_GAIN = 0.5          # Strength of goal attraction (when goal exists)
+REPULSIVE_GAIN = 0.8           # Reduced obstacle repulsion
+REPULSIVE_INFLUENCE = 0.5      # Only repel when very close
+ATTRACTIVE_GAIN = 1.0          # Increased goal attraction
 
 # =============================================================================
 # REWARD SHAPING PARAMETERS
 # =============================================================================
 
-# Proximity penalties (graduated)
-R_PROXIMITY_SCALE = -50.0      # Max penalty per step when very close (increased)
-R_CLEARANCE_BONUS = 0.5        # Bonus for maintaining good clearance (increased)
-R_SAFETY_INTERVENTION = -8.0   # Penalty scaled by how much safety overrode RL (increased)
+# Proximity penalties (graduated) - REDUCED to allow close approach
+R_PROXIMITY_SCALE = -15.0      # Reduced from -50 - don't punish closeness so much
+R_CLEARANCE_BONUS = 0.1        # Small bonus for clearance, not essential
+R_SAFETY_INTERVENTION = -2.0   # Reduced from -8 - intervention is guidance, not punishment
 
 # =============================================================================
 # GOAL-SEEKING REWARDS (PRIMARY BEHAVIOR)
