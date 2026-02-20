@@ -1176,6 +1176,8 @@ class StretchRosInterface(Node):
         self.last_odom: Optional[Odometry] = None
         self.last_scan: Optional[LaserScan] = None
         self.last_goal: Optional[PointStamped] = None
+        self._last_goal_time: float = 0.0  # When we last received a goal
+        self._goal_persist_timeout: float = 30.0  # Keep goal for 30s after losing sight
         self.last_imu: Optional[Imu] = None
         
         def make_topic(topic: str) -> str:
@@ -1286,7 +1288,9 @@ class StretchRosInterface(Node):
     def _odom_cb(self, msg): self.last_odom = msg
     def _scan_cb(self, msg): self.last_scan = msg
     def _imu_cb(self, msg): self.last_imu = msg
-    def _goal_cb(self, msg): self.last_goal = msg
+    def _goal_cb(self, msg):
+        self.last_goal = msg
+        self._last_goal_time = time.time()
     
     def wait_for_sensors(self, timeout: float = 10.0) -> bool:
         start = time.time()
@@ -1474,7 +1478,18 @@ class StretchExploreEnv(gym.Env):
         # COMPUTE REWARD WITH SAFETY SHAPING
         # ============================================================
         
+        # Check goal validity with persistence timeout
         has_goal = self.ros.last_goal is not None
+        
+        if has_goal:
+            # Check if goal has timed out (no update for too long)
+            goal_age = time.time() - self.ros._last_goal_time
+            if goal_age > self.ros._goal_persist_timeout:
+                # Goal is stale - clear it
+                self.ros.last_goal = None
+                has_goal = False
+                if self._step_count % 100 == 0:
+                    self.ros.get_logger().info(f'[GOAL] Cleared stale goal (age: {goal_age:.1f}s > {self.ros._goal_persist_timeout:.0f}s)')
         
         # Check if new goal is too close to a recently reached goal
         # This prevents immediate re-triggering when goal generator publishes same target

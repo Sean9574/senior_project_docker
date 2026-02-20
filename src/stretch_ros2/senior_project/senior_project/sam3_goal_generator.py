@@ -995,7 +995,9 @@ class SAM3GoalGeneratorV2(Node):
                 'goal_position': [float(goal_x), float(goal_y)]
             }
 
-            if self.auto_publish and not self.goal_sent:
+            # ALWAYS publish goal while target is visible (not just once)
+            # This keeps the goal updated as robot/target moves
+            if self.auto_publish:
                 self.publish_goal(goal_x, goal_y)
                 self.goal_sent = True
         else:
