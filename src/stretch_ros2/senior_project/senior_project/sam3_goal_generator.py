@@ -108,6 +108,8 @@ class SAM3GoalGeneratorV2(Node):
         self.declare_parameter('server_url', 'http://localhost:8100')
         self.declare_parameter('mono_depth_url', 'http://localhost:8101')
         self.declare_parameter('target', 'cup')
+        self.declare_parameter('targets', '')  # Comma-separated list for cycling: "chair,table,box,person"
+        self.declare_parameter('target_cycle_on_reach', True)  # Cycle to next target when goal reached
         self.declare_parameter('confidence_threshold', 0.2)
         self.declare_parameter('rate', 2.0)  # SAM3 detection rate (Hz)
         self.declare_parameter('viz_rate', 15.0)  # Visualization rate (Hz) - smooth camera feed
@@ -161,6 +163,19 @@ class SAM3GoalGeneratorV2(Node):
         self.goal_offset = float(self.get_parameter('goal_offset').value)
         self.auto_publish = bool(self.get_parameter('auto_publish_goal').value)
         self.default_focal_length = float(self.get_parameter('default_focal_length').value)
+        
+        # Multiple targets cycling
+        targets_str = self.get_parameter('targets').value
+        if targets_str:
+            self.target_list = [t.strip() for t in targets_str.split(',') if t.strip()]
+        else:
+            self.target_list = [self.target] if self.target else []
+        self.target_cycle_on_reach = bool(self.get_parameter('target_cycle_on_reach').value)
+        self.current_target_index = 0
+        
+        # If we have a target list, use the first one
+        if self.target_list:
+            self.target = self.target_list[0]
 
         rgb_topic = self.get_parameter('rgb_topic').value
         depth_topic = self.get_parameter('depth_topic').value
@@ -283,9 +298,16 @@ class SAM3GoalGeneratorV2(Node):
         self.set_sam3_prompt(self.target)
         self.check_mono_depth_server()
         self._init_gui()
+        
+        # Subscribe to goal reached topic for target cycling
+        self.create_subscription(
+            PointStamped, f'/{self.ns}/goal_reached', self.goal_reached_callback, 10
+        )
 
         self.get_logger().info('SAM3 Goal Generator V2 started')
         self.get_logger().info(f'  Target: "{self.target}"')
+        if len(self.target_list) > 1:
+            self.get_logger().info(f'  Target List: {self.target_list} (cycling enabled)')
         self.get_logger().info(f'  SAM3 Server: {self.server_url}')
         self.get_logger().info(f'  Mono Depth Server: {self.mono_depth_url}')
         self.get_logger().info(f'  Depth Mode: {self.depth_mode.value}')
@@ -490,6 +512,24 @@ class SAM3GoalGeneratorV2(Node):
         self.goal_sent = False
         self.set_sam3_prompt(self.target)
         self.get_logger().info(f'Target changed to: "{self.target}"')
+    
+    def goal_reached_callback(self, msg: PointStamped):
+        """Called when learner node reports goal reached - cycle to next target."""
+        if self.target_cycle_on_reach and len(self.target_list) > 1:
+            self.cycle_target()
+    
+    def cycle_target(self):
+        """Cycle to the next target in the list."""
+        if len(self.target_list) <= 1:
+            return
+        
+        self.current_target_index = (self.current_target_index + 1) % len(self.target_list)
+        new_target = self.target_list[self.current_target_index]
+        
+        self.target = new_target
+        self.goal_sent = False
+        self.set_sam3_prompt(self.target)
+        self.get_logger().info(f'[CYCLE] Target cycled to: "{self.target}" ({self.current_target_index + 1}/{len(self.target_list)})')
 
     def rgb_callback(self, msg: Image):
         with self.lock:

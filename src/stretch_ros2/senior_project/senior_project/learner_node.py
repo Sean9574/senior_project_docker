@@ -101,11 +101,16 @@ R_SAFETY_INTERVENTION = -3.0   # Moderate intervention penalty
 R_GOAL = 2000.0               # Reaching goal
 R_COLLISION = -800.0          # Collision penalty (reduced from -1500)
 R_TIMEOUT = -50.0             # Episode timeout
+R_REDETECTION = 300.0         # Bonus for re-finding a lost target
 
 PROGRESS_SCALE = 300.0        # Reward for getting closer to goal
 ALIGN_SCALE = 5.0             # Reward for facing goal
 STEP_COST = -0.1              # Small step cost to encourage efficiency
 GOAL_RADIUS = 0.45            # Distance to count as "reached"
+
+# Progress toward last-known target position (when target not visible)
+LAST_KNOWN_PROGRESS_SCALE = 100.0  # Reward for moving toward last sighting
+LAST_KNOWN_ALIGN_SCALE = 2.0       # Reward for facing last known position
 
 # =============================================================================
 # EXPLORATION REWARDS (SECONDARY - only when no goal)
@@ -1177,7 +1182,16 @@ class StretchRosInterface(Node):
         self.last_scan: Optional[LaserScan] = None
         self.last_goal: Optional[PointStamped] = None
         self._last_goal_time: float = 0.0  # When we last received a goal
-        self._goal_persist_timeout: float = 30.0  # Keep goal for 30s after losing sight
+        self._goal_persist_timeout: float = 60.0  # Keep goal for 60s after losing sight
+        
+        # Last known target position (persists even after goal cleared)
+        self._last_known_target_pos: Optional[Tuple[float, float]] = None
+        self._last_known_target_time: float = 0.0
+        self._last_known_persist_timeout: float = 120.0  # Remember location for 2 minutes
+        
+        # Re-detection tracking
+        self._target_was_lost: bool = False
+        self._lost_time: float = 0.0
         self.last_imu: Optional[Imu] = None
         
         def make_topic(topic: str) -> str:
@@ -1213,6 +1227,9 @@ class StretchRosInterface(Node):
         
         # Safety visualization
         self.safety_zone_pub = self.create_publisher(Marker, "/safety_zone", 10)
+        
+        # Goal reached publisher - signals to goal generator to cycle targets
+        self.goal_reached_pub = self.create_publisher(PointStamped, f"/{ns}/goal_reached", 10)
         
         self.path_history: deque = deque(maxlen=PATH_HISTORY_LENGTH)
         
@@ -1289,8 +1306,16 @@ class StretchRosInterface(Node):
     def _scan_cb(self, msg): self.last_scan = msg
     def _imu_cb(self, msg): self.last_imu = msg
     def _goal_cb(self, msg):
+        # Track if this is a re-detection (we had lost the target)
+        if self._target_was_lost and self.last_goal is None:
+            self._target_was_lost = False  # Will trigger re-detection bonus
+            
         self.last_goal = msg
         self._last_goal_time = time.time()
+        
+        # Update last known target position
+        self._last_known_target_pos = (msg.point.x, msg.point.y)
+        self._last_known_target_time = time.time()
     
     def wait_for_sensors(self, timeout: float = 10.0) -> bool:
         start = time.time()
@@ -1485,11 +1510,19 @@ class StretchExploreEnv(gym.Env):
             # Check if goal has timed out (no update for too long)
             goal_age = time.time() - self.ros._last_goal_time
             if goal_age > self.ros._goal_persist_timeout:
-                # Goal is stale - clear it
+                # Goal is stale - clear it and mark target as lost
                 self.ros.last_goal = None
                 has_goal = False
+                self.ros._target_was_lost = True
+                self.ros._lost_time = time.time()
                 if self._step_count % 100 == 0:
                     self.ros.get_logger().info(f'[GOAL] Cleared stale goal (age: {goal_age:.1f}s > {self.ros._goal_persist_timeout:.0f}s)')
+        
+        # Check if last-known position has expired
+        if self.ros._last_known_target_pos is not None:
+            last_known_age = time.time() - self.ros._last_known_target_time
+            if last_known_age > self.ros._last_known_persist_timeout:
+                self.ros._last_known_target_pos = None
         
         # Check if new goal is too close to a recently reached goal
         # This prevents immediate re-triggering when goal generator publishes same target
@@ -1508,8 +1541,18 @@ class StretchExploreEnv(gym.Env):
                 # Different goal location, clear the cooldown
                 self._last_goal_reached_pos = None
         
+        # Re-detection bonus: reward for re-finding a lost target
+        r_redetection = 0.0
+        if has_goal and self.ros._target_was_lost:
+            r_redetection = R_REDETECTION
+            self.ros._target_was_lost = False
+            self.ros.get_logger().info(f'[REDETECT] Target re-acquired! Bonus +{R_REDETECTION:.0f}')
+        
         if has_goal:
             reward, terminated, info = self._compute_goal_reward(safe_v, safe_w, new_cells)
+            reward += r_redetection
+            if r_redetection > 0:
+                info["reward_terms"]["redetection"] = r_redetection
         else:
             reward, terminated, info = self._compute_explore_reward(new_cells, st, obs)
         
@@ -1649,6 +1692,33 @@ class StretchExploreEnv(gym.Env):
         elif abs(st["v_ang"]) > 0.5:
             r_movement = 0.2  # Small bonus for turning (trying to find a way)
         
+        # Progress toward last-known target position (even when not currently visible)
+        r_last_known_progress = 0.0
+        r_last_known_align = 0.0
+        if self.ros._last_known_target_pos is not None:
+            lk_x, lk_y = self.ros._last_known_target_pos
+            robot_x, robot_y = st["x"], st["y"]
+            
+            # Distance to last known position
+            dist_to_last_known = math.hypot(lk_x - robot_x, lk_y - robot_y)
+            
+            # Progress (getting closer)
+            if not hasattr(self, '_prev_last_known_dist'):
+                self._prev_last_known_dist = dist_to_last_known
+            
+            progress = self._prev_last_known_dist - dist_to_last_known
+            r_last_known_progress = LAST_KNOWN_PROGRESS_SCALE * progress
+            self._prev_last_known_dist = dist_to_last_known
+            
+            # Alignment (facing toward last known position)
+            angle_to_last_known = math.atan2(lk_y - robot_y, lk_x - robot_x) - st["yaw"]
+            # Normalize to [-pi, pi]
+            while angle_to_last_known > math.pi:
+                angle_to_last_known -= 2 * math.pi
+            while angle_to_last_known < -math.pi:
+                angle_to_last_known += 2 * math.pi
+            r_last_known_align = LAST_KNOWN_ALIGN_SCALE * math.cos(angle_to_last_known)
+        
         # Collision - now based on ZONE_EMERGENCY (hard safety should prevent this)
         if self.last_safety_state and self.last_safety_state.min_distance < ZONE_EMERGENCY:
             if self.step_count > 10:
@@ -1658,7 +1728,7 @@ class StretchExploreEnv(gym.Env):
         else:
             r_collision = 0.0
         
-        reward = r_discovery + r_novelty + r_frontier + r_step + r_collision + r_rnd + r_movement
+        reward = r_discovery + r_novelty + r_frontier + r_step + r_collision + r_rnd + r_movement + r_last_known_progress + r_last_known_align
         
         info = {
             "collision": collision,
@@ -1672,6 +1742,8 @@ class StretchExploreEnv(gym.Env):
                 "collision": r_collision,
                 "rnd": r_rnd,
                 "movement": r_movement,
+                "last_known_progress": r_last_known_progress,
+                "last_known_align": r_last_known_align,
             }
         }
         
@@ -1706,6 +1778,16 @@ class StretchExploreEnv(gym.Env):
             
             self._goals_reached_this_episode += 1
             self._last_goal_reached_pos = (self.ros.last_goal.point.x, self.ros.last_goal.point.y)
+            
+            # Publish goal reached message - signals goal generator to cycle targets
+            reached_msg = PointStamped()
+            reached_msg.header.stamp = self.ros.get_clock().now().to_msg()
+            reached_msg.header.frame_id = "odom"
+            reached_msg.point.x = self.ros.last_goal.point.x
+            reached_msg.point.y = self.ros.last_goal.point.y
+            reached_msg.point.z = 0.0
+            self.ros.goal_reached_pub.publish(reached_msg)
+            
             self.ros.last_goal = None
             
             self.ros.get_logger().info(
