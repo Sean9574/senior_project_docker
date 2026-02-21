@@ -1515,7 +1515,7 @@ class StretchExploreEnv(gym.Env):
                 has_goal = False
                 self.ros._target_was_lost = True
                 self.ros._lost_time = time.time()
-                if self._step_count % 100 == 0:
+                if self.step_count % 100 == 0:
                     self.ros.get_logger().info(f'[GOAL] Cleared stale goal (age: {goal_age:.1f}s > {self.ros._goal_persist_timeout:.0f}s)')
         
         # Check if last-known position has expired
