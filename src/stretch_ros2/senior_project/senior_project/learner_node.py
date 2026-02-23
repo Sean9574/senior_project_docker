@@ -2607,7 +2607,7 @@ def main():
     parser.add_argument("--save-every", type=int, default=10_000)
     
     # Checkpoint
-    parser.add_argument("--ckpt-dir", type=str, default=os.path.expanduser("~/rl_checkpoints"))
+    parser.add_argument("--ckpt-dir", type=str, default="/home/sean/ament_ws/src/stretch_ros2/senior_project/parallel_training")
     parser.add_argument("--seed", type=int, default=42)
     
     # Mode
@@ -2665,13 +2665,28 @@ def main():
     replay = PrioritizedReplayBuffer(obs_dim, act_dim, size=args.replay_size, device=device)
     
     # Load checkpoint
-    if AUTO_LOAD_CHECKPOINT and os.path.exists(ckpt_path):
-        ros.get_logger().info(f"[CKPT] Loading from {ckpt_path}")
+    # Priority: --load-ckpt explicit path > AUTO_LOAD from ckpt_dir
+    load_path = None
+    if args.load_ckpt and os.path.exists(args.load_ckpt):
+        # Explicit path passed via --load-ckpt (e.g. from launch file or CLI)
+        load_path = args.load_ckpt
+        ros.get_logger().info(f"[CKPT] Explicit load path: {load_path}")
+    elif AUTO_LOAD_CHECKPOINT and os.path.exists(ckpt_path):
+        # Auto-load from the default ckpt_dir location
+        load_path = ckpt_path
+        ros.get_logger().info(f"[CKPT] Auto-load path: {load_path}")
+    else:
+        ros.get_logger().info(
+            f"[CKPT] No checkpoint found — starting fresh"
+            f" (looked for: {args.load_ckpt or 'n/a'}, {ckpt_path})"
+        )
+
+    if load_path is not None:
         try:
-            agent.load(ckpt_path, strict=False)
-            ros.get_logger().info("[CKPT] Load SUCCESS")
+            agent.load(load_path, strict=False)
+            ros.get_logger().info(f"[CKPT] Load SUCCESS from {load_path}")
         except Exception as e:
-            ros.get_logger().warn(f"[CKPT] Load FAILED (model architecture changed?): {e}")
+            ros.get_logger().warn(f"[CKPT] Load FAILED: {e}")
     
     # Shutdown handler
     def shutdown_and_save(signum=None, frame=None):
