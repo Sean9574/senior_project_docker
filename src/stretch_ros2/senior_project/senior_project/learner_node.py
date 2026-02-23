@@ -107,7 +107,10 @@ R_REDETECTION = 300.0         # Bonus for re-finding a lost target
 PROGRESS_SCALE = 500.0        # Strong reward for getting closer to goal (was 300)
 ALIGN_SCALE = 15.0            # Strong reward for facing goal (was 5)
 STEP_COST = -0.5              # Higher step cost during goal mode - encourages efficiency
-GOAL_RADIUS = 0.45            # Distance to count as "reached"
+GOAL_RADIUS = 0.80            # FIX Bug #3: Was 0.45m — dangerously close to goal_offset
+                               # of 0.5m. With depth noise and 2Hz goal updates, the robot
+                               # could be physically within reach but d_goal check failed
+                               # against stale/drifting coordinates. 0.8m gives proper margin.
 
 # Bonus just for actively pursuing goal
 R_GOAL_PURSUIT = 2.0          # Per-step bonus when moving toward goal
@@ -645,6 +648,173 @@ class RewardNormalizer:
         std = np.sqrt(self.rms.var + 1e-8)
         normalized = reward / max(std, 1.0)
         return float(np.clip(normalized, -self.clip, self.clip))
+
+
+# =============================================================================
+# Exponential Moving Average Tracker
+# =============================================================================
+
+class EMATracker:
+    """
+    Tracks multiple named scalar metrics with exponential moving averages.
+
+    Two alpha values are maintained per metric so you get both a fast (reactive)
+    and a slow (trend) view in a single object:
+        fast_alpha  – high alpha (~0.10) → responds quickly, more noisy
+        slow_alpha  – low alpha  (~0.01) → stable long-run trend line
+
+    Standard EMA formula:
+        ema_new = alpha * new_value + (1 - alpha) * ema_old
+
+    Bias correction (identical to the Adam optimiser) is applied so that
+    early values aren't artificially pulled toward zero:
+        ema_corrected = ema_raw / (1 - (1 - alpha)^n)
+
+    After the first observation the corrected value equals the observation
+    exactly, so there is no cold-start distortion regardless of alpha.
+
+    Tracked episode metrics (updated once per episode):
+        episode_return   – total undiscounted reward
+        episode_steps    – number of control steps taken
+        goals_reached    – goals reached in the episode (0 or 1+)
+        success_rate     – 1.0 if goal reached, else 0.0
+        collision_rate   – 1.0 if collision termination, else 0.0
+        intervention_rate – mean safety-blend intervention across episode
+
+    Tracked step metrics (updated every gradient step):
+        critic_loss
+        actor_loss
+        rnd_loss
+
+    Usage:
+        ema = EMATracker(fast_alpha=0.10, slow_alpha=0.01)
+        ema.update("episode_return", 500.0)
+        ema.update("critic_loss",    0.032)
+        print(ema.report())     # compact string for ROS logger
+        d = ema.as_dict()       # flat dict → JSON / ROS topic payload
+    """
+
+    def __init__(self, fast_alpha: float = 0.10, slow_alpha: float = 0.01):
+        if not (0.0 < fast_alpha <= 1.0):
+            raise ValueError(f"fast_alpha must be in (0, 1], got {fast_alpha}")
+        if not (0.0 < slow_alpha <= 1.0):
+            raise ValueError(f"slow_alpha must be in (0, 1], got {slow_alpha}")
+
+        self.fast_alpha = fast_alpha
+        self.slow_alpha = slow_alpha
+
+        # Raw (un-corrected) EMA accumulators
+        self._fast: Dict[str, float] = {}
+        self._slow: Dict[str, float] = {}
+        # Number of updates per metric (for bias correction)
+        self._n: Dict[str, int] = {}
+
+    # ------------------------------------------------------------------
+    # Core update
+    # ------------------------------------------------------------------
+
+    def update(self, name: str, value: float) -> None:
+        """Push one new observation for metric `name`.
+
+        The accumulators are seeded at 0.0 (identical to Adam's m_0=0).
+        This makes the bias-correction formula exact:
+            corrected = raw / (1 - (1-alpha)^n)
+        On n=1:  raw = alpha*value,  correction = alpha  →  corrected = value  ✓
+        As n→∞:  correction → 1.0                        →  corrected = raw    ✓
+        """
+        if name not in self._fast:
+            # Initialise accumulators at 0 so bias correction is valid from step 1
+            self._fast[name] = 0.0
+            self._slow[name] = 0.0
+            self._n[name] = 0
+
+        self._n[name] += 1
+        self._fast[name] = (
+            self.fast_alpha * value + (1.0 - self.fast_alpha) * self._fast[name]
+        )
+        self._slow[name] = (
+            self.slow_alpha * value + (1.0 - self.slow_alpha) * self._slow[name]
+        )
+
+    def update_batch(self, metrics: Dict[str, float]) -> None:
+        """Update multiple metrics at once from a dict."""
+        for name, value in metrics.items():
+            self.update(name, value)
+
+    # ------------------------------------------------------------------
+    # Bias-corrected reads
+    # ------------------------------------------------------------------
+
+    def fast(self, name: str) -> Optional[float]:
+        """Bias-corrected fast EMA for `name`, or None if never updated."""
+        if name not in self._fast:
+            return None
+        n = self._n[name]
+        # On n==1 the raw value IS the observation so correction == 1.0 anyway
+        correction = 1.0 - (1.0 - self.fast_alpha) ** n
+        return self._fast[name] / correction
+
+    def slow(self, name: str) -> Optional[float]:
+        """Bias-corrected slow EMA for `name`, or None if never updated."""
+        if name not in self._slow:
+            return None
+        n = self._n[name]
+        correction = 1.0 - (1.0 - self.slow_alpha) ** n
+        return self._slow[name] / correction
+
+    def count(self, name: str) -> int:
+        """How many times metric `name` has been updated."""
+        return self._n.get(name, 0)
+
+    # ------------------------------------------------------------------
+    # Serialisation / reporting
+    # ------------------------------------------------------------------
+
+    def as_dict(self) -> Dict[str, float]:
+        """
+        Return all current EMA values as a flat dict.
+        Keys are  '<metric>_fast'  and  '<metric>_slow'.
+        Suitable for JSON serialisation or embedding in a ROS String message.
+        """
+        out: Dict[str, float] = {}
+        for name in sorted(self._fast.keys()):
+            fv = self.fast(name)
+            sv = self.slow(name)
+            if fv is not None:
+                out[f"{name}_fast"] = round(fv, 5)
+            if sv is not None:
+                out[f"{name}_slow"] = round(sv, 5)
+        return out
+
+    def report(self, names: Optional[List[str]] = None) -> str:
+        """
+        Compact human-readable string for the ROS logger.
+        Shows  name=fast(slow)  for every metric in `names`
+        (or all metrics if names is None).
+
+        Format examples:
+            episode_return=+312.4(+198.1)
+            success_rate=0.45(0.31)           ← auto-percent for *_rate metrics
+            critic_loss=0.0210(0.0184)        ← 4-decimal for small values
+        """
+        keys = names if names is not None else sorted(self._fast.keys())
+        parts: List[str] = []
+        for k in keys:
+            if k not in self._fast:
+                continue
+            fv = self.fast(k)
+            sv = self.slow(k)
+            if fv is None or sv is None:
+                continue
+            if k.endswith("_rate") or k.endswith("_pct"):
+                parts.append(f"{k}={fv:.1%}({sv:.1%})")
+            elif "return" in k:
+                parts.append(f"{k}={fv:+.1f}({sv:+.1f})")
+            elif abs(fv) < 0.1 and abs(fv) > 0.0:
+                parts.append(f"{k}={fv:.4f}({sv:.4f})")
+            else:
+                parts.append(f"{k}={fv:.3f}({sv:.3f})")
+        return "  ".join(parts) if parts else "(no data yet)"
 
 
 # =============================================================================
@@ -1223,6 +1393,7 @@ class StretchRosInterface(Node):
         self.cmd_pub = self.create_publisher(Twist, cmd_name, 10)
         self.reward_pub = self.create_publisher(Float32, "/reward", 10)
         self.reward_breakdown_pub = self.create_publisher(StringMsg, "/reward_breakdown", 10)
+        self.ema_pub = self.create_publisher(StringMsg, "/ema_stats", 10)  # EMA metrics for monitor
         
         self.map_pub = self.create_publisher(OccupancyGrid, "/exploration_map", 10)
         self.heatmap_pub = self.create_publisher(OccupancyGrid, "/visit_heatmap", 10)
@@ -1310,10 +1481,11 @@ class StretchRosInterface(Node):
     def _scan_cb(self, msg): self.last_scan = msg
     def _imu_cb(self, msg): self.last_imu = msg
     def _goal_cb(self, msg):
-        # Track if this is a re-detection (we had lost the target)
-        if self._target_was_lost and self.last_goal is None:
-            self._target_was_lost = False  # Will trigger re-detection bonus
-            
+        # FIX Bug #6: Previously this callback cleared _target_was_lost to False
+        # (via the condition below) before step() ever had a chance to grant the
+        # re-detection bonus.  The guard `self.last_goal is None` was already True
+        # on entry because we hadn't assigned it yet, so the flag was always wiped.
+        # Now we simply let step() handle the flag — don't touch it here at all.
         self.last_goal = msg
         self._last_goal_time = time.time()
         
@@ -1432,6 +1604,18 @@ class StretchExploreEnv(gym.Env):
         self.episode_interventions = []
         self._goals_reached_this_episode = 0
         self._had_goal_last_step = False  # Track goal state transitions
+
+        # FIX Bug #1: Clear goal-reached cooldown between episodes.
+        # Without this, _last_goal_reached_pos persists across episodes and
+        # suppresses goal detection for the entire next episode if SAM3
+        # publishes a goal near the same position.
+        self._last_goal_reached_pos = None
+
+        # FIX Bug #5: Clear stale last-known-distance so the first-step
+        # progress reward in _compute_explore_reward isn't computed against
+        # a distance value left over from the previous episode.
+        if hasattr(self, '_prev_last_known_dist'):
+            del self._prev_last_known_dist
         
         self.occ_grid.decay_visits()
         
@@ -1801,6 +1985,11 @@ class StretchExploreEnv(gym.Env):
         r_goal = 0.0
         if d_goal <= GOAL_RADIUS:
             success = True
+            # FIX Bug #2: Terminate the episode immediately on success.
+            # Previously terminated stayed False, causing the episode to
+            # continue into explore mode while SAM3 immediately re-published
+            # the same goal, creating the suppression / reset loop.
+            terminated = True
             r_goal = R_GOAL
             
             self._goals_reached_this_episode += 1
@@ -1818,7 +2007,7 @@ class StretchExploreEnv(gym.Env):
             self.ros.last_goal = None
             
             self.ros.get_logger().info(
-                f"[GOAL REACHED #{self._goals_reached_this_episode}] dist={d_goal:.2f}m, reward={r_goal:.0f}, continuing exploration"
+                f"[GOAL REACHED #{self._goals_reached_this_episode}] dist={d_goal:.2f}m, reward={r_goal:.0f}, episode terminating"
             )
         
         # === NO EXPLORATION REWARDS DURING GOAL MODE ===
@@ -2433,6 +2622,20 @@ def main():
     ros.get_logger().info("[MODE] TRAINING (with graduated safety)")
     obs, _ = env.reset()
     last_save = 0
+
+    # ------------------------------------------------------------------ #
+    # Exponential Moving Average tracker                                   #
+    # fast_alpha=0.10  → ~10-episode window  (reactive, shows recent trend)
+    # slow_alpha=0.01  → ~100-episode window (stable long-run baseline)   #
+    # ------------------------------------------------------------------ #
+    ema = EMATracker(fast_alpha=0.10, slow_alpha=0.01)
+
+    # Accumulators for the current in-progress episode
+    _ep_return: float = 0.0
+    _ep_steps:  int   = 0
+    _ep_critic_losses: List[float] = []
+    _ep_actor_losses:  List[float] = []
+    _ep_rnd_losses:    List[float] = []
     
     for t in range(1, args.total_steps + 1):
         # Random actions at start
@@ -2445,6 +2648,10 @@ def main():
         
         next_obs, reward, terminated, truncated, info = env.step(act)
         done = terminated or truncated
+
+        # Track episode accumulators
+        _ep_return += reward
+        _ep_steps  += 1
         
         replay.add(
             obs, act,
@@ -2456,14 +2663,55 @@ def main():
         obs = next_obs
         
         if done:
+            # ---- Update EMA with episode-level metrics ----------------
+            ema.update("episode_return",    _ep_return)
+            ema.update("episode_steps",     float(_ep_steps))
+            ema.update("goals_reached",     float(env._goals_reached_this_episode))
+            ema.update("success_rate",      1.0 if info.get("success", False) else 0.0)
+            ema.update("collision_rate",    1.0 if info.get("collision", False) else 0.0)
+            avg_int = float(np.mean(env.episode_interventions)) if env.episode_interventions else 0.0
+            ema.update("intervention_rate", avg_int)
+
+            # If we accumulated any loss values this episode, push their mean
+            if _ep_critic_losses:
+                ema.update("critic_loss", float(np.mean(_ep_critic_losses)))
+            if _ep_actor_losses:
+                # actor_loss is 0.0 when actor wasn't updated (policy_delay),
+                # filter those out so we only average real gradient steps
+                real_actor = [v for v in _ep_actor_losses if v != 0.0]
+                if real_actor:
+                    ema.update("actor_loss", float(np.mean(real_actor)))
+            if _ep_rnd_losses:
+                ema.update("rnd_loss", float(np.mean(_ep_rnd_losses)))
+
+            # Publish EMA snapshot to /ema_stats for the reward monitor
+            ema_msg = StringMsg()
+            ema_dict = ema.as_dict()
+            ema_dict["episode"] = env.episode_index
+            ema_dict["total_steps"] = t
+            ema_msg.data = json.dumps(ema_dict)
+            ros.ema_pub.publish(ema_msg)
+
+            # Reset per-episode accumulators
+            _ep_return = 0.0
+            _ep_steps  = 0
+            _ep_critic_losses.clear()
+            _ep_actor_losses.clear()
+            _ep_rnd_losses.clear()
+
             obs, _ = env.reset()
         
         # Update
         if t >= args.update_after and t % args.update_every == 0 and replay.count >= args.batch_size:
             beta = PER_BETA_START + (PER_BETA_END - PER_BETA_START) * (t / args.total_steps)
             critic_loss, actor_loss, rnd_loss = agent.update(replay, args.batch_size, beta)
+
+            # Accumulate losses for end-of-episode EMA update
+            _ep_critic_losses.append(critic_loss)
+            _ep_actor_losses.append(actor_loss)
+            _ep_rnd_losses.append(rnd_loss)
         
-        # Save
+        # Save + EMA report
         if t - last_save >= args.save_every:
             last_save = t
             stats = env.occ_grid.get_stats()
@@ -2471,6 +2719,18 @@ def main():
             ros.get_logger().info(
                 f"[CKPT] step={t} cells={stats['total_discovered']} "
                 f"intervention={avg_intervention:.1%}"
+            )
+            # Log EMA report — shows fast(slow) for every tracked metric
+            ep_keys = [
+                "episode_return", "episode_steps", "goals_reached",
+                "success_rate", "collision_rate", "intervention_rate",
+            ]
+            loss_keys = ["critic_loss", "actor_loss", "rnd_loss"]
+            ros.get_logger().info(
+                f"[EMA] episodes: {ema.report(ep_keys)}"
+            )
+            ros.get_logger().info(
+                f"[EMA] losses:   {ema.report(loss_keys)}"
             )
             try:
                 agent.save(ckpt_path + ".tmp")
