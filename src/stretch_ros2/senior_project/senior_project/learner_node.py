@@ -154,6 +154,24 @@ V_MAX = 1.25
 W_MAX = 7.0
 V_MIN_REVERSE = -0.05
 
+# =============================================================================
+# CMD_VEL EXPONENTIAL MOVING AVERAGE SMOOTHER
+# =============================================================================
+# Applied inside send_cmd() — every velocity command is blended with the
+# previous published output before being sent on /stretch/cmd_vel.
+#
+# Formula:  smoothed = alpha * requested + (1 - alpha) * previous_smoothed
+#
+# alpha = 1.0  → no smoothing  (instantaneous, original behaviour)
+# alpha = 0.5  → moderate      (~2 step time-constant at 10 Hz = 0.2 s)
+# alpha = 0.3  → heavy         (~3 step time-constant at 10 Hz = 0.3 s)
+#
+# Linear (V) and angular (W) use separate alphas because turns need to be
+# snappier than forward motion — too much angular lag causes the robot to
+# overshoot corners and fight the safety blender.
+CMD_VEL_ALPHA_V: float = 0.4   # linear  — moderate smoothing
+CMD_VEL_ALPHA_W: float = 0.5   # angular — slightly more responsive
+
 # RND Config
 RND_WEIGHT_INITIAL = 1.0
 RND_WEIGHT_DECAY = 0.99995
@@ -1367,6 +1385,10 @@ class StretchRosInterface(Node):
         self._target_was_lost: bool = False
         self._lost_time: float = 0.0
         self.last_imu: Optional[Imu] = None
+
+        # cmd_vel EMA smoother state — initialised to zero (robot at rest)
+        self._smooth_v: float = 0.0
+        self._smooth_w: float = 0.0
         
         def make_topic(topic: str) -> str:
             if topic.startswith("/"):
@@ -1503,10 +1525,37 @@ class StretchRosInterface(Node):
         return False
     
     def send_cmd(self, v: float, w: float):
+        """
+        Apply exponential moving average smoothing to velocity commands
+        before publishing on /stretch/cmd_vel.
+
+        The smoother blends the requested value with the previously published
+        value so the robot never sees an instantaneous velocity jump:
+
+            smoothed = alpha * requested + (1 - alpha) * previous
+
+        Separate alphas for linear and angular (see CMD_VEL_ALPHA_V / _W).
+        A hard zero-command bypasses the smoother completely so emergency
+        stops and episode resets are always instant.
+        """
+        # Hard stop (safety override or episode end) — bypass EMA entirely
+        if v == 0.0 and w == 0.0:
+            self._smooth_v = 0.0
+            self._smooth_w = 0.0
+        else:
+            self._smooth_v = CMD_VEL_ALPHA_V * v + (1.0 - CMD_VEL_ALPHA_V) * self._smooth_v
+            self._smooth_w = CMD_VEL_ALPHA_W * w + (1.0 - CMD_VEL_ALPHA_W) * self._smooth_w
+
         msg = Twist()
-        msg.linear.x = float(v)
-        msg.angular.z = float(w)
+        msg.linear.x  = float(self._smooth_v)
+        msg.angular.z = float(self._smooth_w)
         self.cmd_pub.publish(msg)
+
+    def reset_cmd_smoother(self):
+        """Zero the smoother state at the start of each episode so there
+        is no velocity carry-over from the previous episode."""
+        self._smooth_v = 0.0
+        self._smooth_w = 0.0
 
 
 # =============================================================================
@@ -1616,7 +1665,11 @@ class StretchExploreEnv(gym.Env):
         # a distance value left over from the previous episode.
         if hasattr(self, '_prev_last_known_dist'):
             del self._prev_last_known_dist
-        
+
+        # Zero the cmd_vel EMA smoother so the previous episode's final
+        # velocity doesn't bleed into the first commands of the new one.
+        self.ros.reset_cmd_smoother()
+
         self.occ_grid.decay_visits()
         
         self.prev_goal_dist = self._goal_distance()
