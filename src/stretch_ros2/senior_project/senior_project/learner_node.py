@@ -155,22 +155,26 @@ W_MAX = 7.0
 V_MIN_REVERSE = -0.05
 
 # =============================================================================
-# CMD_VEL EXPONENTIAL MOVING AVERAGE SMOOTHER
+# CMD_VEL ADAPTIVE EXPONENTIAL MOVING AVERAGE SMOOTHER
 # =============================================================================
-# Applied inside send_cmd() — every velocity command is blended with the
-# previous published output before being sent on /stretch/cmd_vel.
+# Instead of a fixed alpha, the smoother measures the actual time between the
+# last CMD_VEL_WINDOW topic publications and derives alpha on every call:
 #
-# Formula:  smoothed = alpha * requested + (1 - alpha) * previous_smoothed
+#     dt    = median interval across the last CMD_VEL_WINDOW publish timestamps
+#     alpha = 1 - exp(-dt / tau)
 #
-# alpha = 1.0  → no smoothing  (instantaneous, original behaviour)
-# alpha = 0.5  → moderate      (~2 step time-constant at 10 Hz = 0.2 s)
-# alpha = 0.3  → heavy         (~3 step time-constant at 10 Hz = 0.3 s)
+# This keeps the smoothing time-constant (tau) stable regardless of how fast
+# or slow the control loop is actually running — fully rate-agnostic.
 #
-# Linear (V) and angular (W) use separate alphas because turns need to be
-# snappier than forward motion — too much angular lag causes the robot to
-# overshoot corners and fight the safety blender.
-CMD_VEL_ALPHA_V: float = 0.4   # linear  — moderate smoothing
-CMD_VEL_ALPHA_W: float = 0.5   # angular — slightly more responsive
+# tau = 0.12 s  → light   (~1-2 publish lag at ~10 Hz)
+# tau = 0.20 s  → moderate
+# tau = 0.40 s  → heavy, robot feels floaty
+#
+# Linear and angular have separate taus. Angular is kept tighter so the robot
+# tracks turns responsively and doesn't fight the safety blender.
+CMD_VEL_WINDOW: int   = 50    # rolling window of publish timestamps to measure dt
+CMD_VEL_TAU_V:  float = 0.20  # linear  smoothing time-constant (seconds)
+CMD_VEL_TAU_W:  float = 0.12  # angular smoothing time-constant (seconds) — snappier
 
 # RND Config
 RND_WEIGHT_INITIAL = 1.0
@@ -1386,9 +1390,13 @@ class StretchRosInterface(Node):
         self._lost_time: float = 0.0
         self.last_imu: Optional[Imu] = None
 
-        # cmd_vel EMA smoother state — initialised to zero (robot at rest)
+        # cmd_vel EMA smoother state
         self._smooth_v: float = 0.0
         self._smooth_w: float = 0.0
+        # Rolling window of the last CMD_VEL_WINDOW publish timestamps (seconds).
+        # Used to measure the real inter-publish dt so alpha is derived from
+        # actual observed rate rather than an assumed Hz value.
+        self._cmd_ts: deque = deque(maxlen=CMD_VEL_WINDOW)
         
         def make_topic(topic: str) -> str:
             if topic.startswith("/"):
@@ -1526,25 +1534,50 @@ class StretchRosInterface(Node):
     
     def send_cmd(self, v: float, w: float):
         """
-        Apply exponential moving average smoothing to velocity commands
-        before publishing on /stretch/cmd_vel.
+        Publish a velocity command on /stretch/cmd_vel with adaptive EMA smoothing.
 
-        The smoother blends the requested value with the previously published
-        value so the robot never sees an instantaneous velocity jump:
+        Alpha is derived from the median inter-publish interval measured over
+        the last CMD_VEL_WINDOW publishes, so the smoothing time-constant stays
+        consistent regardless of actual control loop speed:
 
-            smoothed = alpha * requested + (1 - alpha) * previous
+            dt    = median interval over last CMD_VEL_WINDOW timestamps
+            alpha = 1 - exp(-dt / tau)
+            smoothed = alpha * requested + (1 - alpha) * previous_smoothed
 
-        Separate alphas for linear and angular (see CMD_VEL_ALPHA_V / _W).
-        A hard zero-command bypasses the smoother completely so emergency
-        stops and episode resets are always instant.
+        Hard zero commands (emergency stop / episode reset) bypass the EMA
+        completely and zero the state instantly — never damped.
         """
-        # Hard stop (safety override or episode end) — bypass EMA entirely
+        now = time.time()
+        self._cmd_ts.append(now)
+
+        # Hard stop — bypass smoother, reset state, publish immediately
         if v == 0.0 and w == 0.0:
             self._smooth_v = 0.0
             self._smooth_w = 0.0
+            msg = Twist()
+            self.cmd_pub.publish(msg)
+            return
+
+        # Compute median dt from the rolling timestamp window
+        if len(self._cmd_ts) >= 2:
+            intervals = [
+                self._cmd_ts[i] - self._cmd_ts[i - 1]
+                for i in range(1, len(self._cmd_ts))
+            ]
+            dt = float(np.median(intervals))
+            # Guard against zero or nonsense dt (e.g. two calls in the same ms)
+            dt = max(dt, 1e-4)
         else:
-            self._smooth_v = CMD_VEL_ALPHA_V * v + (1.0 - CMD_VEL_ALPHA_V) * self._smooth_v
-            self._smooth_w = CMD_VEL_ALPHA_W * w + (1.0 - CMD_VEL_ALPHA_W) * self._smooth_w
+            # Not enough history yet — use a sensible default (10 Hz)
+            dt = 0.10
+
+        # Derive alphas from time-constant and measured dt
+        alpha_v = 1.0 - math.exp(-dt / CMD_VEL_TAU_V)
+        alpha_w = 1.0 - math.exp(-dt / CMD_VEL_TAU_W)
+
+        # Apply EMA
+        self._smooth_v = alpha_v * v + (1.0 - alpha_v) * self._smooth_v
+        self._smooth_w = alpha_w * w + (1.0 - alpha_w) * self._smooth_w
 
         msg = Twist()
         msg.linear.x  = float(self._smooth_v)
@@ -1552,10 +1585,10 @@ class StretchRosInterface(Node):
         self.cmd_pub.publish(msg)
 
     def reset_cmd_smoother(self):
-        """Zero the smoother state at the start of each episode so there
-        is no velocity carry-over from the previous episode."""
+        """Zero smoother state and timestamp history at episode boundaries."""
         self._smooth_v = 0.0
         self._smooth_w = 0.0
+        self._cmd_ts.clear()
 
 
 # =============================================================================
