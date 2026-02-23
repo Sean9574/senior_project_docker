@@ -236,12 +236,15 @@ RUN echo '# Stub - robocasa kitchen generation disabled' > $AMENT_WS/src/stretch
     echo '    def __init__(self, *args, **kwargs): pass' >> $AMENT_WS/src/stretch_mujoco/stretch_mujoco/robocasa_gen.py && \
     echo '    def generate(self, *args, **kwargs): return None' >> $AMENT_WS/src/stretch_mujoco/stretch_mujoco/robocasa_gen.py
 
-
-
-
 # PERFORMANCE PATCH: Reduce camera resolution for Docker (424x240 -> 212x120)
 RUN sed -i 's/width=424/width=212/g; s/height=240/height=120/g' \
     $AMENT_WS/src/stretch_mujoco/stretch_mujoco/enums/stretch_cameras.py
+
+# VELOCITY PATCH: Raise MuJoCo wheel actuator limit from ±6 to ±15 rad/s
+# (ctrlrange="-6 6" caps the robot at ~0.9 m/s regardless of cmd_vel values)
+RUN sed -i 's/ctrlrange="-6 6"/ctrlrange="-15 15"/g' \
+    $AMENT_WS/src/stretch_mujoco/stretch_mujoco/models/stretch.xml \
+    $AMENT_WS/src/stretch_mujoco/stretch_mujoco/models/stretch_mj_3.3.0.xml
 
 RUN git clone https://github.com/hello-robot/stretch_urdf.git
 

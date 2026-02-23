@@ -150,8 +150,8 @@ GRID_RESOLUTION = 0.5
 GRID_MAX_RANGE = 12.0
 
 # Movement Limits
-V_MAX = 1.25
-W_MAX = 7.0
+V_MAX = 1.875
+W_MAX = 12.0
 V_MIN_REVERSE = -0.05
 
 # =============================================================================
@@ -281,6 +281,14 @@ class GraduatedSafetyBlender:
         # Logging
         self.last_safety_state: Optional[SafetyState] = None
         self.intervention_history = deque(maxlen=100)
+
+        # Turn-direction hysteresis — once we commit to turning a direction
+        # during obstacle avoidance, hold it for _escape_hold_steps steps
+        # before reconsidering. Prevents oscillation when the closest LIDAR
+        # point bounces between left/right walls on alternate scan cycles.
+        self._escape_turn_sign: float = 0.0   # +1 = turn left, -1 = turn right
+        self._escape_hold_steps: int  = 8     # steps to hold the chosen direction
+        self._escape_hold_count: int  = 0     # steps remaining on current hold
     
     def analyze_scan(self, scan: LaserScan) -> SafetyState:
         """
@@ -469,108 +477,112 @@ class GraduatedSafetyBlender:
     ) -> Tuple[float, float, float]:
         """
         Blend RL action with safety action based on current safety state.
-        
+
         Returns:
             (blended_v, blended_w, intervention_amount)
-        
-        intervention_amount: How much safety overrode RL (0-1)
+
+        Turn-direction hysteresis: once a turn direction is chosen during
+        obstacle avoidance, it is locked in for _escape_hold_steps control
+        steps before being reconsidered. This prevents the oscillation that
+        occurs when the single closest LIDAR point alternates between the
+        left and right wall on consecutive scan cycles.
         """
         blend = safety_state.safety_blend
-        
-        # If no safety needed, return RL action directly
+
+        # Free zone — pure RL, reset hysteresis
         if blend < 0.01:
+            self._escape_hold_count = 0
+            self._escape_turn_sign  = 0.0
             return rl_v, rl_w, 0.0
-        
-        # Compute safety action
-        safety_v = safety_state.repulsive_v
-        safety_w = safety_state.repulsive_w
-        
-        # If we have a goal and we're not in emergency, bias toward goal
-        if goal_angle is not None and safety_state.zone not in ["EMERGENCY", "CRITICAL"]:
-            # Add attractive component toward goal
-            goal_w = ATTRACTIVE_GAIN * math.sin(goal_angle) * W_MAX
-            safety_w = safety_w + goal_w * (1.0 - blend)
-        
-        # STALL PREVENTION: In CAUTION or worse, if blended action would be near-zero, force turning
-        if safety_state.zone in ["CAUTION", "DANGER", "EMERGENCY", "CRITICAL"]:
-            # Check if obstacle is ahead
-            danger_ahead = abs(safety_state.danger_direction) < math.pi / 3
-            
-            if danger_ahead:
-                # If RL wants forward and safety wants backward, we'll get ~0 velocity
-                # Force a strong turn instead of stalling
-                if rl_v > 0.1 and safety_v < 0:
-                    # Turn away from danger direction
-                    if safety_state.danger_direction > 0:
-                        safety_w = -W_MAX * 0.7  # Turn right (obstacle on left)
-                    else:
-                        safety_w = W_MAX * 0.7   # Turn left (obstacle on right)
-                    
-                    # Also allow slight backward motion to clear obstacle
-                    safety_v = -V_MAX * 0.2
-        
-        # ACTIVE ESCAPE: When very close, don't just block - actively move away!
-        if safety_state.zone in ["DANGER", "EMERGENCY", "CRITICAL"]:
-            # Override with strong escape behavior
-            escape_strength = 0.6 if safety_state.zone == "DANGER" else 0.9
-            
-            # Always back up when this close
-            safety_v = -V_MAX * 0.4 * escape_strength
-            
-            # Strong turn away from obstacle
+
+        # ------------------------------------------------------------------ #
+        # 1. Determine escape turn direction with hysteresis                  #
+        # ------------------------------------------------------------------ #
+        if self._escape_hold_count > 0:
+            # Still committed to the previously chosen direction
+            turn_sign = self._escape_turn_sign
+            self._escape_hold_count -= 1
+        else:
+            # Choose fresh: turn away from the danger direction.
+            # danger_direction > 0 → obstacle is to the left → turn right (-1)
+            # danger_direction < 0 → obstacle is to the right → turn left (+1)
             if safety_state.danger_direction > 0:
-                safety_w = -W_MAX * escape_strength  # Turn right
+                turn_sign = -1.0   # turn right
             else:
-                safety_w = W_MAX * escape_strength   # Turn left
-            
-            # Higher blend to enforce escape
-            blend = max(blend, escape_strength)
-        
-        # In emergency/critical, maximum escape effort
-        if safety_state.zone in ["EMERGENCY", "CRITICAL"]:
-            # Full escape mode - ignore RL completely
-            blend = 0.98
-            safety_v = -V_MAX * 0.5  # Strong backup
-            
-            # Turn away from danger
-            if safety_state.danger_direction > 0:
-                safety_w = -W_MAX * 0.8  # Turn right
-            else:
-                safety_w = W_MAX * 0.8   # Turn left
-        
-        # Blend RL and safety actions
+                turn_sign = 1.0    # turn left
+
+            # Only lock in if we're actually intervening significantly
+            if blend >= 0.05:
+                self._escape_turn_sign  = turn_sign
+                self._escape_hold_count = self._escape_hold_steps
+
+        # ------------------------------------------------------------------ #
+        # 2. Build a single coherent safety command based on zone             #
+        # ------------------------------------------------------------------ #
+        zone = safety_state.zone
+
+        if zone in ["EMERGENCY", "CRITICAL"]:
+            # Full override — back up hard and spin away
+            safety_v   = -V_MAX * 0.5
+            safety_w   = turn_sign * W_MAX * 0.8
+            blend      = 0.98
+
+        elif zone == "DANGER":
+            # Strong escape — back up moderately and turn firmly
+            safety_v   = -V_MAX * 0.4 * 0.6
+            safety_w   = turn_sign * W_MAX * 0.6
+            blend      = max(blend, 0.6)
+
+        elif zone == "CAUTION":
+            # Gentle redirect — slow down and start turning
+            safety_v   = safety_state.repulsive_v
+            safety_w   = turn_sign * W_MAX * 0.5
+
+            # If RL is pushing forward into the obstacle, also add backward
+            if rl_v > 0.1 and abs(safety_state.danger_direction) < math.pi / 3:
+                safety_v = -V_MAX * 0.2
+
+        else:
+            # AWARE — light repulsion only, keep RL mostly in charge
+            safety_v = safety_state.repulsive_v
+            safety_w = safety_state.repulsive_w
+
+            # If we have a goal, add a gentle attractive component
+            if goal_angle is not None:
+                goal_w   = ATTRACTIVE_GAIN * math.sin(goal_angle) * W_MAX
+                safety_w = safety_w + goal_w * (1.0 - blend)
+
+        # ------------------------------------------------------------------ #
+        # 3. Blend and clamp                                                  #
+        # ------------------------------------------------------------------ #
         blended_v = lerp(rl_v, safety_v, blend)
         blended_w = lerp(rl_w, safety_w, blend)
-        
-        # FINAL STALL CHECK: If we're about to output near-zero velocity near obstacles, force movement
-        if safety_state.zone in ["CAUTION", "DANGER", "EMERGENCY", "CRITICAL"]:
+
+        # Final stall guard — if everything cancelled out near an obstacle,
+        # force a spin to break free
+        if zone in ["CAUTION", "DANGER", "EMERGENCY", "CRITICAL"]:
             if abs(blended_v) < 0.1 and abs(blended_w) < 0.2:
-                # Robot would stall - force active escape
-                if safety_state.danger_direction > 0:
-                    blended_w = -W_MAX * 0.6
-                else:
-                    blended_w = W_MAX * 0.6
-                blended_v = -V_MAX * 0.3  # Back up!
-        
-        # Apply velocity limits
+                blended_w = turn_sign * W_MAX * 0.6
+                blended_v = -V_MAX * 0.3
+
         blended_v = np.clip(blended_v, V_MIN_REVERSE, V_MAX)
         blended_w = np.clip(blended_w, -W_MAX, W_MAX)
-        
-        # Calculate how much we intervened
+
+        # ------------------------------------------------------------------ #
+        # 4. Intervention metric                                              #
+        # ------------------------------------------------------------------ #
         original_magnitude = math.sqrt(rl_v**2 + rl_w**2)
-        diff_magnitude = math.sqrt((rl_v - blended_v)**2 + (rl_w - blended_w)**2)
-        
+        diff_magnitude     = math.sqrt((rl_v - blended_v)**2 + (rl_w - blended_w)**2)
+
         if original_magnitude > 0.01:
             intervention = diff_magnitude / (original_magnitude + 0.01)
         else:
             intervention = blend
-        
-        intervention = np.clip(intervention, 0.0, 1.0)
-        
-        # Track intervention
+
+        intervention = float(np.clip(intervention, 0.0, 1.0))
         self.intervention_history.append(intervention)
-        
-        return float(blended_v), float(blended_w), float(intervention)
+
+        return float(blended_v), float(blended_w), intervention
     
     def compute_proximity_reward(self, safety_state: SafetyState) -> float:
         """
@@ -2008,13 +2020,12 @@ class StretchExploreEnv(gym.Env):
             r_last_known_align = LAST_KNOWN_ALIGN_SCALE * math.cos(angle_to_last_known)
         
         # Collision - now based on ZONE_EMERGENCY (hard safety should prevent this)
+        r_collision = 0.0  # initialise here so it's always bound
         if self.last_safety_state and self.last_safety_state.min_distance < ZONE_EMERGENCY:
             if self.step_count > 10:
                 terminated = True
                 collision = True
                 r_collision = R_COLLISION_EXPLORE
-        else:
-            r_collision = 0.0
         
         reward = r_discovery + r_novelty + r_frontier + r_step + r_collision + r_rnd + r_movement + r_last_known_progress + r_last_known_align
         
