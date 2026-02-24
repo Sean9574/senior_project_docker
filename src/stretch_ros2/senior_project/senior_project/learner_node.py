@@ -62,28 +62,28 @@ MIN_SAFE_DISTANCE = ROBOT_HALF_WIDTH_M + DESIRED_CLEARANCE_M  # ~0.41m
 
 # =============================================================================
 # SAFETY ZONE THRESHOLDS (from LIDAR/center of robot)
-# RELAXED - only intervene when actually about to collide
+# REACT EARLY but GENTLY - don't wait until too close
 # =============================================================================
 
-ZONE_FREE = 0.8         # Full RL control (reduced from 1.0)
-ZONE_AWARE = 0.50       # Just monitoring, no intervention (reduced from 0.70)
-ZONE_CAUTION = 0.35     # Light guidance (reduced from 0.50)
-ZONE_DANGER = 0.25      # Safety takes priority (reduced from 0.38)
-ZONE_EMERGENCY = 0.18   # Hard override - truly about to collide (reduced from 0.25)
+ZONE_FREE = 1.0         # Full RL control
+ZONE_AWARE = 0.70       # Start monitoring
+ZONE_CAUTION = 0.50     # Light guidance begins HERE - early enough to steer
+ZONE_DANGER = 0.35      # Stronger guidance
+ZONE_EMERGENCY = 0.22   # Hard override - last resort
 
-# Safety blend ratios - MUCH LOWER to trust RL and reduce jitter
+# Safety blend ratios - GENTLE intervention, escalates gradually
 BLEND_FREE = 0.0        # 0% safety
 BLEND_AWARE = 0.0       # 0% safety - just monitoring
-BLEND_CAUTION = 0.08    # 8% safety - very light (was 20%)
-BLEND_DANGER = 0.25     # 25% safety - moderate (was 50%)
-BLEND_EMERGENCY = 0.90  # 90% safety - emergency only (was 98%)
+BLEND_CAUTION = 0.15    # 15% safety - gentle steering
+BLEND_DANGER = 0.40     # 40% safety - firmer guidance  
+BLEND_EMERGENCY = 0.85  # 85% safety - strong but not total lockup
 
 # =============================================================================
-# POTENTIAL FIELD PARAMETERS - REDUCED to minimize jitter
+# POTENTIAL FIELD PARAMETERS - moderate repulsion, early detection
 # =============================================================================
 
-REPULSIVE_GAIN = 0.6           # Lower repulsion (was 1.2)
-REPULSIVE_INFLUENCE = 0.6      # Smaller influence radius (was 0.9)
+REPULSIVE_GAIN = 0.8           # Moderate repulsion
+REPULSIVE_INFLUENCE = 0.8      # Start repelling at 0.8m (earlier detection)
 ATTRACTIVE_GAIN = 0.8          # Strong goal attraction
 
 # =============================================================================
@@ -528,45 +528,72 @@ class GraduatedSafetyBlender:
         """
         blend = safety_state.safety_blend
         
-        # If no safety needed or just awareness, return RL action directly
-        # Let RL handle FREE, AWARE, and even light CAUTION
-        if blend < 0.05 or safety_state.zone in ["FREE", "AWARE"]:
+        # If no safety needed, return RL action directly
+        if blend < 0.01 or safety_state.zone == "FREE":
             self.intervention_history.append(0.0)
             return rl_v, rl_w, 0.0
         
-        # In CAUTION zone - very light intervention only if heading toward obstacle
-        if safety_state.zone == "CAUTION":
-            # Only intervene if RL is trying to go forward toward the obstacle
-            if rl_v > 0.1 and abs(safety_state.danger_direction) < math.pi / 4:
-                # Slightly reduce forward speed, but don't take over steering
-                blended_v = rl_v * 0.7
-                blended_w = rl_w  # Let RL steer
-                self.intervention_history.append(0.1)
-                return float(blended_v), float(blended_w), 0.1
+        # AWARE zone - very light steering suggestion, mostly let RL handle it
+        if safety_state.zone == "AWARE":
+            # Only intervene if going forward at decent speed
+            if rl_v > 0.1:
+                best_escape_angle, _ = self._find_escape_direction(safety_state)
+                # Very light suggestion - 5% influence
+                escape_w = np.clip(best_escape_angle * 0.8, -W_MAX * 0.3, W_MAX * 0.3)
+                blended_w = lerp(rl_w, escape_w, 0.05)
+                self.intervention_history.append(0.02)
+                return rl_v, float(blended_w), 0.02
             else:
-                # RL is avoiding or turning - let it
                 self.intervention_history.append(0.0)
                 return rl_v, rl_w, 0.0
         
-        # DANGER zone - moderate intervention
+        # In CAUTION zone - actively steer away from obstacles
+        if safety_state.zone == "CAUTION":
+            # Find best direction to go
+            best_escape_angle, best_clearance = self._find_escape_direction(safety_state)
+            
+            # If RL is going forward, guide it toward clear space
+            if rl_v > 0.02:
+                # Keep most of the speed
+                blended_v = rl_v * 0.85
+                
+                # Steer toward escape direction - more aggressive than before
+                escape_w = np.clip(best_escape_angle * 2.0, -W_MAX * 0.6, W_MAX * 0.6)
+                blended_w = lerp(rl_w, escape_w, 0.25)  # 25% escape influence
+                
+                self.intervention_history.append(0.15)
+                return float(blended_v), float(blended_w), 0.15
+            else:
+                # RL is stopping or backing up - let it, but maybe help turn
+                if abs(rl_w) < 0.5:  # Not already turning much
+                    # Suggest a turn direction
+                    escape_w = np.clip(best_escape_angle * 1.0, -W_MAX * 0.3, W_MAX * 0.3)
+                    blended_w = lerp(rl_w, escape_w, 0.15)
+                    self.intervention_history.append(0.05)
+                    return rl_v, float(blended_w), 0.05
+                else:
+                    self.intervention_history.append(0.0)
+                    return rl_v, rl_w, 0.0
+        
+        # DANGER zone - moderate intervention, find escape path
         if safety_state.zone == "DANGER":
             # Find best escape direction from sector distances
             best_escape_angle, best_clearance = self._find_escape_direction(safety_state)
             
-            # If best escape is forward-ish (within 90 degrees), slow down but go toward it
-            if abs(best_escape_angle) < math.pi / 2 and best_clearance > ZONE_EMERGENCY:
-                blended_v = rl_v * 0.4  # Slow down
-                blended_w = lerp(rl_w, best_escape_angle * 2.0, blend)
-            # If best escape is behind, back up toward it
-            elif best_clearance > ZONE_EMERGENCY:
-                blended_v = -V_MAX * 0.2
-                # Turn to face escape direction
-                if best_escape_angle > 0:
-                    blended_w = W_MAX * 0.4
-                else:
-                    blended_w = -W_MAX * 0.4
+            # Need at least CAUTION-level clearance to consider it a good escape
+            min_escape_clearance = ZONE_CAUTION
+            
+            # If there's a clear path forward-ish, steer toward it
+            if abs(best_escape_angle) < math.pi / 2 and best_clearance > min_escape_clearance:
+                blended_v = rl_v * 0.5  # Slow down but keep moving
+                escape_w = np.clip(best_escape_angle * 2.5, -W_MAX * 0.6, W_MAX * 0.6)
+                blended_w = lerp(rl_w, escape_w, blend)
+            # If escape is to the side or behind, turn toward it
+            elif best_clearance > ZONE_DANGER:
+                blended_v = rl_v * 0.3 if rl_v > 0 else -V_MAX * 0.15
+                blended_w = W_MAX * 0.5 if best_escape_angle > 0 else -W_MAX * 0.5
             else:
-                # No good escape - just stop and turn away from closest obstacle
+                # No good escape visible - slow down and turn away from danger
                 blended_v = 0.0
                 if safety_state.danger_direction > 0:
                     blended_w = -W_MAX * 0.5
@@ -581,28 +608,40 @@ class GraduatedSafetyBlender:
             # Find the clearest direction to escape
             best_escape_angle, best_clearance = self._find_escape_direction(safety_state)
             
+            # Need more clearance than just ZONE_EMERGENCY to consider it a valid escape
+            min_escape_clearance = ZONE_DANGER  # Need at least DANGER zone clearance
+            
             # Escape toward the clearest direction
-            if best_clearance > ZONE_EMERGENCY:
-                # There's a way out
+            if best_clearance > min_escape_clearance:
+                # There's a decent escape route
                 if abs(best_escape_angle) < math.pi / 3:
                     # Escape is ahead - slow forward while turning toward it
-                    blended_v = V_MAX * 0.15
-                    blended_w = np.clip(best_escape_angle * 4.0, -W_MAX * 0.8, W_MAX * 0.8)
+                    blended_v = V_MAX * 0.2
+                    blended_w = np.clip(best_escape_angle * 3.0, -W_MAX * 0.7, W_MAX * 0.7)
                 elif abs(best_escape_angle) < 2 * math.pi / 3:
-                    # Escape is to the side - stop and turn hard
+                    # Escape is to the side - turn in place toward it
                     blended_v = 0.0
-                    blended_w = W_MAX * 0.8 if best_escape_angle > 0 else -W_MAX * 0.8
+                    blended_w = W_MAX * 0.7 if best_escape_angle > 0 else -W_MAX * 0.7
                 else:
-                    # Escape is behind - back up while turning
-                    blended_v = -V_MAX * 0.25
+                    # Escape is behind - back up while turning to face it
+                    blended_v = -V_MAX * 0.2
                     blended_w = W_MAX * 0.5 if best_escape_angle > 0 else -W_MAX * 0.5
+            elif best_clearance > ZONE_EMERGENCY:
+                # Tight but there's something - slowly work toward it
+                blended_v = -V_MAX * 0.1  # Slow backup
+                blended_w = W_MAX * 0.6 if best_escape_angle > 0 else -W_MAX * 0.6
             else:
-                # Surrounded - just stop
-                blended_v = 0.0
-                blended_w = 0.0
+                # Truly surrounded - try to back out slowly while turning
+                # Don't just stop - that guarantees being stuck
+                blended_v = -V_MAX * 0.15
+                # Turn away from the closest obstacle
+                if safety_state.danger_direction > 0:
+                    blended_w = -W_MAX * 0.5  # Obstacle on left, turn right
+                else:
+                    blended_w = W_MAX * 0.5   # Obstacle on right, turn left
             
-            self.intervention_history.append(0.9)
-            return float(blended_v), float(blended_w), 0.9
+            self.intervention_history.append(0.85)
+            return float(blended_v), float(blended_w), 0.85
         
         # Fallback - shouldn't reach here
         self.intervention_history.append(0.0)
