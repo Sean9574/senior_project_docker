@@ -1040,7 +1040,7 @@ class SAM3GoalGeneratorV2(Node):
             self._last_detect_log_time = 0.0
         now = time.time()
         if now - self._last_detect_log_time > 5.0:  # Every 5 seconds
-            num_detections = len(masks) if masks is not None else 0
+            num_detections = len(overlays)  # Use overlays which contains all detections
             if num_detections > 0 and best_detection is None:
                 self.get_logger().warn(
                     f'[DETECT] SAM3 found {num_detections} "{prompt}" but none had valid depth/distance'
