@@ -107,10 +107,7 @@ R_REDETECTION = 300.0         # Bonus for re-finding a lost target
 PROGRESS_SCALE = 500.0        # Strong reward for getting closer to goal (was 300)
 ALIGN_SCALE = 15.0            # Strong reward for facing goal (was 5)
 STEP_COST = -0.5              # Higher step cost during goal mode - encourages efficiency
-GOAL_RADIUS = 0.80            # FIX Bug #3: Was 0.45m — dangerously close to goal_offset
-                               # of 0.5m. With depth noise and 2Hz goal updates, the robot
-                               # could be physically within reach but d_goal check failed
-                               # against stale/drifting coordinates. 0.8m gives proper margin.
+GOAL_RADIUS = 0.45            # Distance to count as "reached"
 
 # Bonus just for actively pursuing goal
 R_GOAL_PURSUIT = 2.0          # Per-step bonus when moving toward goal
@@ -150,31 +147,9 @@ GRID_RESOLUTION = 0.5
 GRID_MAX_RANGE = 12.0
 
 # Movement Limits
-V_MAX = 4.00
-W_MAX = 12.0
+V_MAX = 1.25
+W_MAX = 7.0
 V_MIN_REVERSE = -0.05
-
-# =============================================================================
-# CMD_VEL ADAPTIVE EXPONENTIAL MOVING AVERAGE SMOOTHER
-# =============================================================================
-# Instead of a fixed alpha, the smoother measures the actual time between the
-# last CMD_VEL_WINDOW topic publications and derives alpha on every call:
-#
-#     dt    = median interval across the last CMD_VEL_WINDOW publish timestamps
-#     alpha = 1 - exp(-dt / tau)
-#
-# This keeps the smoothing time-constant (tau) stable regardless of how fast
-# or slow the control loop is actually running — fully rate-agnostic.
-#
-# tau = 0.12 s  → light   (~1-2 publish lag at ~10 Hz)
-# tau = 0.20 s  → moderate
-# tau = 0.40 s  → heavy, robot feels floaty
-#
-# Linear and angular have separate taus. Angular is kept tighter so the robot
-# tracks turns responsively and doesn't fight the safety blender.
-CMD_VEL_WINDOW: int   = 50    # rolling window of publish timestamps to measure dt
-CMD_VEL_TAU_V:  float = 0.20  # linear  smoothing time-constant (seconds)
-CMD_VEL_TAU_W:  float = 0.12  # angular smoothing time-constant (seconds) — snappier
 
 # RND Config
 RND_WEIGHT_INITIAL = 1.0
@@ -281,14 +256,6 @@ class GraduatedSafetyBlender:
         # Logging
         self.last_safety_state: Optional[SafetyState] = None
         self.intervention_history = deque(maxlen=100)
-
-        # Turn-direction hysteresis — once we commit to turning a direction
-        # during obstacle avoidance, hold it for _escape_hold_steps steps
-        # before reconsidering. Prevents oscillation when the closest LIDAR
-        # point bounces between left/right walls on alternate scan cycles.
-        self._escape_turn_sign: float = 0.0   # +1 = turn left, -1 = turn right
-        self._escape_hold_steps: int  = 8     # steps to hold the chosen direction
-        self._escape_hold_count: int  = 0     # steps remaining on current hold
     
     def analyze_scan(self, scan: LaserScan) -> SafetyState:
         """
@@ -477,112 +444,108 @@ class GraduatedSafetyBlender:
     ) -> Tuple[float, float, float]:
         """
         Blend RL action with safety action based on current safety state.
-
+        
         Returns:
             (blended_v, blended_w, intervention_amount)
-
-        Turn-direction hysteresis: once a turn direction is chosen during
-        obstacle avoidance, it is locked in for _escape_hold_steps control
-        steps before being reconsidered. This prevents the oscillation that
-        occurs when the single closest LIDAR point alternates between the
-        left and right wall on consecutive scan cycles.
+        
+        intervention_amount: How much safety overrode RL (0-1)
         """
         blend = safety_state.safety_blend
-
-        # Free zone — pure RL, reset hysteresis
+        
+        # If no safety needed, return RL action directly
         if blend < 0.01:
-            self._escape_hold_count = 0
-            self._escape_turn_sign  = 0.0
             return rl_v, rl_w, 0.0
-
-        # ------------------------------------------------------------------ #
-        # 1. Determine escape turn direction with hysteresis                  #
-        # ------------------------------------------------------------------ #
-        if self._escape_hold_count > 0:
-            # Still committed to the previously chosen direction
-            turn_sign = self._escape_turn_sign
-            self._escape_hold_count -= 1
-        else:
-            # Choose fresh: turn away from the danger direction.
-            # danger_direction > 0 → obstacle is to the left → turn right (-1)
-            # danger_direction < 0 → obstacle is to the right → turn left (+1)
+        
+        # Compute safety action
+        safety_v = safety_state.repulsive_v
+        safety_w = safety_state.repulsive_w
+        
+        # If we have a goal and we're not in emergency, bias toward goal
+        if goal_angle is not None and safety_state.zone not in ["EMERGENCY", "CRITICAL"]:
+            # Add attractive component toward goal
+            goal_w = ATTRACTIVE_GAIN * math.sin(goal_angle) * W_MAX
+            safety_w = safety_w + goal_w * (1.0 - blend)
+        
+        # STALL PREVENTION: In CAUTION or worse, if blended action would be near-zero, force turning
+        if safety_state.zone in ["CAUTION", "DANGER", "EMERGENCY", "CRITICAL"]:
+            # Check if obstacle is ahead
+            danger_ahead = abs(safety_state.danger_direction) < math.pi / 3
+            
+            if danger_ahead:
+                # If RL wants forward and safety wants backward, we'll get ~0 velocity
+                # Force a strong turn instead of stalling
+                if rl_v > 0.1 and safety_v < 0:
+                    # Turn away from danger direction
+                    if safety_state.danger_direction > 0:
+                        safety_w = -W_MAX * 0.7  # Turn right (obstacle on left)
+                    else:
+                        safety_w = W_MAX * 0.7   # Turn left (obstacle on right)
+                    
+                    # Also allow slight backward motion to clear obstacle
+                    safety_v = -V_MAX * 0.2
+        
+        # ACTIVE ESCAPE: When very close, don't just block - actively move away!
+        if safety_state.zone in ["DANGER", "EMERGENCY", "CRITICAL"]:
+            # Override with strong escape behavior
+            escape_strength = 0.6 if safety_state.zone == "DANGER" else 0.9
+            
+            # Always back up when this close
+            safety_v = -V_MAX * 0.4 * escape_strength
+            
+            # Strong turn away from obstacle
             if safety_state.danger_direction > 0:
-                turn_sign = -1.0   # turn right
+                safety_w = -W_MAX * escape_strength  # Turn right
             else:
-                turn_sign = 1.0    # turn left
-
-            # Only lock in if we're actually intervening significantly
-            if blend >= 0.05:
-                self._escape_turn_sign  = turn_sign
-                self._escape_hold_count = self._escape_hold_steps
-
-        # ------------------------------------------------------------------ #
-        # 2. Build a single coherent safety command based on zone             #
-        # ------------------------------------------------------------------ #
-        zone = safety_state.zone
-
-        if zone in ["EMERGENCY", "CRITICAL"]:
-            # Full override — back up hard and spin away
-            safety_v   = -V_MAX * 0.5
-            safety_w   = turn_sign * W_MAX * 0.8
-            blend      = 0.98
-
-        elif zone == "DANGER":
-            # Strong escape — back up moderately and turn firmly
-            safety_v   = -V_MAX * 0.4 * 0.6
-            safety_w   = turn_sign * W_MAX * 0.6
-            blend      = max(blend, 0.6)
-
-        elif zone == "CAUTION":
-            # Gentle redirect — slow down and start turning
-            safety_v   = safety_state.repulsive_v
-            safety_w   = turn_sign * W_MAX * 0.5
-
-            # If RL is pushing forward into the obstacle, also add backward
-            if rl_v > 0.1 and abs(safety_state.danger_direction) < math.pi / 3:
-                safety_v = -V_MAX * 0.2
-
-        else:
-            # AWARE — light repulsion only, keep RL mostly in charge
-            safety_v = safety_state.repulsive_v
-            safety_w = safety_state.repulsive_w
-
-            # If we have a goal, add a gentle attractive component
-            if goal_angle is not None:
-                goal_w   = ATTRACTIVE_GAIN * math.sin(goal_angle) * W_MAX
-                safety_w = safety_w + goal_w * (1.0 - blend)
-
-        # ------------------------------------------------------------------ #
-        # 3. Blend and clamp                                                  #
-        # ------------------------------------------------------------------ #
+                safety_w = W_MAX * escape_strength   # Turn left
+            
+            # Higher blend to enforce escape
+            blend = max(blend, escape_strength)
+        
+        # In emergency/critical, maximum escape effort
+        if safety_state.zone in ["EMERGENCY", "CRITICAL"]:
+            # Full escape mode - ignore RL completely
+            blend = 0.98
+            safety_v = -V_MAX * 0.5  # Strong backup
+            
+            # Turn away from danger
+            if safety_state.danger_direction > 0:
+                safety_w = -W_MAX * 0.8  # Turn right
+            else:
+                safety_w = W_MAX * 0.8   # Turn left
+        
+        # Blend RL and safety actions
         blended_v = lerp(rl_v, safety_v, blend)
         blended_w = lerp(rl_w, safety_w, blend)
-
-        # Final stall guard — if everything cancelled out near an obstacle,
-        # force a spin to break free
-        if zone in ["CAUTION", "DANGER", "EMERGENCY", "CRITICAL"]:
+        
+        # FINAL STALL CHECK: If we're about to output near-zero velocity near obstacles, force movement
+        if safety_state.zone in ["CAUTION", "DANGER", "EMERGENCY", "CRITICAL"]:
             if abs(blended_v) < 0.1 and abs(blended_w) < 0.2:
-                blended_w = turn_sign * W_MAX * 0.6
-                blended_v = -V_MAX * 0.3
-
+                # Robot would stall - force active escape
+                if safety_state.danger_direction > 0:
+                    blended_w = -W_MAX * 0.6
+                else:
+                    blended_w = W_MAX * 0.6
+                blended_v = -V_MAX * 0.3  # Back up!
+        
+        # Apply velocity limits
         blended_v = np.clip(blended_v, V_MIN_REVERSE, V_MAX)
         blended_w = np.clip(blended_w, -W_MAX, W_MAX)
-
-        # ------------------------------------------------------------------ #
-        # 4. Intervention metric                                              #
-        # ------------------------------------------------------------------ #
+        
+        # Calculate how much we intervened
         original_magnitude = math.sqrt(rl_v**2 + rl_w**2)
-        diff_magnitude     = math.sqrt((rl_v - blended_v)**2 + (rl_w - blended_w)**2)
-
+        diff_magnitude = math.sqrt((rl_v - blended_v)**2 + (rl_w - blended_w)**2)
+        
         if original_magnitude > 0.01:
             intervention = diff_magnitude / (original_magnitude + 0.01)
         else:
             intervention = blend
-
-        intervention = float(np.clip(intervention, 0.0, 1.0))
+        
+        intervention = np.clip(intervention, 0.0, 1.0)
+        
+        # Track intervention
         self.intervention_history.append(intervention)
-
-        return float(blended_v), float(blended_w), intervention
+        
+        return float(blended_v), float(blended_w), float(intervention)
     
     def compute_proximity_reward(self, safety_state: SafetyState) -> float:
         """
@@ -682,173 +645,6 @@ class RewardNormalizer:
         std = np.sqrt(self.rms.var + 1e-8)
         normalized = reward / max(std, 1.0)
         return float(np.clip(normalized, -self.clip, self.clip))
-
-
-# =============================================================================
-# Exponential Moving Average Tracker
-# =============================================================================
-
-class EMATracker:
-    """
-    Tracks multiple named scalar metrics with exponential moving averages.
-
-    Two alpha values are maintained per metric so you get both a fast (reactive)
-    and a slow (trend) view in a single object:
-        fast_alpha  – high alpha (~0.10) → responds quickly, more noisy
-        slow_alpha  – low alpha  (~0.01) → stable long-run trend line
-
-    Standard EMA formula:
-        ema_new = alpha * new_value + (1 - alpha) * ema_old
-
-    Bias correction (identical to the Adam optimiser) is applied so that
-    early values aren't artificially pulled toward zero:
-        ema_corrected = ema_raw / (1 - (1 - alpha)^n)
-
-    After the first observation the corrected value equals the observation
-    exactly, so there is no cold-start distortion regardless of alpha.
-
-    Tracked episode metrics (updated once per episode):
-        episode_return   – total undiscounted reward
-        episode_steps    – number of control steps taken
-        goals_reached    – goals reached in the episode (0 or 1+)
-        success_rate     – 1.0 if goal reached, else 0.0
-        collision_rate   – 1.0 if collision termination, else 0.0
-        intervention_rate – mean safety-blend intervention across episode
-
-    Tracked step metrics (updated every gradient step):
-        critic_loss
-        actor_loss
-        rnd_loss
-
-    Usage:
-        ema = EMATracker(fast_alpha=0.10, slow_alpha=0.01)
-        ema.update("episode_return", 500.0)
-        ema.update("critic_loss",    0.032)
-        print(ema.report())     # compact string for ROS logger
-        d = ema.as_dict()       # flat dict → JSON / ROS topic payload
-    """
-
-    def __init__(self, fast_alpha: float = 0.10, slow_alpha: float = 0.01):
-        if not (0.0 < fast_alpha <= 1.0):
-            raise ValueError(f"fast_alpha must be in (0, 1], got {fast_alpha}")
-        if not (0.0 < slow_alpha <= 1.0):
-            raise ValueError(f"slow_alpha must be in (0, 1], got {slow_alpha}")
-
-        self.fast_alpha = fast_alpha
-        self.slow_alpha = slow_alpha
-
-        # Raw (un-corrected) EMA accumulators
-        self._fast: Dict[str, float] = {}
-        self._slow: Dict[str, float] = {}
-        # Number of updates per metric (for bias correction)
-        self._n: Dict[str, int] = {}
-
-    # ------------------------------------------------------------------
-    # Core update
-    # ------------------------------------------------------------------
-
-    def update(self, name: str, value: float) -> None:
-        """Push one new observation for metric `name`.
-
-        The accumulators are seeded at 0.0 (identical to Adam's m_0=0).
-        This makes the bias-correction formula exact:
-            corrected = raw / (1 - (1-alpha)^n)
-        On n=1:  raw = alpha*value,  correction = alpha  →  corrected = value  ✓
-        As n→∞:  correction → 1.0                        →  corrected = raw    ✓
-        """
-        if name not in self._fast:
-            # Initialise accumulators at 0 so bias correction is valid from step 1
-            self._fast[name] = 0.0
-            self._slow[name] = 0.0
-            self._n[name] = 0
-
-        self._n[name] += 1
-        self._fast[name] = (
-            self.fast_alpha * value + (1.0 - self.fast_alpha) * self._fast[name]
-        )
-        self._slow[name] = (
-            self.slow_alpha * value + (1.0 - self.slow_alpha) * self._slow[name]
-        )
-
-    def update_batch(self, metrics: Dict[str, float]) -> None:
-        """Update multiple metrics at once from a dict."""
-        for name, value in metrics.items():
-            self.update(name, value)
-
-    # ------------------------------------------------------------------
-    # Bias-corrected reads
-    # ------------------------------------------------------------------
-
-    def fast(self, name: str) -> Optional[float]:
-        """Bias-corrected fast EMA for `name`, or None if never updated."""
-        if name not in self._fast:
-            return None
-        n = self._n[name]
-        # On n==1 the raw value IS the observation so correction == 1.0 anyway
-        correction = 1.0 - (1.0 - self.fast_alpha) ** n
-        return self._fast[name] / correction
-
-    def slow(self, name: str) -> Optional[float]:
-        """Bias-corrected slow EMA for `name`, or None if never updated."""
-        if name not in self._slow:
-            return None
-        n = self._n[name]
-        correction = 1.0 - (1.0 - self.slow_alpha) ** n
-        return self._slow[name] / correction
-
-    def count(self, name: str) -> int:
-        """How many times metric `name` has been updated."""
-        return self._n.get(name, 0)
-
-    # ------------------------------------------------------------------
-    # Serialisation / reporting
-    # ------------------------------------------------------------------
-
-    def as_dict(self) -> Dict[str, float]:
-        """
-        Return all current EMA values as a flat dict.
-        Keys are  '<metric>_fast'  and  '<metric>_slow'.
-        Suitable for JSON serialisation or embedding in a ROS String message.
-        """
-        out: Dict[str, float] = {}
-        for name in sorted(self._fast.keys()):
-            fv = self.fast(name)
-            sv = self.slow(name)
-            if fv is not None:
-                out[f"{name}_fast"] = round(fv, 5)
-            if sv is not None:
-                out[f"{name}_slow"] = round(sv, 5)
-        return out
-
-    def report(self, names: Optional[List[str]] = None) -> str:
-        """
-        Compact human-readable string for the ROS logger.
-        Shows  name=fast(slow)  for every metric in `names`
-        (or all metrics if names is None).
-
-        Format examples:
-            episode_return=+312.4(+198.1)
-            success_rate=0.45(0.31)           ← auto-percent for *_rate metrics
-            critic_loss=0.0210(0.0184)        ← 4-decimal for small values
-        """
-        keys = names if names is not None else sorted(self._fast.keys())
-        parts: List[str] = []
-        for k in keys:
-            if k not in self._fast:
-                continue
-            fv = self.fast(k)
-            sv = self.slow(k)
-            if fv is None or sv is None:
-                continue
-            if k.endswith("_rate") or k.endswith("_pct"):
-                parts.append(f"{k}={fv:.1%}({sv:.1%})")
-            elif "return" in k:
-                parts.append(f"{k}={fv:+.1f}({sv:+.1f})")
-            elif abs(fv) < 0.1 and abs(fv) > 0.0:
-                parts.append(f"{k}={fv:.4f}({sv:.4f})")
-            else:
-                parts.append(f"{k}={fv:.3f}({sv:.3f})")
-        return "  ".join(parts) if parts else "(no data yet)"
 
 
 # =============================================================================
@@ -1383,7 +1179,7 @@ class EgoOccupancyGrid:
 
 class StretchRosInterface(Node):
     def __init__(self, ns: str = "", odom_topic="/odom", scan_topic="/scan_filtered",
-                 imu_topic="/imu_mobile_base", goal_topic="/goal", cmd_topic="/stretch/cmd_vel"):
+                 imu_topic="/imu_mobile_base", goal_topic="goal", cmd_topic="/stretch/cmd_vel"):
         super().__init__("learner_node")
         
         self.last_odom: Optional[Odometry] = None
@@ -1401,14 +1197,6 @@ class StretchRosInterface(Node):
         self._target_was_lost: bool = False
         self._lost_time: float = 0.0
         self.last_imu: Optional[Imu] = None
-
-        # cmd_vel EMA smoother state
-        self._smooth_v: float = 0.0
-        self._smooth_w: float = 0.0
-        # Rolling window of the last CMD_VEL_WINDOW publish timestamps (seconds).
-        # Used to measure the real inter-publish dt so alpha is derived from
-        # actual observed rate rather than an assumed Hz value.
-        self._cmd_ts: deque = deque(maxlen=CMD_VEL_WINDOW)
         
         def make_topic(topic: str) -> str:
             if topic.startswith("/"):
@@ -1435,7 +1223,6 @@ class StretchRosInterface(Node):
         self.cmd_pub = self.create_publisher(Twist, cmd_name, 10)
         self.reward_pub = self.create_publisher(Float32, "/reward", 10)
         self.reward_breakdown_pub = self.create_publisher(StringMsg, "/reward_breakdown", 10)
-        self.ema_pub = self.create_publisher(StringMsg, "/ema_stats", 10)  # EMA metrics for monitor
         
         self.map_pub = self.create_publisher(OccupancyGrid, "/exploration_map", 10)
         self.heatmap_pub = self.create_publisher(OccupancyGrid, "/visit_heatmap", 10)
@@ -1523,11 +1310,10 @@ class StretchRosInterface(Node):
     def _scan_cb(self, msg): self.last_scan = msg
     def _imu_cb(self, msg): self.last_imu = msg
     def _goal_cb(self, msg):
-        # FIX Bug #6: Previously this callback cleared _target_was_lost to False
-        # (via the condition below) before step() ever had a chance to grant the
-        # re-detection bonus.  The guard `self.last_goal is None` was already True
-        # on entry because we hadn't assigned it yet, so the flag was always wiped.
-        # Now we simply let step() handle the flag — don't touch it here at all.
+        # Track if this is a re-detection (we had lost the target)
+        if self._target_was_lost and self.last_goal is None:
+            self._target_was_lost = False  # Will trigger re-detection bonus
+            
         self.last_goal = msg
         self._last_goal_time = time.time()
         
@@ -1545,62 +1331,10 @@ class StretchRosInterface(Node):
         return False
     
     def send_cmd(self, v: float, w: float):
-        """
-        Publish a velocity command on /stretch/cmd_vel with adaptive EMA smoothing.
-
-        Alpha is derived from the median inter-publish interval measured over
-        the last CMD_VEL_WINDOW publishes, so the smoothing time-constant stays
-        consistent regardless of actual control loop speed:
-
-            dt    = median interval over last CMD_VEL_WINDOW timestamps
-            alpha = 1 - exp(-dt / tau)
-            smoothed = alpha * requested + (1 - alpha) * previous_smoothed
-
-        Hard zero commands (emergency stop / episode reset) bypass the EMA
-        completely and zero the state instantly — never damped.
-        """
-        now = time.time()
-        self._cmd_ts.append(now)
-
-        # Hard stop — bypass smoother, reset state, publish immediately
-        if v == 0.0 and w == 0.0:
-            self._smooth_v = 0.0
-            self._smooth_w = 0.0
-            msg = Twist()
-            self.cmd_pub.publish(msg)
-            return
-
-        # Compute median dt from the rolling timestamp window
-        if len(self._cmd_ts) >= 2:
-            intervals = [
-                self._cmd_ts[i] - self._cmd_ts[i - 1]
-                for i in range(1, len(self._cmd_ts))
-            ]
-            dt = float(np.median(intervals))
-            # Guard against zero or nonsense dt (e.g. two calls in the same ms)
-            dt = max(dt, 1e-4)
-        else:
-            # Not enough history yet — use a sensible default (10 Hz)
-            dt = 0.10
-
-        # Derive alphas from time-constant and measured dt
-        alpha_v = 1.0 - math.exp(-dt / CMD_VEL_TAU_V)
-        alpha_w = 1.0 - math.exp(-dt / CMD_VEL_TAU_W)
-
-        # Apply EMA
-        self._smooth_v = alpha_v * v + (1.0 - alpha_v) * self._smooth_v
-        self._smooth_w = alpha_w * w + (1.0 - alpha_w) * self._smooth_w
-
         msg = Twist()
-        msg.linear.x  = float(self._smooth_v)
-        msg.angular.z = float(self._smooth_w)
+        msg.linear.x = float(v)
+        msg.angular.z = float(w)
         self.cmd_pub.publish(msg)
-
-    def reset_cmd_smoother(self):
-        """Zero smoother state and timestamp history at episode boundaries."""
-        self._smooth_v = 0.0
-        self._smooth_w = 0.0
-        self._cmd_ts.clear()
 
 
 # =============================================================================
@@ -1698,23 +1432,7 @@ class StretchExploreEnv(gym.Env):
         self.episode_interventions = []
         self._goals_reached_this_episode = 0
         self._had_goal_last_step = False  # Track goal state transitions
-
-        # FIX Bug #1: Clear goal-reached cooldown between episodes.
-        # Without this, _last_goal_reached_pos persists across episodes and
-        # suppresses goal detection for the entire next episode if SAM3
-        # publishes a goal near the same position.
-        self._last_goal_reached_pos = None
-
-        # FIX Bug #5: Clear stale last-known-distance so the first-step
-        # progress reward in _compute_explore_reward isn't computed against
-        # a distance value left over from the previous episode.
-        if hasattr(self, '_prev_last_known_dist'):
-            del self._prev_last_known_dist
-
-        # Zero the cmd_vel EMA smoother so the previous episode's final
-        # velocity doesn't bleed into the first commands of the new one.
-        self.ros.reset_cmd_smoother()
-
+        
         self.occ_grid.decay_visits()
         
         self.prev_goal_dist = self._goal_distance()
@@ -2020,12 +1738,13 @@ class StretchExploreEnv(gym.Env):
             r_last_known_align = LAST_KNOWN_ALIGN_SCALE * math.cos(angle_to_last_known)
         
         # Collision - now based on ZONE_EMERGENCY (hard safety should prevent this)
-        r_collision = 0.0  # initialise here so it's always bound
         if self.last_safety_state and self.last_safety_state.min_distance < ZONE_EMERGENCY:
             if self.step_count > 10:
                 terminated = True
                 collision = True
                 r_collision = R_COLLISION_EXPLORE
+        else:
+            r_collision = 0.0
         
         reward = r_discovery + r_novelty + r_frontier + r_step + r_collision + r_rnd + r_movement + r_last_known_progress + r_last_known_align
         
@@ -2053,6 +1772,8 @@ class StretchExploreEnv(gym.Env):
         Compute reward for goal-seeking mode.
         PRIMARY: Get to the goal - this is ALL that matters now
         Exploration is DISABLED when we have a goal
+        
+        KEY FIX: Only reward alignment when moving forward, penalize spinning in place
         """
         reward = 0.0
         terminated = False
@@ -2066,27 +1787,43 @@ class StretchExploreEnv(gym.Env):
         progress = self.prev_goal_dist - d_goal
         r_progress = PROGRESS_SCALE * progress
         
-        # Alignment reward - facing the goal
-        r_align = ALIGN_SCALE * math.cos(ang)
+        # Alignment reward - ONLY when moving forward!
+        # This prevents the "spin in place" behavior
+        r_align = 0.0
+        if v_cmd > 0.15:  # Only reward alignment when moving forward
+            r_align = ALIGN_SCALE * math.cos(ang)
         
         # Step cost - higher during goal mode to encourage efficiency
         r_step = STEP_COST
         
+        # === ANTI-SPIN: Penalize spinning without forward motion ===
+        r_spin_penalty = 0.0
+        if v_cmd < 0.1 and abs(w_cmd) > 1.0:
+            # Spinning in place - bad!
+            r_spin_penalty = -8.0
+        
+        # === FORWARD MOTION BONUS ===
+        r_forward = 0.0
+        if v_cmd > 0.2:
+            r_forward = 3.0  # Reward for actually moving forward
+        elif v_cmd < 0.05 and abs(w_cmd) < 0.5:
+            r_forward = -2.0  # Penalize being stationary
+        
+        # === STALL PENALTY: Not making progress ===
+        r_stall = 0.0
+        if abs(progress) < 0.01 and v_cmd < 0.15:
+            r_stall = -3.0  # Penalize no progress
+        
         # Pursuit bonus - reward for actively moving toward goal
         r_pursuit = 0.0
         if progress > 0.01 and v_cmd > 0.1:  # Making progress and moving forward
-            r_pursuit = R_GOAL_PURSUIT
+            r_pursuit = R_GOAL_PURSUIT * 2  # Double bonus for actual progress
         elif progress < -0.01:  # Moving away from goal
-            r_pursuit = -R_GOAL_PURSUIT * 2  # Penalize moving away
+            r_pursuit = -R_GOAL_PURSUIT * 3  # Strong penalty for moving away
         
         r_goal = 0.0
         if d_goal <= GOAL_RADIUS:
             success = True
-            # FIX Bug #2: Terminate the episode immediately on success.
-            # Previously terminated stayed False, causing the episode to
-            # continue into explore mode while SAM3 immediately re-published
-            # the same goal, creating the suppression / reset loop.
-            terminated = True
             r_goal = R_GOAL
             
             self._goals_reached_this_episode += 1
@@ -2104,7 +1841,7 @@ class StretchExploreEnv(gym.Env):
             self.ros.last_goal = None
             
             self.ros.get_logger().info(
-                f"[GOAL REACHED #{self._goals_reached_this_episode}] dist={d_goal:.2f}m, reward={r_goal:.0f}, episode terminating"
+                f"[GOAL REACHED #{self._goals_reached_this_episode}] dist={d_goal:.2f}m, reward={r_goal:.0f}, continuing exploration"
             )
         
         # === NO EXPLORATION REWARDS DURING GOAL MODE ===
@@ -2128,7 +1865,8 @@ class StretchExploreEnv(gym.Env):
         self.prev_goal_dist = d_goal
         
         # Combine: ONLY goal-seeking rewards, no exploration
-        reward = r_progress + r_align + r_step + r_pursuit + r_goal + r_collision + r_timeout
+        reward = (r_progress + r_align + r_step + r_pursuit + r_goal + 
+                  r_collision + r_timeout + r_spin_penalty + r_forward + r_stall)
         
         info = {
             "collision": collision,
@@ -2143,6 +1881,9 @@ class StretchExploreEnv(gym.Env):
                 "goal": r_goal,
                 "collision": r_collision,
                 "timeout": r_timeout,
+                "spin_penalty": r_spin_penalty,
+                "forward_bonus": r_forward,
+                "stall_penalty": r_stall,
             }
         }
         
@@ -2593,7 +2334,7 @@ def main():
     parser.add_argument("--odom-topic", type=str, default="/stretch/odom")
     parser.add_argument("--lidar-topic", type=str, default="/stretch/scan")
     parser.add_argument("--imu-topic", type=str, default="/imu_mobile_base")
-    parser.add_argument("--goal-topic", type=str, default="/goal")
+    parser.add_argument("--goal-topic", type=str, default="goal")
     parser.add_argument("--cmd-topic", type=str, default="/stretch/cmd_vel")
     
     # Training
@@ -2607,7 +2348,7 @@ def main():
     parser.add_argument("--save-every", type=int, default=10_000)
     
     # Checkpoint
-    parser.add_argument("--ckpt-dir", type=str, default="/home/sean/ament_ws/src/stretch_ros2/senior_project/parallel_training")
+    parser.add_argument("--ckpt-dir", type=str, default=os.path.expanduser("~/rl_checkpoints"))
     parser.add_argument("--seed", type=int, default=42)
     
     # Mode
@@ -2665,28 +2406,13 @@ def main():
     replay = PrioritizedReplayBuffer(obs_dim, act_dim, size=args.replay_size, device=device)
     
     # Load checkpoint
-    # Priority: --load-ckpt explicit path > AUTO_LOAD from ckpt_dir
-    load_path = None
-    if args.load_ckpt and os.path.exists(args.load_ckpt):
-        # Explicit path passed via --load-ckpt (e.g. from launch file or CLI)
-        load_path = args.load_ckpt
-        ros.get_logger().info(f"[CKPT] Explicit load path: {load_path}")
-    elif AUTO_LOAD_CHECKPOINT and os.path.exists(ckpt_path):
-        # Auto-load from the default ckpt_dir location
-        load_path = ckpt_path
-        ros.get_logger().info(f"[CKPT] Auto-load path: {load_path}")
-    else:
-        ros.get_logger().info(
-            f"[CKPT] No checkpoint found — starting fresh"
-            f" (looked for: {args.load_ckpt or 'n/a'}, {ckpt_path})"
-        )
-
-    if load_path is not None:
+    if AUTO_LOAD_CHECKPOINT and os.path.exists(ckpt_path):
+        ros.get_logger().info(f"[CKPT] Loading from {ckpt_path}")
         try:
-            agent.load(load_path, strict=False)
-            ros.get_logger().info(f"[CKPT] Load SUCCESS from {load_path}")
+            agent.load(ckpt_path, strict=False)
+            ros.get_logger().info("[CKPT] Load SUCCESS")
         except Exception as e:
-            ros.get_logger().warn(f"[CKPT] Load FAILED: {e}")
+            ros.get_logger().warn(f"[CKPT] Load FAILED (model architecture changed?): {e}")
     
     # Shutdown handler
     def shutdown_and_save(signum=None, frame=None):
@@ -2734,20 +2460,6 @@ def main():
     ros.get_logger().info("[MODE] TRAINING (with graduated safety)")
     obs, _ = env.reset()
     last_save = 0
-
-    # ------------------------------------------------------------------ #
-    # Exponential Moving Average tracker                                   #
-    # fast_alpha=0.10  → ~10-episode window  (reactive, shows recent trend)
-    # slow_alpha=0.01  → ~100-episode window (stable long-run baseline)   #
-    # ------------------------------------------------------------------ #
-    ema = EMATracker(fast_alpha=0.10, slow_alpha=0.01)
-
-    # Accumulators for the current in-progress episode
-    _ep_return: float = 0.0
-    _ep_steps:  int   = 0
-    _ep_critic_losses: List[float] = []
-    _ep_actor_losses:  List[float] = []
-    _ep_rnd_losses:    List[float] = []
     
     for t in range(1, args.total_steps + 1):
         # Random actions at start
@@ -2760,10 +2472,6 @@ def main():
         
         next_obs, reward, terminated, truncated, info = env.step(act)
         done = terminated or truncated
-
-        # Track episode accumulators
-        _ep_return += reward
-        _ep_steps  += 1
         
         replay.add(
             obs, act,
@@ -2775,55 +2483,14 @@ def main():
         obs = next_obs
         
         if done:
-            # ---- Update EMA with episode-level metrics ----------------
-            ema.update("episode_return",    _ep_return)
-            ema.update("episode_steps",     float(_ep_steps))
-            ema.update("goals_reached",     float(env._goals_reached_this_episode))
-            ema.update("success_rate",      1.0 if info.get("success", False) else 0.0)
-            ema.update("collision_rate",    1.0 if info.get("collision", False) else 0.0)
-            avg_int = float(np.mean(env.episode_interventions)) if env.episode_interventions else 0.0
-            ema.update("intervention_rate", avg_int)
-
-            # If we accumulated any loss values this episode, push their mean
-            if _ep_critic_losses:
-                ema.update("critic_loss", float(np.mean(_ep_critic_losses)))
-            if _ep_actor_losses:
-                # actor_loss is 0.0 when actor wasn't updated (policy_delay),
-                # filter those out so we only average real gradient steps
-                real_actor = [v for v in _ep_actor_losses if v != 0.0]
-                if real_actor:
-                    ema.update("actor_loss", float(np.mean(real_actor)))
-            if _ep_rnd_losses:
-                ema.update("rnd_loss", float(np.mean(_ep_rnd_losses)))
-
-            # Publish EMA snapshot to /ema_stats for the reward monitor
-            ema_msg = StringMsg()
-            ema_dict = ema.as_dict()
-            ema_dict["episode"] = env.episode_index
-            ema_dict["total_steps"] = t
-            ema_msg.data = json.dumps(ema_dict)
-            ros.ema_pub.publish(ema_msg)
-
-            # Reset per-episode accumulators
-            _ep_return = 0.0
-            _ep_steps  = 0
-            _ep_critic_losses.clear()
-            _ep_actor_losses.clear()
-            _ep_rnd_losses.clear()
-
             obs, _ = env.reset()
         
         # Update
         if t >= args.update_after and t % args.update_every == 0 and replay.count >= args.batch_size:
             beta = PER_BETA_START + (PER_BETA_END - PER_BETA_START) * (t / args.total_steps)
             critic_loss, actor_loss, rnd_loss = agent.update(replay, args.batch_size, beta)
-
-            # Accumulate losses for end-of-episode EMA update
-            _ep_critic_losses.append(critic_loss)
-            _ep_actor_losses.append(actor_loss)
-            _ep_rnd_losses.append(rnd_loss)
         
-        # Save + EMA report
+        # Save
         if t - last_save >= args.save_every:
             last_save = t
             stats = env.occ_grid.get_stats()
@@ -2831,18 +2498,6 @@ def main():
             ros.get_logger().info(
                 f"[CKPT] step={t} cells={stats['total_discovered']} "
                 f"intervention={avg_intervention:.1%}"
-            )
-            # Log EMA report — shows fast(slow) for every tracked metric
-            ep_keys = [
-                "episode_return", "episode_steps", "goals_reached",
-                "success_rate", "collision_rate", "intervention_rate",
-            ]
-            loss_keys = ["critic_loss", "actor_loss", "rnd_loss"]
-            ros.get_logger().info(
-                f"[EMA] episodes: {ema.report(ep_keys)}"
-            )
-            ros.get_logger().info(
-                f"[EMA] losses:   {ema.report(loss_keys)}"
             )
             try:
                 agent.save(ckpt_path + ".tmp")
