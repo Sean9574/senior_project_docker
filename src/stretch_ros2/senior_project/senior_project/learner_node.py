@@ -1968,13 +1968,12 @@ class StretchExploreEnv(gym.Env):
                 r_last_known_forward = 2.0  # Moving toward last known position!
         
         # Collision - now based on ZONE_EMERGENCY (hard safety should prevent this)
+        r_collision = 0.0  # Initialize first
         if self.last_safety_state and self.last_safety_state.min_distance < ZONE_EMERGENCY:
             if self.step_count > 10:
                 terminated = True
                 collision = True
                 r_collision = R_COLLISION_EXPLORE
-        else:
-            r_collision = 0.0
         
         reward = (r_discovery + r_novelty + r_frontier + r_step + r_collision + r_rnd + 
                   r_movement + r_spin_penalty + r_last_known_progress + r_last_known_align + r_last_known_forward)
