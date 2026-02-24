@@ -243,6 +243,7 @@ class SAM3GoalGeneratorV2(Node):
         self.robot_y = 0.0
         self.robot_yaw = 0.0
         self.goal_sent = False
+        self._goal_published_this_detection = False  # Only publish goal once per detection
 
         self.depth_camera_available = False
         self._last_depth_msg_time = 0.0
@@ -510,11 +511,13 @@ class SAM3GoalGeneratorV2(Node):
     def target_callback(self, msg: String):
         self.target = msg.data
         self.goal_sent = False
+        self._goal_published_this_detection = False  # Reset so new target gets a goal
         self.set_sam3_prompt(self.target)
         self.get_logger().info(f'Target changed to: "{self.target}"')
     
     def goal_reached_callback(self, msg: PointStamped):
         """Called when learner node reports goal reached - cycle to next target."""
+        self._goal_published_this_detection = False  # Reset for next detection
         if self.target_cycle_on_reach and len(self.target_list) > 1:
             self.cycle_target()
     
@@ -528,6 +531,7 @@ class SAM3GoalGeneratorV2(Node):
         
         self.target = new_target
         self.goal_sent = False
+        self._goal_published_this_detection = False  # Reset so new target gets a goal
         self.set_sam3_prompt(self.target)
         self.get_logger().info(f'[CYCLE] Target cycled to: "{self.target}" ({self.current_target_index + 1}/{len(self.target_list)})')
 
@@ -1035,38 +1039,17 @@ class SAM3GoalGeneratorV2(Node):
                 'goal_position': [float(goal_x), float(goal_y)]
             }
 
-            # Only publish goal if position changed significantly (>0.5m) or first detection
-            # This prevents goal spam and drift
+            # Only publish goal ONCE when target is first detected
+            # Do NOT continuously update - the learner tracks the goal in odom frame
             if self.auto_publish:
-                should_publish = False
+                if not hasattr(self, '_goal_published_this_detection'):
+                    self._goal_published_this_detection = False
                 
-                if not hasattr(self, '_last_published_goal'):
-                    self._last_published_goal = None
-                    self._last_publish_time = 0.0
-                
-                current_time = time.time()
-                
-                if self._last_published_goal is None:
-                    should_publish = True
-                    self.get_logger().info(f'[GOAL] First detection - publishing goal at ({goal_x:.2f}, {goal_y:.2f})')
-                else:
-                    last_x, last_y = self._last_published_goal
-                    dist_change = math.sqrt((goal_x - last_x)**2 + (goal_y - last_y)**2)
-                    time_since_publish = current_time - self._last_publish_time
-                    
-                    # Only update if moved >50cm OR it's been more than 5 seconds
-                    if dist_change > 0.5:
-                        should_publish = True
-                        self.get_logger().info(f'[GOAL] Target moved {dist_change:.2f}m - updating goal')
-                    elif time_since_publish > 5.0:
-                        # Periodic refresh to keep goal alive
-                        should_publish = True
-                
-                if should_publish:
+                if not self._goal_published_this_detection:
                     self.publish_goal(goal_x, goal_y)
-                    self._last_published_goal = (goal_x, goal_y)
-                    self._last_publish_time = current_time
+                    self._goal_published_this_detection = True
                     self.goal_sent = True
+                    self.get_logger().info(f'[GOAL] Target detected - publishing goal at ({goal_x:.2f}, {goal_y:.2f})')
         else:
             status = {
                 'found': False,
@@ -1074,6 +1057,9 @@ class SAM3GoalGeneratorV2(Node):
                 'available_methods': depth_status,
                 'message': 'Object not found in valid range'
             }
+            
+            # Reset so next detection publishes a new goal
+            self._goal_published_this_detection = False
 
         self.status_pub.publish(String(data=json.dumps(status)))
 

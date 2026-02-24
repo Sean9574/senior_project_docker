@@ -62,27 +62,28 @@ MIN_SAFE_DISTANCE = ROBOT_HALF_WIDTH_M + DESIRED_CLEARANCE_M  # ~0.41m
 
 # =============================================================================
 # SAFETY ZONE THRESHOLDS (from LIDAR/center of robot)
+# RELAXED - only intervene when actually about to collide
 # =============================================================================
 
-ZONE_FREE = 1.0         # Full RL control
-ZONE_AWARE = 0.70       # Gentle safety influence begins
-ZONE_CAUTION = 0.50     # Blended control - turning starts here
-ZONE_DANGER = 0.38      # Safety takes priority - strong turning
-ZONE_EMERGENCY = 0.25   # Hard override - about to collide
+ZONE_FREE = 0.8         # Full RL control (reduced from 1.0)
+ZONE_AWARE = 0.50       # Just monitoring, no intervention (reduced from 0.70)
+ZONE_CAUTION = 0.35     # Light guidance (reduced from 0.50)
+ZONE_DANGER = 0.25      # Safety takes priority (reduced from 0.38)
+ZONE_EMERGENCY = 0.18   # Hard override - truly about to collide (reduced from 0.25)
 
-# Safety blend ratios - LOW for learning, but STRONG emergency stop
+# Safety blend ratios - MUCH LOWER to trust RL and reduce jitter
 BLEND_FREE = 0.0        # 0% safety
-BLEND_AWARE = 0.05      # 5% safety - barely noticeable
-BLEND_CAUTION = 0.20    # 20% safety - turning behavior active
-BLEND_DANGER = 0.50     # 50% safety - strong turning
-BLEND_EMERGENCY = 0.98  # 98% safety - HARD STOP to prevent collision
+BLEND_AWARE = 0.0       # 0% safety - just monitoring
+BLEND_CAUTION = 0.08    # 8% safety - very light (was 20%)
+BLEND_DANGER = 0.25     # 25% safety - moderate (was 50%)
+BLEND_EMERGENCY = 0.90  # 90% safety - emergency only (was 98%)
 
 # =============================================================================
-# POTENTIAL FIELD PARAMETERS (BALANCED)
+# POTENTIAL FIELD PARAMETERS - REDUCED to minimize jitter
 # =============================================================================
 
-REPULSIVE_GAIN = 1.2           # Moderate obstacle repulsion
-REPULSIVE_INFLUENCE = 0.9      # Start repelling earlier
+REPULSIVE_GAIN = 0.6           # Lower repulsion (was 1.2)
+REPULSIVE_INFLUENCE = 0.6      # Smaller influence radius (was 0.9)
 ATTRACTIVE_GAIN = 0.8          # Strong goal attraction
 
 # =============================================================================
@@ -518,142 +519,127 @@ class GraduatedSafetyBlender:
     ) -> Tuple[float, float, float]:
         """
         Blend RL action with safety action based on current safety state.
-        Uses smart gap-finding to navigate around obstacles toward goal.
+        
+        SIMPLIFIED: Only intervene in DANGER/EMERGENCY, let RL handle everything else.
+        This reduces jitter and lets RL learn proper navigation.
         
         Returns:
             (blended_v, blended_w, intervention_amount)
-        
-        intervention_amount: How much safety overrode RL (0-1)
         """
         blend = safety_state.safety_blend
         
-        # If no safety needed, return RL action directly
-        if blend < 0.01:
+        # If no safety needed or just awareness, return RL action directly
+        # Let RL handle FREE, AWARE, and even light CAUTION
+        if blend < 0.05 or safety_state.zone in ["FREE", "AWARE"]:
+            self.intervention_history.append(0.0)
             return rl_v, rl_w, 0.0
         
-        # Default safety action from repulsive field
-        safety_v = safety_state.repulsive_v
-        safety_w = safety_state.repulsive_w
-        
-        # SMART NAVIGATION: Use LIDAR to find clear directions
-        if ranges is not None and angles is not None and safety_state.zone in ["CAUTION", "DANGER", "EMERGENCY", "CRITICAL"]:
-            # Find best clear direction, considering goal if we have one
-            best_angle, clearance = self._find_best_direction(
-                ranges, angles, 
-                goal_angle=goal_angle,
-                min_clearance=ZONE_CAUTION  # Need this much space to navigate
-            )
-            
-            # Calculate turn needed to face best direction
-            turn_to_best = best_angle  # Already in robot frame
-            
-            # Smart escape: Turn toward best direction AND move
-            if clearance > ZONE_DANGER:
-                # There's a clear path - navigate through it
-                # Turn toward the clear direction
-                safety_w = np.clip(turn_to_best * 3.0, -W_MAX * 0.8, W_MAX * 0.8)
-                
-                # Move forward if we're roughly facing the clear direction
-                if abs(turn_to_best) < math.pi / 3:
-                    # Good alignment with clear direction - move forward!
-                    safety_v = V_MAX * 0.3 * (1.0 - abs(turn_to_best) / (math.pi / 3))
-                else:
-                    # Need to turn more - slow down or stop
-                    safety_v = 0.0
+        # In CAUTION zone - very light intervention only if heading toward obstacle
+        if safety_state.zone == "CAUTION":
+            # Only intervene if RL is trying to go forward toward the obstacle
+            if rl_v > 0.1 and abs(safety_state.danger_direction) < math.pi / 4:
+                # Slightly reduce forward speed, but don't take over steering
+                blended_v = rl_v * 0.7
+                blended_w = rl_w  # Let RL steer
+                self.intervention_history.append(0.1)
+                return float(blended_v), float(blended_w), 0.1
             else:
-                # No good clear path - back up while turning
-                safety_v = -V_MAX * 0.3
-                safety_w = np.clip(turn_to_best * 2.0, -W_MAX * 0.7, W_MAX * 0.7)
+                # RL is avoiding or turning - let it
+                self.intervention_history.append(0.0)
+                return rl_v, rl_w, 0.0
         
-        # ACTIVE ESCAPE in danger zones - but smarter
-        if safety_state.zone in ["DANGER", "EMERGENCY", "CRITICAL"]:
-            escape_strength = 0.6 if safety_state.zone == "DANGER" else 0.9
+        # DANGER zone - moderate intervention
+        if safety_state.zone == "DANGER":
+            # Find best escape direction from sector distances
+            best_escape_angle, best_clearance = self._find_escape_direction(safety_state)
             
-            # If we found a clear direction via LIDAR, prefer that
-            if ranges is not None and angles is not None:
-                best_angle, clearance = self._find_best_direction(
-                    ranges, angles,
-                    goal_angle=goal_angle,
-                    min_clearance=ZONE_DANGER
-                )
-                
-                # Turn toward best direction aggressively
-                safety_w = np.clip(best_angle * 4.0, -W_MAX * escape_strength, W_MAX * escape_strength)
-                
-                # Only back up if best direction is behind us
-                if abs(best_angle) > math.pi / 2:
-                    safety_v = -V_MAX * 0.4 * escape_strength
+            # If best escape is forward-ish (within 90 degrees), slow down but go toward it
+            if abs(best_escape_angle) < math.pi / 2 and best_clearance > ZONE_EMERGENCY:
+                blended_v = rl_v * 0.4  # Slow down
+                blended_w = lerp(rl_w, best_escape_angle * 2.0, blend)
+            # If best escape is behind, back up toward it
+            elif best_clearance > ZONE_EMERGENCY:
+                blended_v = -V_MAX * 0.2
+                # Turn to face escape direction
+                if best_escape_angle > 0:
+                    blended_w = W_MAX * 0.4
                 else:
-                    # Clear path is ahead/side - slow forward or stop is ok
-                    safety_v = 0.0
+                    blended_w = -W_MAX * 0.4
             else:
-                # No LIDAR data - use danger direction
-                safety_v = -V_MAX * 0.4 * escape_strength
+                # No good escape - just stop and turn away from closest obstacle
+                blended_v = 0.0
                 if safety_state.danger_direction > 0:
-                    safety_w = -W_MAX * escape_strength
+                    blended_w = -W_MAX * 0.5
                 else:
-                    safety_w = W_MAX * escape_strength
+                    blended_w = W_MAX * 0.5
             
-            # Higher blend to enforce escape
-            blend = max(blend, escape_strength)
+            self.intervention_history.append(blend)
+            return float(blended_v), float(blended_w), float(blend)
         
-        # In emergency/critical, maximum escape effort
+        # EMERGENCY - hard override to prevent collision, but SMART about it
         if safety_state.zone in ["EMERGENCY", "CRITICAL"]:
-            blend = 0.98
-            # Still use smart direction if available
-            if ranges is not None and angles is not None:
-                best_angle, _ = self._find_best_direction(ranges, angles, goal_angle=goal_angle, min_clearance=0.3)
-                safety_w = np.clip(best_angle * 5.0, -W_MAX * 0.9, W_MAX * 0.9)
-                safety_v = -V_MAX * 0.4  # Back up
+            # Find the clearest direction to escape
+            best_escape_angle, best_clearance = self._find_escape_direction(safety_state)
+            
+            # Escape toward the clearest direction
+            if best_clearance > ZONE_EMERGENCY:
+                # There's a way out
+                if abs(best_escape_angle) < math.pi / 3:
+                    # Escape is ahead - slow forward while turning toward it
+                    blended_v = V_MAX * 0.15
+                    blended_w = np.clip(best_escape_angle * 4.0, -W_MAX * 0.8, W_MAX * 0.8)
+                elif abs(best_escape_angle) < 2 * math.pi / 3:
+                    # Escape is to the side - stop and turn hard
+                    blended_v = 0.0
+                    blended_w = W_MAX * 0.8 if best_escape_angle > 0 else -W_MAX * 0.8
+                else:
+                    # Escape is behind - back up while turning
+                    blended_v = -V_MAX * 0.25
+                    blended_w = W_MAX * 0.5 if best_escape_angle > 0 else -W_MAX * 0.5
             else:
-                safety_v = -V_MAX * 0.5
-                if safety_state.danger_direction > 0:
-                    safety_w = -W_MAX * 0.8
-                else:
-                    safety_w = W_MAX * 0.8
+                # Surrounded - just stop
+                blended_v = 0.0
+                blended_w = 0.0
+            
+            self.intervention_history.append(0.9)
+            return float(blended_v), float(blended_w), 0.9
         
-        # Blend RL and safety actions
-        blended_v = lerp(rl_v, safety_v, blend)
-        blended_w = lerp(rl_w, safety_w, blend)
+        # Fallback - shouldn't reach here
+        self.intervention_history.append(0.0)
+        return rl_v, rl_w, 0.0
+    
+    def _find_escape_direction(self, safety_state: SafetyState) -> Tuple[float, float]:
+        """
+        Find the best direction to escape based on sector distances.
+        Returns (angle_to_escape, clearance_in_that_direction)
+        Angle is in robot frame: 0=front, positive=left, negative=right
+        """
+        sectors = safety_state.sector_distances
+        if sectors is None or len(sectors) == 0:
+            # No data - default to turning away from danger
+            if safety_state.danger_direction > 0:
+                return -math.pi / 2, 0.5  # Turn right
+            else:
+                return math.pi / 2, 0.5   # Turn left
         
-        # FINAL CHECK: Ensure we're not stalling when there's a clear path
-        if safety_state.zone in ["CAUTION", "DANGER"]:
-            if abs(blended_v) < 0.1 and abs(blended_w) < 0.2:
-                # About to stall - pick any clear direction
-                if ranges is not None and angles is not None:
-                    best_angle, _ = self._find_best_direction(ranges, angles, goal_angle=goal_angle, min_clearance=0.4)
-                    blended_w = np.clip(best_angle * 3.0, -W_MAX * 0.6, W_MAX * 0.6)
-                    if abs(best_angle) < math.pi / 2:
-                        blended_v = V_MAX * 0.2  # Path ahead - go!
-                    else:
-                        blended_v = -V_MAX * 0.2  # Path behind - back up
-                else:
-                    # Fallback
-                    if safety_state.danger_direction > 0:
-                        blended_w = -W_MAX * 0.6
-                    else:
-                        blended_w = W_MAX * 0.6
-                    blended_v = -V_MAX * 0.3
+        # Find sector with maximum clearance
+        num_sectors = len(sectors)
+        best_idx = int(np.argmax(sectors))
+        best_clearance = float(sectors[best_idx])
         
-        # Apply velocity limits
-        blended_v = np.clip(blended_v, V_MIN_REVERSE, V_MAX)
-        blended_w = np.clip(blended_w, -W_MAX, W_MAX)
+        # Convert sector index to angle
+        # Sectors are indexed with: sector_idx = int((angle + π) / sector_width)
+        # So angle = (sector_idx * sector_width) - π
+        sector_width = 2 * math.pi / num_sectors
+        best_angle = (best_idx * sector_width) - math.pi + (sector_width / 2)  # Center of sector
         
-        # Calculate how much we intervened
-        original_magnitude = math.sqrt(rl_v**2 + rl_w**2)
-        diff_magnitude = math.sqrt((rl_v - blended_v)**2 + (rl_w - blended_w)**2)
+        # Normalize to [-pi, pi]
+        while best_angle > math.pi:
+            best_angle -= 2 * math.pi
+        while best_angle < -math.pi:
+            best_angle += 2 * math.pi
         
-        if original_magnitude > 0.01:
-            intervention = diff_magnitude / (original_magnitude + 0.01)
-        else:
-            intervention = blend
-        
-        intervention = np.clip(intervention, 0.0, 1.0)
-        
-        # Track intervention
-        self.intervention_history.append(intervention)
-        
-        return float(blended_v), float(blended_w), float(intervention)
+        return best_angle, best_clearance
     
     def compute_proximity_reward(self, safety_state: SafetyState) -> float:
         """
