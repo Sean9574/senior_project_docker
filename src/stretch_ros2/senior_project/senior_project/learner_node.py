@@ -65,11 +65,11 @@ MIN_SAFE_DISTANCE = ROBOT_HALF_WIDTH_M + DESIRED_CLEARANCE_M  # ~0.41m
 # REACT EARLY but GENTLY - don't wait until too close
 # =============================================================================
 
-ZONE_FREE = 1.0         # Full RL control
-ZONE_AWARE = 0.70       # Start monitoring
-ZONE_CAUTION = 0.50     # Light guidance begins HERE - early enough to steer
-ZONE_DANGER = 0.35      # Stronger guidance
-ZONE_EMERGENCY = 0.22   # Hard override - last resort
+ZONE_FREE = 1.2         # Full RL control
+ZONE_AWARE = 0.90       # Start monitoring
+ZONE_CAUTION = 0.65     # Light guidance begins - early enough to steer
+ZONE_DANGER = 0.45      # Stronger guidance - actively avoiding
+ZONE_EMERGENCY = 0.30   # Hard override - last resort
 
 # Safety blend ratios - GENTLE intervention, escalates gradually
 BLEND_FREE = 0.0        # 0% safety
@@ -268,10 +268,6 @@ class DynamicNavigator:
         # History for logging
         self.intervention_history = deque(maxlen=100)
         self.last_nav_state: Optional[NavigationState] = None
-        
-        # Smoothing for velocity commands
-        self._prev_safe_v = 0.0
-        self._prev_safe_w = 0.0
     
     def analyze_scan(self, scan: Optional[LaserScan]) -> NavigationState:
         """
@@ -512,106 +508,160 @@ class DynamicNavigator:
         Returns (v, w, intervention_amount)
         """
         blend = nav_state.safety_blend
+        min_dist = nav_state.min_distance
         
-        # Very safe - just use RL
+        # === CRITICAL ZONE - Hard override, no blending ===
+        if min_dist < ZONE_EMERGENCY:
+            return self._emergency_escape(nav_state, goal_angle)
+        
+        # === DANGER ZONE - Strong intervention ===
+        if min_dist < ZONE_DANGER:
+            return self._danger_avoidance(nav_state, rl_v, rl_w, goal_angle)
+        
+        # === CAUTION ZONE - Active steering ===
+        if min_dist < ZONE_CAUTION:
+            return self._caution_steering(nav_state, rl_v, rl_w, goal_angle)
+        
+        # === AWARE/FREE ZONE - Light or no intervention ===
         if blend < 0.02:
             self.intervention_history.append(0.0)
             return rl_v, rl_w, 0.0
         
-        # Recompute best direction with goal info
+        # Light steering suggestion
         best_dir, best_clearance = self._select_best_direction(
-            nav_state.sector_distances,
-            nav_state.clear_gaps,
-            goal_angle
+            nav_state.sector_distances, nav_state.clear_gaps, goal_angle
         )
         
-        # Compute navigation velocity toward best direction
-        nav_v, nav_w = self._compute_nav_velocity(
-            nav_state, best_dir, best_clearance, goal_angle
-        )
+        # Very light turn suggestion if obstacle ahead
+        if abs(nav_state.min_angle) < math.pi / 3 and rl_v > 0.1:
+            suggested_w = np.clip(best_dir * 1.5, -W_MAX * 0.4, W_MAX * 0.4)
+            blended_w = lerp(rl_w, suggested_w, 0.1)
+            self.intervention_history.append(0.05)
+            return rl_v, float(blended_w), 0.05
         
-        # Blend RL and navigation
-        blended_v = lerp(rl_v, nav_v, blend)
-        blended_w = lerp(rl_w, nav_w, blend)
-        
-        # === Additional Safety Checks ===
-        
-        # 1. Don't accelerate toward close obstacles
-        if nav_state.min_distance < ZONE_CAUTION:
-            # Is closest obstacle roughly ahead?
-            if abs(nav_state.min_angle) < math.pi / 3:
-                if blended_v > 0:
-                    # Scale down based on proximity
-                    proximity_scale = nav_state.min_distance / ZONE_CAUTION
-                    blended_v *= proximity_scale
-        
-        # 2. In danger zone, limit forward speed
-        if nav_state.min_distance < ZONE_DANGER:
-            blended_v = min(blended_v, V_MAX * 0.3)
-        
-        # 3. In emergency, no forward motion toward obstacles
-        if nav_state.min_distance < ZONE_EMERGENCY:
-            if abs(nav_state.min_angle) < math.pi / 2:
-                blended_v = min(blended_v, 0.0)
-            # Ensure we're turning away
-            if abs(blended_w) < 1.0:
-                escape_dir = -1.0 if nav_state.min_angle > 0 else 1.0
-                blended_w = escape_dir * W_MAX * 0.6
-        
-        # Apply velocity limits
-        blended_v = np.clip(blended_v, V_MIN_REVERSE, V_MAX)
-        blended_w = np.clip(blended_w, -W_MAX, W_MAX)
-        
-        # Smooth output (reduce jitter)
-        alpha = 0.7  # Smoothing factor
-        blended_v = alpha * blended_v + (1 - alpha) * self._prev_safe_v
-        blended_w = alpha * blended_w + (1 - alpha) * self._prev_safe_w
-        self._prev_safe_v = blended_v
-        self._prev_safe_w = blended_w
-        
-        self.intervention_history.append(blend)
-        return float(blended_v), float(blended_w), float(blend)
+        self.intervention_history.append(0.0)
+        return rl_v, rl_w, 0.0
     
-    def _compute_nav_velocity(
+    def _emergency_escape(
+        self, 
+        nav_state: NavigationState,
+        goal_angle: Optional[float]
+    ) -> Tuple[float, float, float]:
+        """
+        EMERGENCY: Very close to obstacle - hard escape maneuver.
+        NO blending with RL - pure safety control.
+        """
+        best_dir, best_clearance = self._select_best_direction(
+            nav_state.sector_distances, nav_state.clear_gaps, goal_angle
+        )
+        
+        # Determine escape strategy based on where the clear path is
+        obstacle_ahead = abs(nav_state.min_angle) < math.pi / 2
+        
+        if best_clearance > ZONE_DANGER:
+            # There's a decent escape route
+            if abs(best_dir) < math.pi / 3:
+                # Clear path is ahead-ish - creep forward while turning
+                escape_v = 0.15
+                escape_w = np.clip(best_dir * 4.0, -W_MAX * 0.8, W_MAX * 0.8)
+            elif abs(best_dir) < 2 * math.pi / 3:
+                # Clear path is to the side - turn in place
+                escape_v = 0.0
+                escape_w = W_MAX * 0.7 if best_dir > 0 else -W_MAX * 0.7
+            else:
+                # Clear path is behind - back up while turning
+                escape_v = -0.2
+                escape_w = W_MAX * 0.5 if best_dir > 0 else -W_MAX * 0.5
+        else:
+            # No clear escape - back away from obstacle
+            if obstacle_ahead:
+                escape_v = -0.25  # Back up
+                # Turn away from closest obstacle
+                if nav_state.min_angle > 0:
+                    escape_w = -W_MAX * 0.6  # Obstacle on left, turn right
+                else:
+                    escape_w = W_MAX * 0.6   # Obstacle on right, turn left
+            else:
+                # Obstacle is to side/behind - turn away from it
+                escape_v = 0.0
+                if nav_state.min_angle > 0:
+                    escape_w = -W_MAX * 0.7
+                else:
+                    escape_w = W_MAX * 0.7
+        
+        self.intervention_history.append(0.95)
+        return float(escape_v), float(escape_w), 0.95
+    
+    def _danger_avoidance(
         self,
         nav_state: NavigationState,
-        best_dir: float,
-        best_clearance: float,
+        rl_v: float,
+        rl_w: float,
         goal_angle: Optional[float]
-    ) -> Tuple[float, float]:
+    ) -> Tuple[float, float, float]:
         """
-        Compute navigation velocity to move toward best direction.
+        DANGER zone: Strong intervention but allow some RL influence.
         """
-        # Turn toward best direction
-        turn_error = best_dir  # Already in robot frame
+        best_dir, best_clearance = self._select_best_direction(
+            nav_state.sector_distances, nav_state.clear_gaps, goal_angle
+        )
         
-        # Proportional control for turning
-        turn_gain = 2.5
-        nav_w = np.clip(turn_gain * turn_error, -W_MAX * 0.8, W_MAX * 0.8)
+        obstacle_ahead = abs(nav_state.min_angle) < math.pi / 2
         
-        # Forward velocity depends on:
-        # 1. Alignment with best direction
-        # 2. Available clearance
-        # 3. Proximity to nearest obstacle
-        
-        alignment = math.cos(turn_error)  # 1.0 aligned, 0 perpendicular, -1 opposite
-        
-        if alignment > 0.5:
-            # Roughly facing best direction - move forward
-            clearance_factor = min(best_clearance / ZONE_FREE, 1.0)
-            proximity_factor = min(nav_state.min_distance / ZONE_CAUTION, 1.0)
-            nav_v = V_MAX * 0.6 * alignment * clearance_factor * proximity_factor
-        elif alignment > 0:
-            # Need to turn more - slow forward
-            nav_v = V_MAX * 0.2 * alignment
+        # Limit forward velocity significantly
+        if obstacle_ahead:
+            # Don't go forward toward obstacles
+            safe_v = min(rl_v * 0.2, 0.15)  # Very slow forward max
+            if rl_v > 0.3:
+                safe_v = 0.0  # Stop if RL wants to charge forward
         else:
-            # Best direction is behind - stop or reverse
-            if best_clearance > ZONE_CAUTION:
-                nav_v = V_MIN_REVERSE * 0.5  # Reverse while turning
-            else:
-                nav_v = 0.0  # Just turn
+            safe_v = rl_v * 0.4  # Reduce speed
         
-        return nav_v, nav_w
+        # Strong steering toward escape direction
+        escape_w = np.clip(best_dir * 3.0, -W_MAX * 0.7, W_MAX * 0.7)
+        safe_w = lerp(rl_w, escape_w, 0.7)  # 70% safety steering
+        
+        # Ensure we're turning away if obstacle is directly ahead
+        if obstacle_ahead and abs(safe_w) < 0.5:
+            if nav_state.min_angle > 0:
+                safe_w = -W_MAX * 0.5
+            else:
+                safe_w = W_MAX * 0.5
+        
+        self.intervention_history.append(0.7)
+        return float(safe_v), float(safe_w), 0.7
+    
+    def _caution_steering(
+        self,
+        nav_state: NavigationState,
+        rl_v: float,
+        rl_w: float,
+        goal_angle: Optional[float]
+    ) -> Tuple[float, float, float]:
+        """
+        CAUTION zone: Active steering while allowing reasonable RL control.
+        """
+        best_dir, best_clearance = self._select_best_direction(
+            nav_state.sector_distances, nav_state.clear_gaps, goal_angle
+        )
+        
+        obstacle_ahead = abs(nav_state.min_angle) < math.pi / 2
+        
+        # Scale down velocity based on proximity
+        proximity_factor = (nav_state.min_distance - ZONE_DANGER) / (ZONE_CAUTION - ZONE_DANGER)
+        proximity_factor = np.clip(proximity_factor, 0.3, 1.0)
+        
+        if obstacle_ahead:
+            safe_v = rl_v * proximity_factor * 0.6
+        else:
+            safe_v = rl_v * proximity_factor
+        
+        # Steer toward clear direction
+        escape_w = np.clip(best_dir * 2.0, -W_MAX * 0.6, W_MAX * 0.6)
+        safe_w = lerp(rl_w, escape_w, 0.4)  # 40% safety steering
+        
+        self.intervention_history.append(0.4)
+        return float(safe_v), float(safe_w), 0.4
     
     def compute_proximity_reward(self, nav_state: NavigationState) -> float:
         """Shaped reward based on obstacle proximity."""
