@@ -222,57 +222,61 @@ def lerp(a: float, b: float, t: float) -> float:
     return a + (b - a) * np.clip(t, 0.0, 1.0)
 
 
+
 # =============================================================================
-# DYNAMIC NAVIGATION SYSTEM - VFH-Inspired Obstacle Avoidance
+# DYNAMIC NAVIGATION SYSTEM - Simple & Robust Obstacle Avoidance
 # =============================================================================
 
 @dataclass
 class NavigationState:
     """Current navigation assessment."""
     min_distance: float           # Closest obstacle distance
-    min_angle: float              # Angle to closest obstacle (robot frame)
-    sector_distances: np.ndarray  # Distance in each sector
-    clear_gaps: List[Tuple[float, float, float]]  # List of (start_angle, end_angle, min_clearance)
-    best_direction: float         # Recommended direction (robot frame, 0=forward)
-    best_clearance: float         # Clearance in best direction
+    min_angle: float              # Angle to closest obstacle (robot frame, 0=front)
+    left_clearance: float         # Minimum clearance on left side
+    right_clearance: float        # Minimum clearance on right side  
+    front_clearance: float        # Minimum clearance in front
+    back_clearance: float         # Minimum clearance behind
+    sector_distances: np.ndarray  # Distance in each sector (for observation)
     safety_blend: float           # How much to blend safety (0-1)
     zone: str                     # Human-readable zone
+    clear_gaps: List[Tuple[float, float, float]]  # Compatibility
+    best_direction: float         # Compatibility
+    best_clearance: float         # Compatibility
 
 
 class DynamicNavigator:
     """
-    Dynamic obstacle avoidance using Vector Field Histogram principles.
+    Simple, robust obstacle avoidance.
     
-    Key features:
-    - Finds ALL clear gaps, not just single escape direction
-    - Weights directions by goal proximity AND clearance
-    - Smooth velocity commands with continuous blending
-    - Always moving - never completely stops
-    - Goal-aware: prefers paths toward goal when safe
+    Key principle: Don't overthink it.
+    - If obstacle ahead: turn toward clearer side
+    - If obstacle to side: steer away from it
+    - If very close: back up while turning
+    
+    CRITICAL: Uses hysteresis to prevent oscillation - once we pick
+    a turn direction, we stick with it until we're clear.
     """
     
     def __init__(self, num_sectors: int = 36):
-        """
-        Args:
-            num_sectors: Number of angular sectors (36 = 10° each)
-        """
         self.num_sectors = num_sectors
         self.sector_width = 2 * math.pi / num_sectors
         
-        # Precompute sector center angles (robot frame, 0 = forward)
+        # Sector center angles (robot frame, 0 = forward)
         self.sector_angles = np.array([
             wrap_to_pi(-math.pi + (i + 0.5) * self.sector_width)
             for i in range(num_sectors)
         ])
         
-        # History for logging
         self.intervention_history = deque(maxlen=100)
         self.last_nav_state: Optional[NavigationState] = None
+        
+        # HYSTERESIS: Remember which way we're turning to avoid oscillation
+        self._committed_turn_direction: Optional[float] = None  # +1 = left, -1 = right
+        self._commit_start_time: float = 0.0
+        self._min_commit_duration: float = 0.5  # Stick with decision for at least 0.5s
     
     def analyze_scan(self, scan: Optional[LaserScan]) -> NavigationState:
-        """
-        Analyze LIDAR scan and compute navigation state.
-        """
+        """Analyze LIDAR and compute simple clearance metrics."""
         if scan is None or len(scan.ranges) == 0:
             return self._default_state()
         
@@ -289,75 +293,83 @@ class DynamicNavigator:
         angles = scan.angle_min + np.arange(n_rays) * scan.angle_increment + LIDAR_FORWARD_OFFSET_RAD
         angles = np.array([wrap_to_pi(a) for a in angles])
         
-        # Find minimum distance
+        # Find minimum distance and angle
         min_idx = np.argmin(ranges)
         min_distance = float(ranges[min_idx])
         min_angle = float(angles[min_idx])
         
-        # Build sector histogram (minimum distance per sector)
+        # Compute clearance in 4 quadrants (simple and robust)
+        front_mask = np.abs(angles) < math.pi / 4  # ±45°
+        back_mask = np.abs(angles) > 3 * math.pi / 4  # ±135-180°
+        left_mask = (angles > math.pi / 4) & (angles < 3 * math.pi / 4)  # 45-135°
+        right_mask = (angles < -math.pi / 4) & (angles > -3 * math.pi / 4)  # -45 to -135°
+        
+        front_clearance = float(np.min(ranges[front_mask])) if np.any(front_mask) else max_r
+        back_clearance = float(np.min(ranges[back_mask])) if np.any(back_mask) else max_r
+        left_clearance = float(np.min(ranges[left_mask])) if np.any(left_mask) else max_r
+        right_clearance = float(np.min(ranges[right_mask])) if np.any(right_mask) else max_r
+        
+        # Build sector histogram for observation
         sector_distances = np.full(self.num_sectors, max_r, dtype=np.float32)
         for i in range(n_rays):
             sector_idx = int((angles[i] + math.pi) / self.sector_width) % self.num_sectors
             sector_distances[sector_idx] = min(sector_distances[sector_idx], ranges[i])
         
-        # Find clear gaps (contiguous sectors with clearance > threshold)
-        clear_gaps = self._find_clear_gaps(sector_distances, threshold=ZONE_CAUTION)
-        
-        # Compute safety blend
+        # Safety blend and zone
         safety_blend = self._compute_safety_blend(min_distance)
-        
-        # Determine zone
         zone = self._get_zone_name(min_distance)
         
-        # Find best direction (will be refined with goal info in compute_safe_velocity)
-        best_direction, best_clearance = self._select_best_direction(
-            sector_distances, clear_gaps, goal_angle=None
-        )
+        # Compute best direction for compatibility
+        if left_clearance > right_clearance:
+            best_direction = math.pi / 2
+            best_clearance = left_clearance
+        else:
+            best_direction = -math.pi / 2
+            best_clearance = right_clearance
         
         state = NavigationState(
             min_distance=min_distance,
             min_angle=min_angle,
+            left_clearance=left_clearance,
+            right_clearance=right_clearance,
+            front_clearance=front_clearance,
+            back_clearance=back_clearance,
             sector_distances=sector_distances,
-            clear_gaps=clear_gaps,
-            best_direction=best_direction,
-            best_clearance=best_clearance,
             safety_blend=safety_blend,
-            zone=zone
+            zone=zone,
+            clear_gaps=[],
+            best_direction=best_direction,
+            best_clearance=best_clearance
         )
         
         self.last_nav_state = state
         return state
     
     def _default_state(self) -> NavigationState:
-        """Return safe default when no scan available."""
         return NavigationState(
             min_distance=LIDAR_MAX_RANGE,
             min_angle=0.0,
+            left_clearance=LIDAR_MAX_RANGE,
+            right_clearance=LIDAR_MAX_RANGE,
+            front_clearance=LIDAR_MAX_RANGE,
+            back_clearance=LIDAR_MAX_RANGE,
             sector_distances=np.full(self.num_sectors, LIDAR_MAX_RANGE, dtype=np.float32),
-            clear_gaps=[(-math.pi, math.pi, LIDAR_MAX_RANGE)],
-            best_direction=0.0,
-            best_clearance=LIDAR_MAX_RANGE,
             safety_blend=0.0,
-            zone="FREE"
+            zone="FREE",
+            clear_gaps=[],
+            best_direction=0.0,
+            best_clearance=LIDAR_MAX_RANGE
         )
     
     def _compute_safety_blend(self, min_distance: float) -> float:
-        """
-        Compute smooth safety blend factor using sigmoid-like curve.
-        Returns 0.0 (full RL) to 0.95 (full safety).
-        """
         if min_distance >= ZONE_FREE:
             return 0.0
         if min_distance <= ZONE_EMERGENCY:
             return 0.95
-        
-        # Smooth quadratic interpolation
         t = (min_distance - ZONE_EMERGENCY) / (ZONE_FREE - ZONE_EMERGENCY)
-        blend = 0.95 * (1.0 - t) ** 2
-        return float(np.clip(blend, 0.0, 0.95))
+        return float(0.95 * (1.0 - t) ** 2)
     
     def _get_zone_name(self, min_distance: float) -> str:
-        """Get human-readable zone name."""
         if min_distance >= ZONE_FREE:
             return "FREE"
         elif min_distance >= ZONE_AWARE:
@@ -371,125 +383,6 @@ class DynamicNavigator:
         else:
             return "CRITICAL"
     
-    def _find_clear_gaps(
-        self, 
-        sector_distances: np.ndarray, 
-        threshold: float
-    ) -> List[Tuple[float, float, float]]:
-        """
-        Find contiguous clear gaps in the sector histogram.
-        
-        Returns list of (start_angle, end_angle, min_clearance_in_gap)
-        """
-        gaps = []
-        n = len(sector_distances)
-        
-        # Find contiguous runs of clear sectors
-        in_gap = False
-        gap_start = 0
-        gap_min_clearance = float('inf')
-        
-        for i in range(n):
-            is_clear = sector_distances[i] >= threshold
-            
-            if is_clear and not in_gap:
-                # Start new gap
-                in_gap = True
-                gap_start = i
-                gap_min_clearance = sector_distances[i]
-            elif is_clear and in_gap:
-                # Continue gap
-                gap_min_clearance = min(gap_min_clearance, sector_distances[i])
-            elif not is_clear and in_gap:
-                # End gap
-                in_gap = False
-                start_angle = self.sector_angles[gap_start]
-                end_angle = self.sector_angles[i - 1]
-                gaps.append((start_angle, end_angle, gap_min_clearance))
-        
-        # Handle wrap-around (gap spanning -π to π)
-        if in_gap:
-            start_angle = self.sector_angles[gap_start]
-            end_angle = self.sector_angles[n - 1]
-            gaps.append((start_angle, end_angle, gap_min_clearance))
-        
-        # If no gaps found, create a "best effort" gap at the clearest direction
-        if not gaps:
-            best_idx = int(np.argmax(sector_distances))
-            best_angle = self.sector_angles[best_idx]
-            gaps.append((best_angle, best_angle, float(sector_distances[best_idx])))
-        
-        return gaps
-    
-    def _select_best_direction(
-        self,
-        sector_distances: np.ndarray,
-        clear_gaps: List[Tuple[float, float, float]],
-        goal_angle: Optional[float]
-    ) -> Tuple[float, float]:
-        """
-        Select best direction considering gaps, goal, and forward preference.
-        
-        Returns (best_angle, clearance)
-        """
-        if not clear_gaps:
-            # No gaps - pick direction with most clearance
-            best_idx = int(np.argmax(sector_distances))
-            return float(self.sector_angles[best_idx]), float(sector_distances[best_idx])
-        
-        # Score each gap
-        best_score = -float('inf')
-        best_angle = 0.0
-        best_clearance = 0.0
-        
-        for start_angle, end_angle, clearance in clear_gaps:
-            # Gap center
-            if end_angle >= start_angle:
-                center = (start_angle + end_angle) / 2
-            else:
-                # Wrapped gap
-                center = wrap_to_pi((start_angle + end_angle + 2 * math.pi) / 2)
-            
-            # Gap width (angular)
-            if end_angle >= start_angle:
-                width = end_angle - start_angle
-            else:
-                width = (2 * math.pi) - (start_angle - end_angle)
-            
-            # Base score: clearance and width
-            score = clearance * 2.0 + width * 0.5
-            
-            # Forward preference (prefer going forward)
-            forward_factor = math.cos(center)  # 1.0 at front, -1.0 at back
-            score += forward_factor * 1.5
-            
-            # Goal alignment (if we have a goal)
-            if goal_angle is not None:
-                # Check if goal is within or near this gap
-                angle_to_goal = self._angle_diff(center, goal_angle)
-                goal_alignment = math.cos(angle_to_goal)
-                score += goal_alignment * 3.0  # Strong preference for goal-aligned gaps
-            
-            # Penalize backward directions
-            if abs(center) > 2 * math.pi / 3:
-                score -= 2.0
-            
-            if score > best_score:
-                best_score = score
-                best_angle = center
-                best_clearance = clearance
-        
-        return best_angle, best_clearance
-    
-    def _angle_diff(self, a1: float, a2: float) -> float:
-        """Smallest signed difference between angles."""
-        diff = a1 - a2
-        while diff > math.pi:
-            diff -= 2 * math.pi
-        while diff < -math.pi:
-            diff += 2 * math.pi
-        return diff
-    
     def compute_safe_velocity(
         self,
         rl_v: float,
@@ -498,178 +391,191 @@ class DynamicNavigator:
         goal_angle: Optional[float] = None
     ) -> Tuple[float, float, float]:
         """
-        Compute safe velocity by blending RL with navigation.
+        Compute safe velocity - SIMPLE LOGIC:
         
-        This is the core function - smoothly blends:
-        - Pure RL (when safe)
-        - Goal-directed avoidance (when obstacles present)
-        - Emergency escape (when very close)
-        
-        Returns (v, w, intervention_amount)
+        1. If very close (EMERGENCY): back up + turn away
+        2. If close (DANGER): stop forward + turn toward clear side
+        3. If moderately close (CAUTION): slow down + steer toward clear side
+        4. Otherwise: let RL control
         """
-        blend = nav_state.safety_blend
         min_dist = nav_state.min_distance
         
-        # === CRITICAL ZONE - Hard override, no blending ===
+        # === EMERGENCY: Back up and turn away ===
         if min_dist < ZONE_EMERGENCY:
-            return self._emergency_escape(nav_state, goal_angle)
+            escape_v, escape_w = self._emergency_escape(nav_state)
+            self.intervention_history.append(0.95)
+            return escape_v, escape_w, 0.95
         
-        # === DANGER ZONE - Strong intervention ===
+        # === DANGER: Stop forward motion, turn toward clear side ===
         if min_dist < ZONE_DANGER:
-            return self._danger_avoidance(nav_state, rl_v, rl_w, goal_angle)
+            safe_v, safe_w = self._danger_avoid(nav_state, rl_v, rl_w, goal_angle)
+            self.intervention_history.append(0.7)
+            return safe_v, safe_w, 0.7
         
-        # === CAUTION ZONE - Active steering ===
+        # === CAUTION: Slow down, steer toward clear side ===
         if min_dist < ZONE_CAUTION:
-            return self._caution_steering(nav_state, rl_v, rl_w, goal_angle)
+            safe_v, safe_w = self._caution_steer(nav_state, rl_v, rl_w, goal_angle)
+            self.intervention_history.append(0.4)
+            return safe_v, safe_w, 0.4
         
-        # === AWARE/FREE ZONE - Light or no intervention ===
-        if blend < 0.02:
-            self.intervention_history.append(0.0)
-            return rl_v, rl_w, 0.0
+        # === AWARE: Light intervention if heading toward obstacle ===
+        if min_dist < ZONE_AWARE:
+            # Only intervene if going forward toward the obstacle
+            obstacle_ahead = abs(nav_state.min_angle) < math.pi / 3
+            if obstacle_ahead and rl_v > 0.1:
+                # Steer away slightly
+                steer = self._get_turn_direction(nav_state, goal_angle)
+                safe_w = rl_w + steer * 0.5
+                safe_w = np.clip(safe_w, -W_MAX, W_MAX)
+                self.intervention_history.append(0.1)
+                return rl_v * 0.9, float(safe_w), 0.1
         
-        # Light steering suggestion
-        best_dir, best_clearance = self._select_best_direction(
-            nav_state.sector_distances, nav_state.clear_gaps, goal_angle
-        )
-        
-        # Very light turn suggestion if obstacle ahead
-        if abs(nav_state.min_angle) < math.pi / 3 and rl_v > 0.1:
-            suggested_w = np.clip(best_dir * 1.5, -W_MAX * 0.4, W_MAX * 0.4)
-            blended_w = lerp(rl_w, suggested_w, 0.1)
-            self.intervention_history.append(0.05)
-            return rl_v, float(blended_w), 0.05
-        
+        # === FREE: No intervention - clear any turn commitment ===
+        self._clear_commitment()
         self.intervention_history.append(0.0)
         return rl_v, rl_w, 0.0
     
-    def _emergency_escape(
-        self, 
-        nav_state: NavigationState,
-        goal_angle: Optional[float]
-    ) -> Tuple[float, float, float]:
+    def _get_turn_direction(self, nav_state: NavigationState, goal_angle: Optional[float]) -> float:
         """
-        EMERGENCY: Very close to obstacle - hard escape maneuver.
-        NO blending with RL - pure safety control.
+        Decide which way to turn: positive = left, negative = right.
+        
+        USES HYSTERESIS to prevent oscillation:
+        - Once we commit to a direction, stick with it for min_commit_duration
+        - Only change if the other side becomes MUCH clearer (>0.5m difference)
         """
-        best_dir, best_clearance = self._select_best_direction(
-            nav_state.sector_distances, nav_state.clear_gaps, goal_angle
-        )
+        import time
+        now = time.time()
         
-        # Determine escape strategy based on where the clear path is
-        obstacle_ahead = abs(nav_state.min_angle) < math.pi / 2
+        left_clear = nav_state.left_clearance
+        right_clear = nav_state.right_clearance
         
-        if best_clearance > ZONE_DANGER:
-            # There's a decent escape route
-            if abs(best_dir) < math.pi / 3:
-                # Clear path is ahead-ish - creep forward while turning
-                escape_v = 0.15
-                escape_w = np.clip(best_dir * 4.0, -W_MAX * 0.8, W_MAX * 0.8)
-            elif abs(best_dir) < 2 * math.pi / 3:
-                # Clear path is to the side - turn in place
-                escape_v = 0.0
-                escape_w = W_MAX * 0.7 if best_dir > 0 else -W_MAX * 0.7
-            else:
-                # Clear path is behind - back up while turning
-                escape_v = -0.2
-                escape_w = W_MAX * 0.5 if best_dir > 0 else -W_MAX * 0.5
+        # Check if we should stick with our committed direction
+        if self._committed_turn_direction is not None:
+            time_committed = now - self._commit_start_time
+            
+            # Still within commitment period?
+            if time_committed < self._min_commit_duration:
+                return self._committed_turn_direction
+            
+            # Check if we should change (only if OTHER side is MUCH better)
+            if self._committed_turn_direction > 0:  # Currently turning left
+                # Only switch to right if right is MUCH clearer
+                if right_clear > left_clear + 0.5:
+                    self._committed_turn_direction = -1.0
+                    self._commit_start_time = now
+                    return -1.0
+                else:
+                    return 1.0  # Keep turning left
+            else:  # Currently turning right
+                # Only switch to left if left is MUCH clearer
+                if left_clear > right_clear + 0.5:
+                    self._committed_turn_direction = 1.0
+                    self._commit_start_time = now
+                    return 1.0
+                else:
+                    return -1.0  # Keep turning right
+        
+        # No commitment yet - make initial decision
+        # Strong preference for clearer side
+        if left_clear > right_clear + 0.2:
+            turn_dir = 1.0  # Turn left
+        elif right_clear > left_clear + 0.2:
+            turn_dir = -1.0  # Turn right
         else:
-            # No clear escape - back away from obstacle
-            if obstacle_ahead:
-                escape_v = -0.25  # Back up
+            # Similar clearance - use goal or obstacle position
+            if goal_angle is not None and min(left_clear, right_clear) > ZONE_DANGER:
+                turn_dir = 1.0 if goal_angle > 0 else -1.0
+            else:
                 # Turn away from closest obstacle
-                if nav_state.min_angle > 0:
-                    escape_w = -W_MAX * 0.6  # Obstacle on left, turn right
-                else:
-                    escape_w = W_MAX * 0.6   # Obstacle on right, turn left
-            else:
-                # Obstacle is to side/behind - turn away from it
-                escape_v = 0.0
-                if nav_state.min_angle > 0:
-                    escape_w = -W_MAX * 0.7
-                else:
-                    escape_w = W_MAX * 0.7
+                turn_dir = -1.0 if nav_state.min_angle > 0 else 1.0
         
-        self.intervention_history.append(0.95)
-        return float(escape_v), float(escape_w), 0.95
+        # Commit to this direction
+        self._committed_turn_direction = turn_dir
+        self._commit_start_time = now
+        
+        return turn_dir
     
-    def _danger_avoidance(
-        self,
-        nav_state: NavigationState,
-        rl_v: float,
+    def _clear_commitment(self):
+        """Clear the turn commitment when we're safe again."""
+        self._committed_turn_direction = None
+    
+    def _emergency_escape(self, nav_state: NavigationState) -> Tuple[float, float]:
+        """
+        EMERGENCY: Very close to obstacle.
+        Back up while turning away - AGGRESSIVE.
+        """
+        # ALWAYS back up - faster than before
+        escape_v = -0.4
+        
+        # Turn toward clearer side (STRONG turn)
+        turn_dir = self._get_turn_direction(nav_state, None)
+        escape_w = turn_dir * W_MAX * 0.9  # Almost full turn rate
+        
+        return float(escape_v), float(escape_w)
+    
+    def _danger_avoid(
+        self, 
+        nav_state: NavigationState, 
+        rl_v: float, 
         rl_w: float,
         goal_angle: Optional[float]
-    ) -> Tuple[float, float, float]:
+    ) -> Tuple[float, float]:
         """
-        DANGER zone: Strong intervention but allow some RL influence.
+        DANGER: Close to obstacle.
+        No forward motion toward obstacle, turn toward clear side.
         """
-        best_dir, best_clearance = self._select_best_direction(
-            nav_state.sector_distances, nav_state.clear_gaps, goal_angle
-        )
-        
         obstacle_ahead = abs(nav_state.min_angle) < math.pi / 2
         
-        # Limit forward velocity significantly
+        # Velocity: stop or back up if obstacle ahead
         if obstacle_ahead:
-            # Don't go forward toward obstacles
-            safe_v = min(rl_v * 0.2, 0.15)  # Very slow forward max
-            if rl_v > 0.3:
-                safe_v = 0.0  # Stop if RL wants to charge forward
+            if nav_state.front_clearance < ZONE_DANGER:
+                safe_v = -0.25  # Back up more aggressively
+            else:
+                safe_v = -0.1  # Still back up a bit to create space
         else:
-            safe_v = rl_v * 0.4  # Reduce speed
+            # Obstacle to side - can stop or creep back
+            safe_v = min(0.0, rl_v * 0.1)
         
-        # Strong steering toward escape direction
-        escape_w = np.clip(best_dir * 3.0, -W_MAX * 0.7, W_MAX * 0.7)
-        safe_w = lerp(rl_w, escape_w, 0.7)  # 70% safety steering
+        # Turn toward clear side - DECISIVE
+        turn_dir = self._get_turn_direction(nav_state, goal_angle)
+        safe_w = turn_dir * W_MAX * 0.8  # Strong turn
         
-        # Ensure we're turning away if obstacle is directly ahead
-        if obstacle_ahead and abs(safe_w) < 0.5:
-            if nav_state.min_angle > 0:
-                safe_w = -W_MAX * 0.5
-            else:
-                safe_w = W_MAX * 0.5
-        
-        self.intervention_history.append(0.7)
-        return float(safe_v), float(safe_w), 0.7
+        return float(safe_v), float(safe_w)
     
-    def _caution_steering(
+    def _caution_steer(
         self,
         nav_state: NavigationState,
         rl_v: float,
         rl_w: float,
         goal_angle: Optional[float]
-    ) -> Tuple[float, float, float]:
+    ) -> Tuple[float, float]:
         """
-        CAUTION zone: Active steering while allowing reasonable RL control.
+        CAUTION: Moderately close to obstacle.
+        Slow down, steer toward clearer side.
         """
-        best_dir, best_clearance = self._select_best_direction(
-            nav_state.sector_distances, nav_state.clear_gaps, goal_angle
-        )
-        
         obstacle_ahead = abs(nav_state.min_angle) < math.pi / 2
         
-        # Scale down velocity based on proximity
+        # Slow down based on proximity
         proximity_factor = (nav_state.min_distance - ZONE_DANGER) / (ZONE_CAUTION - ZONE_DANGER)
-        proximity_factor = np.clip(proximity_factor, 0.3, 1.0)
+        proximity_factor = np.clip(proximity_factor, 0.2, 1.0)
         
         if obstacle_ahead:
-            safe_v = rl_v * proximity_factor * 0.6
+            safe_v = rl_v * proximity_factor * 0.5
         else:
             safe_v = rl_v * proximity_factor
         
-        # Steer toward clear direction
-        escape_w = np.clip(best_dir * 2.0, -W_MAX * 0.6, W_MAX * 0.6)
-        safe_w = lerp(rl_w, escape_w, 0.4)  # 40% safety steering
+        # Blend RL steering with safety steering
+        turn_dir = self._get_turn_direction(nav_state, goal_angle)
+        safety_w = turn_dir * W_MAX * 0.5
+        safe_w = rl_w * 0.5 + safety_w * 0.5  # 50/50 blend
+        safe_w = np.clip(safe_w, -W_MAX, W_MAX)
         
-        self.intervention_history.append(0.4)
-        return float(safe_v), float(safe_w), 0.4
+        return float(safe_v), float(safe_w)
     
     def compute_proximity_reward(self, nav_state: NavigationState) -> float:
-        """Shaped reward based on obstacle proximity."""
         min_dist = nav_state.min_distance
-        
         if min_dist >= MIN_SAFE_DISTANCE:
             return R_CLEARANCE_BONUS
-        
         if min_dist >= ZONE_DANGER:
             penalty_factor = 1.0 - (min_dist - ZONE_DANGER) / (MIN_SAFE_DISTANCE - ZONE_DANGER)
             return R_PROXIMITY_SCALE * 0.2 * penalty_factor
@@ -680,20 +586,17 @@ class DynamicNavigator:
             return R_PROXIMITY_SCALE
     
     def compute_intervention_penalty(self, intervention: float) -> float:
-        """Penalize RL for requiring intervention."""
         return R_SAFETY_INTERVENTION * intervention
     
     def get_average_intervention(self) -> float:
-        """Get recent average intervention rate."""
         if len(self.intervention_history) == 0:
             return 0.0
         return float(np.mean(self.intervention_history))
 
 
-# Compatibility alias
+# Compatibility aliases
 SafetyState = NavigationState
 GraduatedSafetyBlender = DynamicNavigator
-
 
 # =============================================================================
 # Running Mean/Std for Normalization (unchanged)
