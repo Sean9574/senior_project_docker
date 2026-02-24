@@ -368,6 +368,78 @@ class GraduatedSafetyBlender:
             # Below emergency threshold - full safety
             return "CRITICAL", 1.0
     
+    def _find_best_direction(
+        self,
+        ranges: np.ndarray,
+        angles: np.ndarray,
+        goal_angle: Optional[float] = None,
+        min_clearance: float = 0.5
+    ) -> Tuple[float, float]:
+        """
+        Find the best direction to move based on LIDAR data and optional goal.
+        
+        Returns:
+            (best_angle, clearance) - the best direction to turn and how clear it is
+        """
+        # Bin the LIDAR into direction sectors
+        num_sectors = 12  # 30-degree sectors
+        sector_size = 2 * math.pi / num_sectors
+        sector_min_range = [float('inf')] * num_sectors
+        
+        for r, angle in zip(ranges, angles):
+            if r < 0.05 or r > 10.0:  # Skip invalid readings
+                continue
+            
+            # Normalize angle to [0, 2pi)
+            norm_angle = angle % (2 * math.pi)
+            sector_idx = int(norm_angle / sector_size) % num_sectors
+            sector_min_range[sector_idx] = min(sector_min_range[sector_idx], r)
+        
+        # Find sectors with sufficient clearance
+        clear_sectors = []
+        for i, clearance in enumerate(sector_min_range):
+            if clearance >= min_clearance:
+                # Convert sector index to angle (center of sector)
+                sector_angle = (i + 0.5) * sector_size
+                # Normalize to [-pi, pi]
+                if sector_angle > math.pi:
+                    sector_angle -= 2 * math.pi
+                clear_sectors.append((sector_angle, clearance))
+        
+        if not clear_sectors:
+            # No clear sectors - find the least bad direction
+            best_idx = max(range(num_sectors), key=lambda i: sector_min_range[i])
+            best_angle = (best_idx + 0.5) * sector_size
+            if best_angle > math.pi:
+                best_angle -= 2 * math.pi
+            return best_angle, sector_min_range[best_idx]
+        
+        # If we have a goal, prefer clear direction closest to goal
+        if goal_angle is not None:
+            # Find clear sector closest to goal direction
+            best_sector = min(clear_sectors, 
+                              key=lambda s: abs(self._angle_diff(s[0], goal_angle)))
+            return best_sector[0], best_sector[1]
+        
+        # No goal - prefer forward or widest gap
+        # First, check if forward (sector near 0) is clear
+        forward_clear = [s for s in clear_sectors if abs(s[0]) < math.pi / 3]
+        if forward_clear:
+            # Pick the most forward clear direction
+            return min(forward_clear, key=lambda s: abs(s[0]))
+        
+        # Otherwise, pick direction with most clearance
+        return max(clear_sectors, key=lambda s: s[1])
+    
+    def _angle_diff(self, a1: float, a2: float) -> float:
+        """Compute smallest difference between two angles."""
+        diff = a1 - a2
+        while diff > math.pi:
+            diff -= 2 * math.pi
+        while diff < -math.pi:
+            diff += 2 * math.pi
+        return diff
+
     def _compute_repulsive_velocity(
         self, 
         ranges: np.ndarray, 
@@ -440,10 +512,13 @@ class GraduatedSafetyBlender:
         rl_v: float, 
         rl_w: float, 
         safety_state: SafetyState,
-        goal_angle: Optional[float] = None
+        goal_angle: Optional[float] = None,
+        ranges: Optional[np.ndarray] = None,
+        angles: Optional[np.ndarray] = None
     ) -> Tuple[float, float, float]:
         """
         Blend RL action with safety action based on current safety state.
+        Uses smart gap-finding to navigate around obstacles toward goal.
         
         Returns:
             (blended_v, blended_w, intervention_amount)
@@ -456,76 +531,109 @@ class GraduatedSafetyBlender:
         if blend < 0.01:
             return rl_v, rl_w, 0.0
         
-        # Compute safety action
+        # Default safety action from repulsive field
         safety_v = safety_state.repulsive_v
         safety_w = safety_state.repulsive_w
         
-        # If we have a goal and we're not in emergency, bias toward goal
-        if goal_angle is not None and safety_state.zone not in ["EMERGENCY", "CRITICAL"]:
-            # Add attractive component toward goal
-            goal_w = ATTRACTIVE_GAIN * math.sin(goal_angle) * W_MAX
-            safety_w = safety_w + goal_w * (1.0 - blend)
-        
-        # STALL PREVENTION: In CAUTION or worse, if blended action would be near-zero, force turning
-        if safety_state.zone in ["CAUTION", "DANGER", "EMERGENCY", "CRITICAL"]:
-            # Check if obstacle is ahead
-            danger_ahead = abs(safety_state.danger_direction) < math.pi / 3
+        # SMART NAVIGATION: Use LIDAR to find clear directions
+        if ranges is not None and angles is not None and safety_state.zone in ["CAUTION", "DANGER", "EMERGENCY", "CRITICAL"]:
+            # Find best clear direction, considering goal if we have one
+            best_angle, clearance = self._find_best_direction(
+                ranges, angles, 
+                goal_angle=goal_angle,
+                min_clearance=ZONE_CAUTION  # Need this much space to navigate
+            )
             
-            if danger_ahead:
-                # If RL wants forward and safety wants backward, we'll get ~0 velocity
-                # Force a strong turn instead of stalling
-                if rl_v > 0.1 and safety_v < 0:
-                    # Turn away from danger direction
-                    if safety_state.danger_direction > 0:
-                        safety_w = -W_MAX * 0.7  # Turn right (obstacle on left)
-                    else:
-                        safety_w = W_MAX * 0.7   # Turn left (obstacle on right)
-                    
-                    # Also allow slight backward motion to clear obstacle
-                    safety_v = -V_MAX * 0.2
+            # Calculate turn needed to face best direction
+            turn_to_best = best_angle  # Already in robot frame
+            
+            # Smart escape: Turn toward best direction AND move
+            if clearance > ZONE_DANGER:
+                # There's a clear path - navigate through it
+                # Turn toward the clear direction
+                safety_w = np.clip(turn_to_best * 3.0, -W_MAX * 0.8, W_MAX * 0.8)
+                
+                # Move forward if we're roughly facing the clear direction
+                if abs(turn_to_best) < math.pi / 3:
+                    # Good alignment with clear direction - move forward!
+                    safety_v = V_MAX * 0.3 * (1.0 - abs(turn_to_best) / (math.pi / 3))
+                else:
+                    # Need to turn more - slow down or stop
+                    safety_v = 0.0
+            else:
+                # No good clear path - back up while turning
+                safety_v = -V_MAX * 0.3
+                safety_w = np.clip(turn_to_best * 2.0, -W_MAX * 0.7, W_MAX * 0.7)
         
-        # ACTIVE ESCAPE: When very close, don't just block - actively move away!
+        # ACTIVE ESCAPE in danger zones - but smarter
         if safety_state.zone in ["DANGER", "EMERGENCY", "CRITICAL"]:
-            # Override with strong escape behavior
             escape_strength = 0.6 if safety_state.zone == "DANGER" else 0.9
             
-            # Always back up when this close
-            safety_v = -V_MAX * 0.4 * escape_strength
-            
-            # Strong turn away from obstacle
-            if safety_state.danger_direction > 0:
-                safety_w = -W_MAX * escape_strength  # Turn right
+            # If we found a clear direction via LIDAR, prefer that
+            if ranges is not None and angles is not None:
+                best_angle, clearance = self._find_best_direction(
+                    ranges, angles,
+                    goal_angle=goal_angle,
+                    min_clearance=ZONE_DANGER
+                )
+                
+                # Turn toward best direction aggressively
+                safety_w = np.clip(best_angle * 4.0, -W_MAX * escape_strength, W_MAX * escape_strength)
+                
+                # Only back up if best direction is behind us
+                if abs(best_angle) > math.pi / 2:
+                    safety_v = -V_MAX * 0.4 * escape_strength
+                else:
+                    # Clear path is ahead/side - slow forward or stop is ok
+                    safety_v = 0.0
             else:
-                safety_w = W_MAX * escape_strength   # Turn left
+                # No LIDAR data - use danger direction
+                safety_v = -V_MAX * 0.4 * escape_strength
+                if safety_state.danger_direction > 0:
+                    safety_w = -W_MAX * escape_strength
+                else:
+                    safety_w = W_MAX * escape_strength
             
             # Higher blend to enforce escape
             blend = max(blend, escape_strength)
         
         # In emergency/critical, maximum escape effort
         if safety_state.zone in ["EMERGENCY", "CRITICAL"]:
-            # Full escape mode - ignore RL completely
             blend = 0.98
-            safety_v = -V_MAX * 0.5  # Strong backup
-            
-            # Turn away from danger
-            if safety_state.danger_direction > 0:
-                safety_w = -W_MAX * 0.8  # Turn right
+            # Still use smart direction if available
+            if ranges is not None and angles is not None:
+                best_angle, _ = self._find_best_direction(ranges, angles, goal_angle=goal_angle, min_clearance=0.3)
+                safety_w = np.clip(best_angle * 5.0, -W_MAX * 0.9, W_MAX * 0.9)
+                safety_v = -V_MAX * 0.4  # Back up
             else:
-                safety_w = W_MAX * 0.8   # Turn left
+                safety_v = -V_MAX * 0.5
+                if safety_state.danger_direction > 0:
+                    safety_w = -W_MAX * 0.8
+                else:
+                    safety_w = W_MAX * 0.8
         
         # Blend RL and safety actions
         blended_v = lerp(rl_v, safety_v, blend)
         blended_w = lerp(rl_w, safety_w, blend)
         
-        # FINAL STALL CHECK: If we're about to output near-zero velocity near obstacles, force movement
-        if safety_state.zone in ["CAUTION", "DANGER", "EMERGENCY", "CRITICAL"]:
+        # FINAL CHECK: Ensure we're not stalling when there's a clear path
+        if safety_state.zone in ["CAUTION", "DANGER"]:
             if abs(blended_v) < 0.1 and abs(blended_w) < 0.2:
-                # Robot would stall - force active escape
-                if safety_state.danger_direction > 0:
-                    blended_w = -W_MAX * 0.6
+                # About to stall - pick any clear direction
+                if ranges is not None and angles is not None:
+                    best_angle, _ = self._find_best_direction(ranges, angles, goal_angle=goal_angle, min_clearance=0.4)
+                    blended_w = np.clip(best_angle * 3.0, -W_MAX * 0.6, W_MAX * 0.6)
+                    if abs(best_angle) < math.pi / 2:
+                        blended_v = V_MAX * 0.2  # Path ahead - go!
+                    else:
+                        blended_v = -V_MAX * 0.2  # Path behind - back up
                 else:
-                    blended_w = W_MAX * 0.6
-                blended_v = -V_MAX * 0.3  # Back up!
+                    # Fallback
+                    if safety_state.danger_direction > 0:
+                        blended_w = -W_MAX * 0.6
+                    else:
+                        blended_w = W_MAX * 0.6
+                    blended_v = -V_MAX * 0.3
         
         # Apply velocity limits
         blended_v = np.clip(blended_v, V_MIN_REVERSE, V_MAX)
@@ -1235,9 +1343,13 @@ class StretchRosInterface(Node):
         # Goal reached publisher - signals to goal generator to cycle targets
         self.goal_reached_pub = self.create_publisher(PointStamped, f"/{ns}/goal_reached", 10)
         
+        # Goal visualization - shows current goal and last-known position in RViz
+        self.goal_marker_pub = self.create_publisher(Marker, "/goal_marker", 10)
+        self.last_known_marker_pub = self.create_publisher(Marker, "/last_known_marker", 10)
+        
         self.path_history: deque = deque(maxlen=PATH_HISTORY_LENGTH)
         
-        self.get_logger().info("[VIZ] Publishing: /exploration_map, /visit_heatmap, /robot_path, /safety_zone")
+        self.get_logger().info("[VIZ] Publishing: /exploration_map, /visit_heatmap, /robot_path, /safety_zone, /goal_marker")
     
     def add_path_point(self, x: float, y: float):
         self.path_history.append((x, y))
@@ -1469,9 +1581,25 @@ class StretchExploreEnv(gym.Env):
         # Get goal angle for attraction (if goal exists)
         goal_angle = self._goal_angle() if self.ros.last_goal is not None else None
         
-        # Blend RL action with safety
+        # Extract LIDAR ranges and angles for smart navigation
+        scan = self.ros.last_scan
+        lidar_ranges = None
+        lidar_angles = None
+        if scan is not None and len(scan.ranges) > 0:
+            lidar_ranges = np.array(scan.ranges, dtype=np.float32)
+            n_rays = len(lidar_ranges)
+            lidar_angles = scan.angle_min + np.arange(n_rays) * scan.angle_increment + LIDAR_FORWARD_OFFSET_RAD
+            lidar_angles = np.array([wrap_to_pi(a) for a in lidar_angles])
+            
+            # Clean invalid readings
+            max_r = min(scan.range_max, LIDAR_MAX_RANGE) if scan.range_max > 0 else LIDAR_MAX_RANGE
+            invalid = np.isnan(lidar_ranges) | np.isinf(lidar_ranges) | (lidar_ranges < 0.05) | (lidar_ranges > max_r)
+            lidar_ranges[invalid] = max_r
+        
+        # Blend RL action with safety - now with smart gap-finding
         safe_v, safe_w, intervention = self.safety_blender.blend_action(
-            rl_v, rl_w, safety_state, goal_angle
+            rl_v, rl_w, safety_state, goal_angle,
+            ranges=lidar_ranges, angles=lidar_angles
         )
         
         # Track intervention
@@ -1678,6 +1806,68 @@ class StretchExploreEnv(gym.Env):
         
         # Publish safety zone visualization
         self.ros.publish_safety_zone(robot_state["x"], robot_state["y"], safety_state)
+        
+        # Publish goal markers
+        self._publish_goal_markers()
+    
+    def _publish_goal_markers(self):
+        """Publish markers for current goal and last-known position."""
+        now = self.ros.get_clock().now().to_msg()
+        
+        # Current goal marker (green sphere)
+        if self.ros.last_goal is not None:
+            goal_marker = Marker()
+            goal_marker.header.stamp = now
+            goal_marker.header.frame_id = "odom"
+            goal_marker.ns = "goal"
+            goal_marker.id = 0
+            goal_marker.type = Marker.SPHERE
+            goal_marker.action = Marker.ADD
+            goal_marker.pose.position.x = self.ros.last_goal.point.x
+            goal_marker.pose.position.y = self.ros.last_goal.point.y
+            goal_marker.pose.position.z = 0.5
+            goal_marker.pose.orientation.w = 1.0
+            goal_marker.scale.x = 0.5
+            goal_marker.scale.y = 0.5
+            goal_marker.scale.z = 0.5
+            goal_marker.color.r = 0.0
+            goal_marker.color.g = 1.0
+            goal_marker.color.b = 0.0
+            goal_marker.color.a = 0.8
+            goal_marker.lifetime.sec = 1
+            self.ros.goal_marker_pub.publish(goal_marker)
+        else:
+            # Delete marker if no goal
+            delete_marker = Marker()
+            delete_marker.header.stamp = now
+            delete_marker.header.frame_id = "odom"
+            delete_marker.ns = "goal"
+            delete_marker.id = 0
+            delete_marker.action = Marker.DELETE
+            self.ros.goal_marker_pub.publish(delete_marker)
+        
+        # Last-known position marker (yellow sphere, smaller)
+        if self.ros._last_known_target_pos is not None:
+            lk_marker = Marker()
+            lk_marker.header.stamp = now
+            lk_marker.header.frame_id = "odom"
+            lk_marker.ns = "last_known"
+            lk_marker.id = 0
+            lk_marker.type = Marker.SPHERE
+            lk_marker.action = Marker.ADD
+            lk_marker.pose.position.x = self.ros._last_known_target_pos[0]
+            lk_marker.pose.position.y = self.ros._last_known_target_pos[1]
+            lk_marker.pose.position.z = 0.3
+            lk_marker.pose.orientation.w = 1.0
+            lk_marker.scale.x = 0.3
+            lk_marker.scale.y = 0.3
+            lk_marker.scale.z = 0.3
+            lk_marker.color.r = 1.0
+            lk_marker.color.g = 1.0
+            lk_marker.color.b = 0.0
+            lk_marker.color.a = 0.6
+            lk_marker.lifetime.sec = 1
+            self.ros.last_known_marker_pub.publish(lk_marker)
     
     def _compute_explore_reward(self, new_cells: int, st: Dict, obs: np.ndarray) -> Tuple[float, bool, Dict]:
         """Compute reward for exploration mode."""
@@ -1704,15 +1894,22 @@ class StretchExploreEnv(gym.Env):
         # Movement bonus - encourage forward movement during exploration
         r_movement = 0.0
         if st["v_lin"] > 0.2:
-            r_movement = 0.5  # Bonus for moving forward
+            r_movement = 1.0  # Increased bonus for moving forward
         elif st["v_lin"] < 0.05 and abs(st["v_ang"]) < 0.1:
-            r_movement = -0.3  # Penalty for being stuck (not moving at all)
-        elif abs(st["v_ang"]) > 0.5:
-            r_movement = 0.2  # Small bonus for turning (trying to find a way)
+            r_movement = -0.5  # Penalty for being stuck (not moving at all)
+        elif abs(st["v_ang"]) > 0.5 and st["v_lin"] < 0.1:
+            r_movement = -0.3  # Small penalty for spinning without forward motion
+        
+        # ANTI-SPIN: Penalize excessive spinning in exploration
+        r_spin_penalty = 0.0
+        if st["v_lin"] < 0.1 and abs(st["v_ang"]) > 1.5:
+            r_spin_penalty = -3.0  # Penalize spinning in place
         
         # Progress toward last-known target position (even when not currently visible)
+        # This is CRITICAL for re-finding lost targets
         r_last_known_progress = 0.0
         r_last_known_align = 0.0
+        r_last_known_forward = 0.0
         if self.ros._last_known_target_pos is not None:
             lk_x, lk_y = self.ros._last_known_target_pos
             robot_x, robot_y = st["x"], st["y"]
@@ -1725,7 +1922,8 @@ class StretchExploreEnv(gym.Env):
                 self._prev_last_known_dist = dist_to_last_known
             
             progress = self._prev_last_known_dist - dist_to_last_known
-            r_last_known_progress = LAST_KNOWN_PROGRESS_SCALE * progress
+            # STRONGER progress reward - this is important!
+            r_last_known_progress = LAST_KNOWN_PROGRESS_SCALE * progress * 2.0
             self._prev_last_known_dist = dist_to_last_known
             
             # Alignment (facing toward last known position)
@@ -1735,7 +1933,14 @@ class StretchExploreEnv(gym.Env):
                 angle_to_last_known -= 2 * math.pi
             while angle_to_last_known < -math.pi:
                 angle_to_last_known += 2 * math.pi
-            r_last_known_align = LAST_KNOWN_ALIGN_SCALE * math.cos(angle_to_last_known)
+            
+            # Only reward alignment when moving forward (anti-spin)
+            if st["v_lin"] > 0.1:
+                r_last_known_align = LAST_KNOWN_ALIGN_SCALE * math.cos(angle_to_last_known) * 2.0
+            
+            # Bonus for moving forward toward last known position
+            if st["v_lin"] > 0.2 and abs(angle_to_last_known) < math.pi / 2:
+                r_last_known_forward = 2.0  # Moving toward last known position!
         
         # Collision - now based on ZONE_EMERGENCY (hard safety should prevent this)
         if self.last_safety_state and self.last_safety_state.min_distance < ZONE_EMERGENCY:
@@ -1746,7 +1951,8 @@ class StretchExploreEnv(gym.Env):
         else:
             r_collision = 0.0
         
-        reward = r_discovery + r_novelty + r_frontier + r_step + r_collision + r_rnd + r_movement + r_last_known_progress + r_last_known_align
+        reward = (r_discovery + r_novelty + r_frontier + r_step + r_collision + r_rnd + 
+                  r_movement + r_spin_penalty + r_last_known_progress + r_last_known_align + r_last_known_forward)
         
         info = {
             "collision": collision,
@@ -1760,8 +1966,10 @@ class StretchExploreEnv(gym.Env):
                 "collision": r_collision,
                 "rnd": r_rnd,
                 "movement": r_movement,
+                "spin_penalty": r_spin_penalty,
                 "last_known_progress": r_last_known_progress,
                 "last_known_align": r_last_known_align,
+                "last_known_forward": r_last_known_forward,
             }
         }
         

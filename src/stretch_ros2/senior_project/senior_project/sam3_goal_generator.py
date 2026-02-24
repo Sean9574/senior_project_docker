@@ -244,14 +244,6 @@ class SAM3GoalGeneratorV2(Node):
         self.robot_yaw = 0.0
         self.goal_sent = False
 
-        # FIX Bug #4: Cooldown timer so we stop publishing goals immediately
-        # after one is reached, giving the learner time to reset cleanly.
-        # Without this, SAM3 re-publishes the same goal within one detection
-        # cycle (~0.5s), flooding ros.last_goal before _last_goal_reached_pos
-        # can suppress it, driving the reset loop.
-        self._goal_cooldown_until: float = 0.0
-        self._goal_cooldown_sec: float = 5.0  # seconds to pause after goal reached
-
         self.depth_camera_available = False
         self._last_depth_msg_time = 0.0
         self.depth_stale_sec = 1.0
@@ -523,17 +515,6 @@ class SAM3GoalGeneratorV2(Node):
     
     def goal_reached_callback(self, msg: PointStamped):
         """Called when learner node reports goal reached - cycle to next target."""
-        # FIX Bug #4: Always set a cooldown, even in single-target mode.
-        # Previously this function was a no-op for single targets, so SAM3
-        # immediately re-detected the same object and re-published the goal,
-        # which drove the suppression loop in the learner.  The cooldown
-        # gives the learner's episode time to terminate and reset() to run
-        # before we start emitting goals again.
-        self._goal_cooldown_until = time.time() + self._goal_cooldown_sec
-        self.goal_sent = False
-        self.get_logger().info(
-            f'[GOAL REACHED] Pausing goal publication for {self._goal_cooldown_sec:.0f}s'
-        )
         if self.target_cycle_on_reach and len(self.target_list) > 1:
             self.cycle_target()
     
@@ -1031,17 +1012,17 @@ class SAM3GoalGeneratorV2(Node):
         depth_status.append("bbox")
 
         if best_detection:
-            # FIX Bug #3: Publish the goal AT the object's world position, not at a
-            # robot-relative offset point.  The original code computed goal_x/goal_y
-            # relative to the robot's current position, so the published goal drifted
-            # in odom-space with every detection cycle.  The learner's d_goal check
-            # fired against whatever stale coordinates were in ros.last_goal (updated
-            # at 2 Hz while the robot moves at 10 Hz), meaning the robot could be
-            # physically within GOAL_RADIUS but the check failed.  Publishing the raw
-            # odom position gives a stable, fixed waypoint the learner can converge on.
-            # The learner's GOAL_RADIUS (now 0.8 m) is large enough to catch arrival.
-            goal_x = best_detection['odom_x']
-            goal_y = best_detection['odom_y']
+            dx = best_detection['odom_x'] - self.robot_x
+            dy = best_detection['odom_y'] - self.robot_y
+            dist_to_obj = math.sqrt(dx * dx + dy * dy)
+
+            if dist_to_obj > self.goal_offset:
+                scale = (dist_to_obj - self.goal_offset) / dist_to_obj
+                goal_x = self.robot_x + dx * scale
+                goal_y = self.robot_y + dy * scale
+            else:
+                goal_x = best_detection['odom_x']
+                goal_y = best_detection['odom_y']
 
             status = {
                 'found': True,
@@ -1054,15 +1035,38 @@ class SAM3GoalGeneratorV2(Node):
                 'goal_position': [float(goal_x), float(goal_y)]
             }
 
-            # FIX Bug #4: Respect the post-goal-reached cooldown before publishing.
-            if self.auto_publish and time.time() >= self._goal_cooldown_until:
-                self.publish_goal(goal_x, goal_y)
-                self.goal_sent = True
-            elif time.time() < self._goal_cooldown_until:
-                remaining = self._goal_cooldown_until - time.time()
-                self.get_logger().debug(
-                    f'[COOLDOWN] Suppressing goal publish, {remaining:.1f}s remaining'
-                )
+            # Only publish goal if position changed significantly (>0.5m) or first detection
+            # This prevents goal spam and drift
+            if self.auto_publish:
+                should_publish = False
+                
+                if not hasattr(self, '_last_published_goal'):
+                    self._last_published_goal = None
+                    self._last_publish_time = 0.0
+                
+                current_time = time.time()
+                
+                if self._last_published_goal is None:
+                    should_publish = True
+                    self.get_logger().info(f'[GOAL] First detection - publishing goal at ({goal_x:.2f}, {goal_y:.2f})')
+                else:
+                    last_x, last_y = self._last_published_goal
+                    dist_change = math.sqrt((goal_x - last_x)**2 + (goal_y - last_y)**2)
+                    time_since_publish = current_time - self._last_publish_time
+                    
+                    # Only update if moved >50cm OR it's been more than 5 seconds
+                    if dist_change > 0.5:
+                        should_publish = True
+                        self.get_logger().info(f'[GOAL] Target moved {dist_change:.2f}m - updating goal')
+                    elif time_since_publish > 5.0:
+                        # Periodic refresh to keep goal alive
+                        should_publish = True
+                
+                if should_publish:
+                    self.publish_goal(goal_x, goal_y)
+                    self._last_published_goal = (goal_x, goal_y)
+                    self._last_publish_time = current_time
+                    self.goal_sent = True
         else:
             status = {
                 'found': False,
