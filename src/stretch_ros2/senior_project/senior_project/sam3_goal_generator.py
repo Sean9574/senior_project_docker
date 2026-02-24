@@ -1,18 +1,11 @@
 #!/usr/bin/env python3
 """
-SAM3 Goal Generator V2 - Performance + Stability Improvements
+SAM3 Goal Generator V2 - With Visible Segmentation Overlay
 
-Key upgrades:
-- Goal publish throttling + only publish when goal changes meaningfully
-- Publish at most once per new SAM3 result (prevents 15Hz spamming)
-- Thread-safe SAM3 request gating (_sam3_busy lock, set before thread start)
-- Avoid sharing requests.Session across threads (thread uses its own session)
-- Robust HTTP + JSON handling (status checks + JSON decode guards)
-- Cache monocular depth per SAM3 result (big perf win)
-- Consistent INTER_NEAREST for masks
-- Use self.odom_frame for goal header frame_id (no hardcoded 'odom')
-- GUI pause actually pauses SAM3 + goal publishing
-- CameraInfo QoS set to RELIABLE
+Changes from original:
+- Increased segmentation overlay alpha (0.55 instead of 0.35)
+- Added contour outline around segmented regions
+- Better color choices for visibility
 """
 
 import base64
@@ -22,7 +15,7 @@ import os
 import threading
 import time
 from enum import Enum
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -112,6 +105,7 @@ DEFAULT_OBJECT_SIZES: Dict[str, Tuple[float, float]] = {
     "target": (0.2, 0.2),
     "goal": (0.2, 0.2),
     "marker": (0.1, 0.3),
+    "object": (0.3, 0.3),
     "furniture": (0.8, 0.8),
     "food": (0.15, 0.1),
     "animal": (0.5, 0.4),
@@ -126,11 +120,11 @@ class SAM3GoalGeneratorV2(Node):
         self.declare_parameter('server_url', 'http://localhost:8100')
         self.declare_parameter('mono_depth_url', 'http://localhost:8101')
         self.declare_parameter('target', 'cup')
-        self.declare_parameter('targets', '')  # Comma-separated list for cycling
-        self.declare_parameter('target_cycle_on_reach', True)
+        self.declare_parameter('targets', '')  # Comma-separated list for cycling: "chair,table,box,person"
+        self.declare_parameter('target_cycle_on_reach', True)  # Cycle to next target when goal reached
         self.declare_parameter('confidence_threshold', 0.2)
         self.declare_parameter('rate', 2.0)  # SAM3 detection rate (Hz)
-        self.declare_parameter('viz_rate', 15.0)  # Visualization rate (Hz)
+        self.declare_parameter('viz_rate', 15.0)  # Visualization rate (Hz) - smooth camera feed
         self.declare_parameter('ns', 'stretch')
         self.declare_parameter('min_distance', 0.3)
         self.declare_parameter('max_distance', 10.0)
@@ -148,10 +142,10 @@ class SAM3GoalGeneratorV2(Node):
         self.declare_parameter('camera_pitch_deg', 0.0)
         self.declare_parameter('camera_height', 1.0)
         self.declare_parameter('camera_forward_offset', 0.0)
-
+        
         # Performance parameters
-        self.declare_parameter('sam3_max_width', 640)
-        self.declare_parameter('sam3_jpeg_quality', 60)
+        self.declare_parameter('sam3_max_width', 640)  # Downscale images for faster inference
+        self.declare_parameter('sam3_jpeg_quality', 60)  # Lower quality = smaller payload
 
         self.declare_parameter('use_tf', True)
         self.declare_parameter('camera_frame', 'camera_color_optical_frame')
@@ -168,14 +162,6 @@ class SAM3GoalGeneratorV2(Node):
         self.declare_parameter('gui_fps', DEFAULT_GUI_FPS_OVERLAY)
         self.declare_parameter('gui_save_dir', DEFAULT_GUI_SAVE_DIR)
 
-        # === New stability/perf parameters ===
-        self.declare_parameter('rotate_viz_90_clockwise', True)
-        self.declare_parameter('goal_publish_min_period', 0.75)   # seconds
-        self.declare_parameter('goal_publish_min_delta', 0.15)    # meters
-        self.declare_parameter('tf_timeout_sec', 0.15)            # seconds
-        self.declare_parameter('sam3_timeout_sec', 5.0)
-        self.declare_parameter('mono_depth_timeout_sec', 5.0)
-
         # Get parameters
         self.server_url = self.get_parameter('server_url').value
         self.mono_depth_url = self.get_parameter('mono_depth_url').value
@@ -189,14 +175,7 @@ class SAM3GoalGeneratorV2(Node):
         self.goal_offset = float(self.get_parameter('goal_offset').value)
         self.auto_publish = bool(self.get_parameter('auto_publish_goal').value)
         self.default_focal_length = float(self.get_parameter('default_focal_length').value)
-
-        self.rotate_viz_90_clockwise = bool(self.get_parameter('rotate_viz_90_clockwise').value)
-        self.goal_publish_min_period = float(self.get_parameter('goal_publish_min_period').value)
-        self.goal_publish_min_delta = float(self.get_parameter('goal_publish_min_delta').value)
-        self.tf_timeout_sec = float(self.get_parameter('tf_timeout_sec').value)
-        self.sam3_timeout_sec = float(self.get_parameter('sam3_timeout_sec').value)
-        self.mono_depth_timeout_sec = float(self.get_parameter('mono_depth_timeout_sec').value)
-
+        
         # Multiple targets cycling
         targets_str = self.get_parameter('targets').value
         if targets_str:
@@ -205,6 +184,8 @@ class SAM3GoalGeneratorV2(Node):
             self.target_list = [self.target] if self.target else []
         self.target_cycle_on_reach = bool(self.get_parameter('target_cycle_on_reach').value)
         self.current_target_index = 0
+        
+        # If we have a target list, use the first one
         if self.target_list:
             self.target = self.target_list[0]
 
@@ -215,7 +196,7 @@ class SAM3GoalGeneratorV2(Node):
         self.camera_pitch_rad = math.radians(float(self.get_parameter('camera_pitch_deg').value))
         self.camera_height = float(self.get_parameter('camera_height').value)
         self.camera_forward_offset = float(self.get_parameter('camera_forward_offset').value)
-
+        
         # Performance settings
         self.sam3_max_width = int(self.get_parameter('sam3_max_width').value)
         self.sam3_jpeg_quality = int(self.get_parameter('sam3_jpeg_quality').value)
@@ -234,11 +215,14 @@ class SAM3GoalGeneratorV2(Node):
         self.gui_show_fps = bool(self.get_parameter('gui_fps').value)
         self.gui_save_dir = str(self.get_parameter('gui_save_dir').value)
 
-        # ===== Segmentation overlay settings =====
+        # Rotate visualization 90° (camera is sideways)
+        self.rotate_viz_90_clockwise = True
+
+        # ===== Segmentation overlay settings - MORE VISIBLE =====
         self.show_segmentation_overlay = True
-        self.seg_overlay_alpha = 0.65
-        self.show_contours = True
-        self.contour_thickness = 3
+        self.seg_overlay_alpha = 0.65  # Increased for better visibility
+        self.show_contours = True  # Draw contour around segmented region
+        self.contour_thickness = 3  # Thicker contours
 
         # TF
         self.tf_buffer = Buffer()
@@ -270,6 +254,8 @@ class SAM3GoalGeneratorV2(Node):
         self.robot_x = 0.0
         self.robot_y = 0.0
         self.robot_yaw = 0.0
+        self.goal_sent = False
+        self._goal_published_this_detection = False  # Only publish goal once per detection
 
         self.depth_camera_available = False
         self._last_depth_msg_time = 0.0
@@ -279,7 +265,6 @@ class SAM3GoalGeneratorV2(Node):
         self.last_depth_check = 0.0
         self.depth_check_interval = 5.0
 
-        # Use a session in main thread only; background threads create their own session
         self.session = requests.Session()
 
         self.gui_ready = False
@@ -294,49 +279,19 @@ class SAM3GoalGeneratorV2(Node):
         self._undistort_maps = None
         self._load_camera_calibration()
 
-        # Store last SAM3 result
-        self._last_sam3_result = None
-        self._sam3_lock = threading.Lock()
-
-        # Thread-safe busy flag
-        self._sam3_busy = False
-        self._sam3_busy_lock = threading.Lock()
-
-        # Track "new result" to avoid re-publishing per viz frame
-        self._sam3_result_seq = 0
-        self._last_processed_seq = -1
-
-        # Cache mono depth per SAM3 result
-        self._mono_depth_cache = None
-        self._mono_depth_cache_seq = -1
-
-        # Publish throttling
-        self._last_goal_pub_time = 0.0
-        self._last_goal_xy = None  # (x, y)
-
-        # last comm errors to report in status
-        self._last_sam3_error = ""
-        self._last_mono_error = ""
-
         # ==================== QoS ====================
-        qos_img = QoSProfile(
+        qos = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
-            history=HistoryPolicy.KEEP_LAST,
-            depth=1
-        )
-        qos_info = QoSProfile(
-            reliability=ReliabilityPolicy.RELIABLE,
             history=HistoryPolicy.KEEP_LAST,
             depth=1
         )
 
         # ==================== Subscribers ====================
-        self.create_subscription(Image, rgb_topic, self.rgb_callback, qos_img)
-        self.create_subscription(Image, depth_topic, self.depth_callback, qos_img)
-        self.create_subscription(CameraInfo, camera_info_topic, self.camera_info_callback, qos_info)
+        self.create_subscription(Image, rgb_topic, self.rgb_callback, qos)
+        self.create_subscription(Image, depth_topic, self.depth_callback, qos)
+        self.create_subscription(CameraInfo, camera_info_topic, self.camera_info_callback, qos)
         self.create_subscription(Odometry, f'/{self.ns}/odom', self.odom_callback, 10)
         self.create_subscription(String, '~/set_target', self.target_callback, 10)
-        self.create_subscription(PointStamped, f'/{self.ns}/goal_reached', self.goal_reached_callback, 10)
 
         # ==================== Publishers ====================
         self.goal_pub = self.create_publisher(PointStamped, f'/{self.ns}/goal', 10)
@@ -345,14 +300,22 @@ class SAM3GoalGeneratorV2(Node):
         self.status_pub = self.create_publisher(String, '~/status', 10)
         self.depth_viz_pub = self.create_publisher(Image, '~/depth_visualization', 10)
 
-        # ==================== Timers ====================
+        # ==================== Timer ====================
+        # Two timers: fast visualization, slower SAM3 detection
         self.viz_timer = self.create_timer(1.0 / max(self.viz_rate, 1.0), self.viz_callback)
         self.sam3_timer = self.create_timer(1.0 / max(self.rate, 0.1), self.sam3_callback)
+        self._sam3_lock = threading.Lock()
+        self._sam3_busy = False
 
         # ==================== Initialize ====================
         self.set_sam3_prompt(self.target)
         self.check_mono_depth_server()
         self._init_gui()
+        
+        # Subscribe to goal reached topic for target cycling
+        self.create_subscription(
+            PointStamped, f'/{self.ns}/goal_reached', self.goal_reached_callback, 10
+        )
 
         self.get_logger().info('SAM3 Goal Generator V2 started')
         self.get_logger().info(f'  Target: "{self.target}"')
@@ -364,7 +327,6 @@ class SAM3GoalGeneratorV2(Node):
         self.get_logger().info(f'  Detection Rate: {self.rate} Hz, Viz Rate: {self.viz_rate} Hz')
         self.get_logger().info(f'  SAM3 max width: {self.sam3_max_width}px, JPEG quality: {self.sam3_jpeg_quality}')
         self.get_logger().info(f'  Segmentation Overlay: alpha={self.seg_overlay_alpha}, contours={self.show_contours}')
-        self.get_logger().info(f'  Goal throttle: min_period={self.goal_publish_min_period:.2f}s, min_delta={self.goal_publish_min_delta:.2f}m')
 
     # ==================== Rotation helpers ====================
 
@@ -379,29 +341,35 @@ class SAM3GoalGeneratorV2(Node):
         rx2, ry2 = self._pt_rot90_cw(x2, y2, orig_h)
         return (min(rx1, rx2), min(ry1, ry2), max(rx1, rx2), max(ry1, ry2))
 
-    def _mask_to_rgb_size(self, mask: np.ndarray, h: int, w: int) -> Optional[np.ndarray]:
+    def _mask_to_rgb_size(self, mask: np.ndarray, h: int, w: int) -> np.ndarray:
         if mask is None:
             return None
         if mask.shape[:2] != (h, w):
             return cv2.resize(mask, (w, h), interpolation=cv2.INTER_NEAREST)
         return mask
 
-    def _overlay_mask(self, img_bgr: np.ndarray, mask_u8: np.ndarray,
+    def _overlay_mask(self, img_bgr: np.ndarray, mask_u8: np.ndarray, 
                       color_bgr: Tuple[int, int, int], alpha: float):
         """Alpha-blend a colored segmentation mask onto img_bgr in-place."""
         if mask_u8 is None:
             return
-
+        
         m = mask_u8 > 127
         if not np.any(m):
+            self.get_logger().warn('Mask has no pixels > 127!')
             return
 
+        # Create colored overlay
         overlay = img_bgr.copy()
         overlay[m] = color_bgr
+        
+        # Blend
         cv2.addWeighted(overlay, alpha, img_bgr, 1.0 - alpha, 0, dst=img_bgr)
-
+        
+        # Draw contour in BRIGHT MAGENTA to distinguish from green bounding box
         if self.show_contours:
             contours, _ = cv2.findContours(mask_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            # Use MAGENTA (255, 0, 255 in BGR) for mask contour - very visible
             cv2.drawContours(img_bgr, contours, -1, (255, 0, 255), self.contour_thickness + 1)
 
     # ==================== Calibration Helpers ====================
@@ -499,13 +467,10 @@ class SAM3GoalGeneratorV2(Node):
 
     def set_sam3_prompt(self, target: str):
         try:
-            r = self.session.post(
+            self.session.post(
                 f"{self.server_url}/prompt/{target.replace(' ', '%20')}",
-                timeout=3
+                timeout=5
             )
-            if r.status_code != 200:
-                self.get_logger().warn(f'SAM3 prompt set failed (HTTP {r.status_code})')
-                return
             self.get_logger().info(f'SAM3 prompt set to: "{target}"')
         except Exception as e:
             self.get_logger().warn(f'Could not set SAM3 prompt: {e}')
@@ -514,18 +479,9 @@ class SAM3GoalGeneratorV2(Node):
         try:
             r = self.session.get(f"{self.mono_depth_url}/health", timeout=2)
             self.mono_depth_available = (r.status_code == 200)
-            if not self.mono_depth_available:
-                self._last_mono_error = f"health HTTP {r.status_code}"
-        except Exception as e:
-            self.mono_depth_available = False
-            self._last_mono_error = str(e)
-            self.get_logger().warn('Monocular depth server not available')
-
-    def _safe_json(self, response) -> Optional[dict]:
-        try:
-            return response.json()
         except Exception:
-            return None
+            self.mono_depth_available = False
+            self.get_logger().warn('Monocular depth server not available')
 
     def get_mono_depth(self, rgb: np.ndarray) -> Optional[np.ndarray]:
         if not self.mono_depth_available:
@@ -537,56 +493,57 @@ class SAM3GoalGeneratorV2(Node):
             r = self.session.post(
                 f"{self.mono_depth_url}/estimate",
                 json={"image_base64": img_b64},
-                timeout=self.mono_depth_timeout_sec
+                timeout=5
             )
             if r.status_code != 200:
-                self._last_mono_error = f"HTTP {r.status_code}"
                 return None
 
-            result = self._safe_json(r)
-            if not result or not result.get('success'):
-                self._last_mono_error = "bad JSON or success=false"
+            result = r.json()
+            if not result.get('success'):
                 return None
 
             depth_b64 = result.get('depth_base64')
             if not depth_b64:
-                self._last_mono_error = "missing depth_base64"
                 return None
 
             depth_bytes = base64.b64decode(depth_b64)
             depth_np = np.frombuffer(depth_bytes, dtype=np.float32)
 
-            h = int(result.get('height', rgb.shape[0]))
-            w = int(result.get('width', rgb.shape[1]))
-            if h * w != depth_np.size:
-                self._last_mono_error = f"depth size mismatch (got {depth_np.size}, expected {h*w})"
-                return None
-
+            h = result.get('height', rgb.shape[0])
+            w = result.get('width', rgb.shape[1])
             depth = depth_np.reshape((h, w))
-            self._last_mono_error = ""
             return depth
 
         except Exception as e:
-            self._last_mono_error = str(e)
+            self.get_logger().debug(f'Mono depth request failed: {e}')
             return None
 
     # ==================== Callbacks ====================
 
     def target_callback(self, msg: String):
         self.target = msg.data
+        self.goal_sent = False
+        self._goal_published_this_detection = False  # Reset so new target gets a goal
         self.set_sam3_prompt(self.target)
         self.get_logger().info(f'Target changed to: "{self.target}"')
-
+    
     def goal_reached_callback(self, msg: PointStamped):
+        """Called when learner node reports goal reached - cycle to next target."""
+        self._goal_published_this_detection = False  # Reset for next detection
         if self.target_cycle_on_reach and len(self.target_list) > 1:
             self.cycle_target()
-
+    
     def cycle_target(self):
+        """Cycle to the next target in the list."""
         if len(self.target_list) <= 1:
             return
+        
         self.current_target_index = (self.current_target_index + 1) % len(self.target_list)
         new_target = self.target_list[self.current_target_index]
+        
         self.target = new_target
+        self.goal_sent = False
+        self._goal_published_this_detection = False  # Reset so new target gets a goal
         self.set_sam3_prompt(self.target)
         self.get_logger().info(f'[CYCLE] Target cycled to: "{self.target}" ({self.current_target_index + 1}/{len(self.target_list)})')
 
@@ -616,12 +573,15 @@ class SAM3GoalGeneratorV2(Node):
 
     def _lookup_object_size(self, object_class: str) -> Tuple[float, float]:
         object_class_lower = object_class.lower().strip()
+
         if object_class_lower in self.object_sizes:
             return self.object_sizes[object_class_lower]
+
         for key, size in self.object_sizes.items():
             k = key.lower()
             if k in object_class_lower or object_class_lower in k:
                 return size
+
         return self.object_sizes.get("object", (0.3, 0.3))
 
     def _mask_dimensions(self, mask: np.ndarray) -> Optional[Tuple[int, int, int, int, int, int]]:
@@ -634,7 +594,7 @@ class SAM3GoalGeneratorV2(Node):
         h = max(1, y2 - y1)
         return (w, h, x1, y1, x2, y2)
 
-    def estimate_distance_from_mask_width(self, mask: np.ndarray, object_class: str,
+    def estimate_distance_from_mask_width(self, mask: np.ndarray, object_class: str, 
                                           rgb_shape: Tuple[int, int, int]) -> Optional[float]:
         if mask is None:
             return None
@@ -644,7 +604,7 @@ class SAM3GoalGeneratorV2(Node):
 
         mask_use = mask
         if mask_use.shape[:2] != (img_h, img_w):
-            mask_use = cv2.resize(mask_use, (img_w, img_h), interpolation=cv2.INTER_NEAREST)
+            mask_use = cv2.resize(mask_use, (img_w, img_h), interpolation=cv2.INTER_LINEAR)
 
         if self._undistort_maps is not None:
             mask_use = self._undistort_image(mask_use)
@@ -665,7 +625,8 @@ class SAM3GoalGeneratorV2(Node):
             return None
         return float(distance)
 
-    def estimate_distance_from_bbox(self, box, object_class: str, img_width: int, img_height: int) -> Optional[float]:
+    def estimate_distance_from_bbox(self, box: List[float], object_class: str,
+                                    img_width: int, img_height: int) -> Optional[float]:
         x1, y1, x2, y2 = box
         bbox_width = x2 - x1
         bbox_height = y2 - y1
@@ -689,7 +650,8 @@ class SAM3GoalGeneratorV2(Node):
 
     # ==================== Depth helpers ====================
 
-    def get_depth_at_point(self, u: int, v: int, depth_img: np.ndarray, window_size: int = 5) -> Optional[float]:
+    def get_depth_at_point(self, u: int, v: int, depth_img: np.ndarray,
+                           window_size: int = 5) -> Optional[float]:
         h, w = depth_img.shape[:2]
         u = max(window_size, min(w - window_size - 1, u))
         v = max(window_size, min(h - window_size - 1, v))
@@ -700,11 +662,12 @@ class SAM3GoalGeneratorV2(Node):
             return None
         return float(np.median(window[valid]))
 
-    def _get_depth_from_mask_or_point(self, mask: Optional[np.ndarray], depth_img: np.ndarray,
+    def _get_depth_from_mask_or_point(self, mask: Optional[np.ndarray],
+                                      depth_img: np.ndarray,
                                       center_x: int, center_y: int) -> Optional[float]:
         if mask is not None:
             if mask.shape != depth_img.shape:
-                mask_rs = cv2.resize(mask, (depth_img.shape[1], depth_img.shape[0]),
+                mask_rs = cv2.resize(mask, (depth_img.shape[1], depth_img.shape[0]), 
                                      interpolation=cv2.INTER_NEAREST)
             else:
                 mask_rs = mask
@@ -715,12 +678,13 @@ class SAM3GoalGeneratorV2(Node):
                 return float(np.median(depths[valid]))
         return self.get_depth_at_point(center_x, center_y, depth_img)
 
-    def get_mask_center(self, mask: Optional[np.ndarray], box, rgb: np.ndarray) -> Tuple[int, int]:
+    def get_mask_center(self, mask: Optional[np.ndarray], box: List[float], 
+                        rgb: np.ndarray) -> Tuple[int, int]:
         if mask is not None:
             mask_rs = mask
             if mask_rs.shape[:2] != rgb.shape[:2]:
-                mask_rs = cv2.resize(mask_rs, (rgb.shape[1], rgb.shape[0]),
-                                     interpolation=cv2.INTER_NEAREST)
+                mask_rs = cv2.resize(mask_rs, (rgb.shape[1], rgb.shape[0]), 
+                                     interpolation=cv2.INTER_LINEAR)
             ys, xs = np.where(mask_rs > 127)
             if len(xs) > 0:
                 return int(np.mean(xs)), int(np.mean(ys))
@@ -732,22 +696,9 @@ class SAM3GoalGeneratorV2(Node):
             return False
         return (time.time() - self._last_depth_msg_time) <= self.depth_stale_sec
 
-    def _get_cached_mono_depth(self, rgb: np.ndarray, current_seq: int) -> Optional[np.ndarray]:
-        # Only recompute mono depth once per new SAM3 result
-        if not self.mono_depth_available:
-            return None
-        if self._mono_depth_cache is not None and self._mono_depth_cache_seq == current_seq:
-            return self._mono_depth_cache
-
-        mono = self.get_mono_depth(rgb)
-        if mono is not None:
-            self._mono_depth_cache = mono
-            self._mono_depth_cache_seq = current_seq
-        return mono
-
     def get_distance_auto(self, mask: Optional[np.ndarray], depth_img: Optional[np.ndarray],
-                          box, object_class: str, rgb: np.ndarray,
-                          sam3_seq: int) -> Tuple[Optional[float], str]:
+                          box: List[float], object_class: str, 
+                          rgb: np.ndarray) -> Tuple[Optional[float], str]:
         depth_ok = depth_img is not None and self._depth_is_fresh()
         cx, cy = self.get_mask_center(mask, box, rgb)
 
@@ -758,7 +709,7 @@ class SAM3GoalGeneratorV2(Node):
             return None, "depth_camera"
 
         if self.depth_mode == DepthMode.MONOCULAR:
-            mono = self._get_cached_mono_depth(rgb, sam3_seq)
+            mono = self.get_mono_depth(rgb)
             if mono is not None:
                 d = self._get_depth_from_mask_or_point(mask, mono, cx, cy)
                 return d, "mono_depth"
@@ -780,11 +731,12 @@ class SAM3GoalGeneratorV2(Node):
             if d is not None:
                 return d, "depth_camera"
 
-        mono = self._get_cached_mono_depth(rgb, sam3_seq)
-        if mono is not None:
-            d = self._get_depth_from_mask_or_point(mask, mono, cx, cy)
-            if d is not None:
-                return d, "mono_depth"
+        if self.mono_depth_available:
+            mono = self.get_mono_depth(rgb)
+            if mono is not None:
+                d = self._get_depth_from_mask_or_point(mask, mono, cx, cy)
+                if d is not None:
+                    return d, "mono_depth"
 
         if mask is not None:
             d = self.estimate_distance_from_mask_width(mask, object_class, rgb.shape)
@@ -823,7 +775,7 @@ class SAM3GoalGeneratorV2(Node):
                 self.odom_frame,
                 self.camera_frame,
                 rclpy.time.Time(),
-                timeout=rclpy.duration.Duration(seconds=self.tf_timeout_sec)
+                timeout=rclpy.duration.Duration(seconds=0.1)
             )
 
             t = transform.transform.translation
@@ -869,6 +821,14 @@ class SAM3GoalGeneratorV2(Node):
             mask_bytes = base64.b64decode(mask_b64)
             mask_np = np.frombuffer(mask_bytes, np.uint8)
             mask = cv2.imdecode(mask_np, cv2.IMREAD_GRAYSCALE)
+            
+            if mask is not None:
+                # Debug only - reduce log spam
+                nonzero = np.sum(mask > 127)
+                self.get_logger().debug(f'Mask decoded: shape={mask.shape}, pixels={nonzero}')
+            else:
+                self.get_logger().warn('Mask decode returned None!')
+            
             return mask
         except Exception as e:
             self.get_logger().warn(f'Failed to decode mask: {e}')
@@ -876,34 +836,10 @@ class SAM3GoalGeneratorV2(Node):
 
     # ==================== Goal publish ====================
 
-    def _should_publish_goal(self, goal_x: float, goal_y: float, sam3_seq: int) -> bool:
-        if not self.auto_publish:
-            return False
-        if self.gui_paused:
-            return False
-
-        now = time.time()
-        if (now - self._last_goal_pub_time) < self.goal_publish_min_period:
-            return False
-
-        if self._last_goal_xy is not None:
-            lx, ly = self._last_goal_xy
-            d = math.hypot(goal_x - lx, goal_y - ly)
-            if d < self.goal_publish_min_delta:
-                return False
-
-        # Only publish once per new SAM3 result (prevents 15Hz re-publish from viz frames)
-        if sam3_seq == self._last_processed_seq:
-            # viz is reprocessing the same seq; allow publish only if moved enough
-            # (already checked above), so ok to continue
-            pass
-
-        return True
-
     def publish_goal(self, x: float, y: float):
         goal = PointStamped()
         goal.header.stamp = self.get_clock().now().to_msg()
-        goal.header.frame_id = self.odom_frame
+        goal.header.frame_id = 'odom'
         goal.point.x = x
         goal.point.y = y
         goal.point.z = 0.0
@@ -927,8 +863,6 @@ class SAM3GoalGeneratorV2(Node):
         marker.color.a = 0.8
         self.marker_pub.publish(marker)
 
-        self._last_goal_pub_time = time.time()
-        self._last_goal_xy = (float(x), float(y))
         self.get_logger().info(f'Goal published: ({x:.2f}, {y:.2f})')
 
     # ==================== Main loop ====================
@@ -941,13 +875,11 @@ class SAM3GoalGeneratorV2(Node):
             rgb = self.latest_rgb.copy()
             depth = self.latest_depth.copy() if self.latest_depth is not None else None
 
+        # Always publish visualization with latest SAM3 results overlay
         self._publish_visualization(rgb, depth)
 
     def sam3_callback(self):
         """Slower callback for SAM3 detection (2 Hz)."""
-        if self.gui_paused:
-            return
-
         current_time = time.time()
 
         if self.depth_camera_available and (current_time - self._last_depth_msg_time) > self.depth_stale_sec:
@@ -962,147 +894,130 @@ class SAM3GoalGeneratorV2(Node):
                 return
             rgb = self.latest_rgb.copy()
 
-        # Thread-safe gate
-        with self._sam3_busy_lock:
-            if self._sam3_busy:
-                return
-            self._sam3_busy = True
-
-        self._send_sam3_request(rgb)
+        # Only send new SAM3 request if not already processing
+        if not self._sam3_busy:
+            self._send_sam3_request(rgb)
 
     def _send_sam3_request(self, rgb: np.ndarray):
         """Send image to SAM3 server in background thread."""
+        # Downscale image for faster SAM3 inference
         orig_h, orig_w = rgb.shape[:2]
         scale_factor = 1.0
         rgb_for_sam3 = rgb
-
+        
         if orig_w > self.sam3_max_width:
             scale_factor = self.sam3_max_width / orig_w
             new_w = self.sam3_max_width
             new_h = int(orig_h * scale_factor)
             rgb_for_sam3 = cv2.resize(rgb, (new_w, new_h), interpolation=cv2.INTER_AREA)
 
-        ok, buf = cv2.imencode('.jpg', rgb_for_sam3, [cv2.IMWRITE_JPEG_QUALITY, self.sam3_jpeg_quality])
-        if not ok:
-            self._last_sam3_error = "jpeg encode failed"
-            with self._sam3_busy_lock:
-                self._sam3_busy = False
-            return
-
+        _, buf = cv2.imencode('.jpg', rgb_for_sam3, [cv2.IMWRITE_JPEG_QUALITY, self.sam3_jpeg_quality])
         img_b64 = base64.b64encode(buf).decode()
 
         def run_sam3():
-            # IMPORTANT: do not reuse self.session in this thread
-            local_session = requests.Session()
-            t0 = time.time()
+            self._sam3_busy = True
             try:
-                r = local_session.post(
+                r = self.session.post(
                     f"{self.server_url}/segment",
                     json={"image_base64": img_b64, "confidence_threshold": self.confidence},
-                    timeout=self.sam3_timeout_sec
+                    timeout=5  # Reduced from 10s - fail faster if server is overloaded
                 )
-                if r.status_code != 200:
-                    self._last_sam3_error = f"HTTP {r.status_code}"
-                    return
-
-                result = self._safe_json(r)
-                if not result:
-                    self._last_sam3_error = "bad JSON"
-                    return
-
+                result = r.json()
+                # Store scale factor with result for coordinate adjustment
                 result['_scale_factor'] = scale_factor
-                result['_latency_ms'] = int((time.time() - t0) * 1000)
-
                 with self._sam3_lock:
                     self._last_sam3_result = result
-                    self._sam3_result_seq += 1
-
-                self._last_sam3_error = ""
-
             except Exception as e:
-                self._last_sam3_error = str(e)
                 self.get_logger().warn(f'SAM3 request failed: {e}')
             finally:
-                try:
-                    local_session.close()
-                except Exception:
-                    pass
-                with self._sam3_busy_lock:
-                    self._sam3_busy = False
+                self._sam3_busy = False
 
         threading.Thread(target=run_sam3, daemon=True).start()
 
     def _publish_visualization(self, rgb: np.ndarray, depth: Optional[np.ndarray]):
         """Publish visualization with latest SAM3 results (or raw frame if none)."""
         orig_h, orig_w = rgb.shape[:2]
-
+        
         with self._sam3_lock:
-            result = self._last_sam3_result
-            current_seq = self._sam3_result_seq
-
+            result = getattr(self, '_last_sam3_result', None)
+        
+        # Initialize visualization with current frame
         viz_base = rgb.copy()
         overlays = []
         best_detection = None
         best_score = 0.0
         prompt = self.target
-
+        
         # Process SAM3 results if available
         if result is not None and result.get('success'):
-            boxes = result.get('boxes', []) or []
-            scores = result.get('scores', []) or []
-            masks_b64 = result.get('masks_base64', []) or []
+            boxes = result.get('boxes', [])
+            scores = result.get('scores', [])
+            masks_b64 = result.get('masks_base64', [])
             prompt = result.get('prompt', self.target)
-            result_scale = float(result.get('_scale_factor', 1.0) or 1.0)
-
+            result_scale = result.get('_scale_factor', 1.0)
+            
             # Scale boxes back to original image coordinates if downscaled
             if result_scale != 1.0:
                 boxes = [[coord / result_scale for coord in box] for box in boxes]
 
+            # Color palette for multiple detections (more saturated/visible)
             colors = [
-                (0, 255, 0),
-                (255, 200, 0),
-                (0, 200, 255),
-                (255, 0, 255),
-                (255, 255, 0),
+                (0, 255, 0),    # Green
+                (255, 200, 0),  # Cyan-ish
+                (0, 200, 255),  # Orange
+                (255, 0, 255),  # Magenta
+                (255, 255, 0),  # Yellow
             ]
 
-            # Robust loop: handle mismatched list lengths
-            n = min(len(boxes), len(scores))
-            for idx in range(n):
-                box = boxes[idx]
-                score = float(scores[idx])
-
-                mask = None
-                if idx < len(masks_b64):
-                    mask = self.decode_mask(masks_b64[idx])
+            for idx, (box, score, mask_b64) in enumerate(zip(boxes, scores, masks_b64)):
+                mask = self.decode_mask(mask_b64)
+                
+                # Debug: log if mask was decoded
+                if mask is not None:
+                    mask_pixels = np.sum(mask > 127)
+                    self.get_logger().debug(f'Mask {idx}: {mask.shape}, pixels={mask_pixels}')
+                else:
+                    self.get_logger().debug(f'Mask {idx}: FAILED TO DECODE')
 
                 cx, cy = self.get_mask_center(mask, box, rgb)
                 x1, y1, x2, y2 = [int(v) for v in box]
-
+                
+                # Use different colors for different detections
                 color = colors[idx % len(colors)]
-
+                
+                # ALWAYS add to overlays for visualization (show all detections)
                 overlays.append({
                     "rect": (x1, y1, x2, y2),
                     "center": (cx, cy),
                     "color": color,
-                    "label": f"{prompt}: {score:.2f}",
+                    "label": f"{prompt}: {float(score):.2f}",
                     "mask": mask,
                 })
-
-                dist, method = self.get_distance_auto(mask, depth, box, prompt, rgb, current_seq)
-                if dist is None or dist < self.min_dist or dist > self.max_dist:
+                
+                # Only consider for goal if distance is valid
+                dist, method = self.get_distance_auto(mask, depth, box, prompt, rgb)
+                if dist is None:
+                    self.get_logger().debug(f'[DETECT] Skipping detection - no distance estimate')
+                    continue
+                if dist < self.min_dist:
+                    self.get_logger().debug(f'[DETECT] Skipping detection - too close: {dist:.2f}m < {self.min_dist}m')
+                    continue
+                if dist > self.max_dist:
+                    self.get_logger().debug(f'[DETECT] Skipping detection - too far: {dist:.2f}m > {self.max_dist}m')
                     continue
 
                 cam_point = self.pixel_to_3d(cx, cy, dist)
                 if cam_point is None:
+                    self.get_logger().debug(f'[DETECT] Skipping detection - pixel_to_3d failed')
                     continue
 
                 odom_x, odom_y = self.camera_to_odom(*cam_point)
-
-                if score > best_score:
-                    overlays[-1]["color"] = (0, 255, 0)
-                    overlays[-1]["label"] = f"{prompt}: {score:.2f} | {dist:.2f}m"
-                    best_score = score
+                
+                # Update overlay color to green if this is the best detection
+                if float(score) > best_score:
+                    overlays[-1]["color"] = (0, 255, 0)  # Best detection is green
+                    overlays[-1]["label"] = f"{prompt}: {float(score):.2f} | {float(dist):.2f}m"
+                    best_score = float(score)
                     best_detection = {
                         'distance': float(dist),
                         'odom_x': float(odom_x),
@@ -1119,17 +1034,13 @@ class SAM3GoalGeneratorV2(Node):
             depth_status.append("mono")
         depth_status.append("size")
         depth_status.append("bbox")
-
+        
         # Log detection summary periodically
         if not hasattr(self, '_last_detect_log_time'):
             self._last_detect_log_time = 0.0
         now = time.time()
-        if now - self._last_detect_log_time > 5.0:
-            if result is not None and result.get('success'):
-                num_detections = len(result.get('boxes', []) or [])
-            else:
-                num_detections = 0
-
+        if now - self._last_detect_log_time > 5.0:  # Every 5 seconds
+            num_detections = len(masks) if masks is not None else 0
             if num_detections > 0 and best_detection is None:
                 self.get_logger().warn(
                     f'[DETECT] SAM3 found {num_detections} "{prompt}" but none had valid depth/distance'
@@ -1161,55 +1072,66 @@ class SAM3GoalGeneratorV2(Node):
                 'depth_method': best_detection['method'],
                 'available_methods': depth_status,
                 'object_position': [best_detection['odom_x'], best_detection['odom_y']],
-                'goal_position': [float(goal_x), float(goal_y)],
-                'sam3_latency_ms': int(result.get('_latency_ms', -1)) if isinstance(result, dict) else -1,
-                'sam3_error': self._last_sam3_error,
-                'mono_error': self._last_mono_error,
-                'tf_available': bool(self.tf_available),
+                'goal_position': [float(goal_x), float(goal_y)]
             }
 
+            # CONTINUOUSLY publish goal while target is visible
+            # The learner uses this to track the goal position
             if self.auto_publish:
-                if not (math.isnan(goal_x) or math.isnan(goal_y) or math.isinf(goal_x) or math.isinf(goal_y)):
-                    if self._should_publish_goal(goal_x, goal_y, current_seq):
-                        self.publish_goal(goal_x, goal_y)
+                # Validate goal coordinates
+                if not (math.isnan(goal_x) or math.isnan(goal_y) or 
+                        math.isinf(goal_x) or math.isinf(goal_y)):
+                    self.publish_goal(goal_x, goal_y)
+                    
+                    # Log periodically (not every frame)
+                    if not hasattr(self, '_last_goal_log_time'):
+                        self._last_goal_log_time = 0.0
+                    now = time.time()
+                    if now - self._last_goal_log_time > 2.0:  # Log every 2 seconds
+                        self.get_logger().info(
+                            f'[GOAL] Publishing goal at ({goal_x:.2f}, {goal_y:.2f}), '
+                            f'dist={best_detection["distance"]:.2f}m, conf={best_detection["score"]:.2f}'
+                        )
+                        self._last_goal_log_time = now
                 else:
                     self.get_logger().warn(f'[GOAL] Invalid goal coordinates: ({goal_x}, {goal_y})')
-
         else:
             status = {
                 'found': False,
                 'target': prompt,
                 'available_methods': depth_status,
-                'message': 'Object not found in valid range',
-                'sam3_error': self._last_sam3_error,
-                'mono_error': self._last_mono_error,
-                'tf_available': bool(self.tf_available),
+                'message': 'Object not found in valid range'
             }
 
         self.status_pub.publish(String(data=json.dumps(status)))
 
         # ===== Build visualization =====
+        orig_h, orig_w = viz_base.shape[0], viz_base.shape[1]
         viz = viz_base
+
         if self.rotate_viz_90_clockwise:
             viz = self._rotate90_cw(viz)
 
-        # 1) Segmentation overlay
+        # 1) SEGMENTATION OVERLAY - Draw colored masks FIRST
         if self.show_segmentation_overlay:
             for item in overlays:
                 mask = item.get("mask")
                 if mask is None:
                     continue
 
+                # Resize mask to original RGB size
                 mask_rs = self._mask_to_rgb_size(mask, orig_h, orig_w)
                 if mask_rs is None:
                     continue
 
+                # Rotate mask to match viz orientation
                 if self.rotate_viz_90_clockwise:
                     mask_rs = self._rotate90_cw(mask_rs)
 
+                # Overlay with the detection color
                 self._overlay_mask(viz, mask_rs, item["color"], self.seg_overlay_alpha)
 
-        # 2) Bounding boxes and centers
+        # 2) Draw bounding boxes and center dots ON TOP of overlay (NO TEXT - shown in UI instead)
         for item in overlays:
             x1, y1, x2, y2 = item["rect"]
             cx, cy = item["center"]
@@ -1224,12 +1146,10 @@ class SAM3GoalGeneratorV2(Node):
 
             cv2.rectangle(viz, (rx1, ry1), (rx2, ry2), color, 2)
             cv2.circle(viz, (rcx, rcy), 6, color, -1)
-            cv2.circle(viz, (rcx, rcy), 8, (255, 255, 255), 2)
+            cv2.circle(viz, (rcx, rcy), 8, (255, 255, 255), 2)  # White ring around center
 
+        # Publish visualization
         self.viz_pub.publish(self.bridge.cv2_to_imgmsg(viz, 'bgr8'))
-
-        # Track last processed seq for gating logic
-        self._last_processed_seq = current_seq
 
         self._last_viz_for_gui = viz
         self._update_gui(viz)
@@ -1268,10 +1188,6 @@ class SAM3GoalGeneratorV2(Node):
             rclpy.shutdown()
         elif key == ord('p'):
             self.gui_paused = not self.gui_paused
-            if self.gui_paused:
-                self.get_logger().info("GUI paused: stopping SAM3 + goal publishing.")
-            else:
-                self.get_logger().info("GUI resumed.")
         elif key == ord('s'):
             try:
                 os.makedirs(self.gui_save_dir, exist_ok=True)
