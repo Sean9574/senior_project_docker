@@ -149,7 +149,7 @@ GRID_MAX_RANGE = 12.0
 
 # Movement Limits
 V_MAX = 1.25
-W_MAX = 7.0
+W_MAX = 5.0
 V_MIN_REVERSE = -0.05
 
 # RND Config
