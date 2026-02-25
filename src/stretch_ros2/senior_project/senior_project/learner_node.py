@@ -1,25 +1,17 @@
 #!/usr/bin/env python3
 """
-Stretch Robot RL Environment + Learner with GRADUATED SAFETY SYSTEM
+Stretch Robot RL Environment + Learner
 
-KEY FEATURES:
-1. Graduated Safety Blender - smooth transition from RL control to safety override
-2. Potential Field Avoidance - continuous repulsive forces from obstacles
-3. Shaped Rewards - RL learns to avoid, not just react
-4. Safety-Aware Training - RL experiences consequences without destruction
+The RL agent has FULL CONTROL — no hard-coded safety overrides.
+It learns to navigate, avoid obstacles, explore, and reach goals
+purely through reward signals and episode resets.
 
-SAFETY ZONES (based on 13" robot width + 2ft desired clearance):
-- FREE:      > 1.5m   - Full RL control
-- AWARE:    1.5-1.0m  - Gentle safety influence (10%)
-- CAUTION:  1.0-0.6m  - Blended control (40% safety)
-- DANGER:   0.6-0.35m - Safety dominant (70%)  
-- EMERGENCY: < 0.35m  - Hard override (100% safety)
+EPISODE TERMINATION:
+- COLLISION: min LIDAR distance < 0.30m → negative reward, reset
+- GOAL REACHED: within 0.45m of goal → positive reward, reset
+- TIMEOUT: max steps exceeded → small negative, reset
 
-The RL agent still learns because:
-1. It experiences the "resistance" from safety as environment dynamics
-2. Shaped rewards penalize getting into danger zones
-3. Near-misses still happen, teaching avoidance
-4. Reward includes penalty for safety intervention amount
+Each reset calls /sim/reset to teleport the robot back to start.
 """
 
 import argparse
@@ -49,6 +41,7 @@ from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import Imu, LaserScan
 from std_msgs.msg import Float32
 from std_msgs.msg import String as StringMsg
+from std_srvs.srv import Trigger
 from visualization_msgs.msg import Marker, MarkerArray
 
 # =============================================================================
@@ -71,67 +64,44 @@ ZONE_CAUTION = 0.65     # Light guidance begins - early enough to steer
 ZONE_DANGER = 0.45      # Stronger guidance - actively avoiding
 ZONE_EMERGENCY = 0.30   # Hard override - last resort
 
-# Safety blend ratios - GENTLE intervention, escalates gradually
-BLEND_FREE = 0.0        # 0% safety
-BLEND_AWARE = 0.0       # 0% safety - just monitoring
-BLEND_CAUTION = 0.15    # 15% safety - gentle steering
-BLEND_DANGER = 0.40     # 40% safety - firmer guidance  
-BLEND_EMERGENCY = 0.85  # 85% safety - strong but not total lockup
-
-# =============================================================================
-# POTENTIAL FIELD PARAMETERS - moderate repulsion, early detection
-# =============================================================================
-
-REPULSIVE_GAIN = 0.8           # Moderate repulsion
-REPULSIVE_INFLUENCE = 0.8      # Start repelling at 0.8m (earlier detection)
-ATTRACTIVE_GAIN = 0.8          # Strong goal attraction
-
 # =============================================================================
 # REWARD SHAPING PARAMETERS
 # =============================================================================
 
-# Proximity penalties (graduated) - BALANCED
-R_PROXIMITY_SCALE = -25.0      # Moderate penalty for being too close
-R_CLEARANCE_BONUS = 0.2        # Small bonus for clearance
-R_SAFETY_INTERVENTION = -3.0   # Moderate intervention penalty
-
 # =============================================================================
-# GOAL-SEEKING REWARDS (PRIMARY BEHAVIOR)
+# EPISODE TERMINATION REWARDS
 # =============================================================================
 
-R_GOAL = 2000.0               # Reaching goal
-R_COLLISION = -800.0          # Collision penalty (reduced from -1500)
-R_TIMEOUT = -50.0             # Episode timeout
-R_REDETECTION = 300.0         # Bonus for re-finding a lost target
+R_GOAL = 2000.0               # Reaching goal -> episode ends
+R_COLLISION = -500.0           # Collision -> episode ends
+R_TIMEOUT = -50.0              # Episode timeout -> episode ends
 
-# GOAL-SEEKING REWARDS (PRIMARY - these dominate when goal is visible)
-PROGRESS_SCALE = 500.0        # Strong reward for getting closer to goal (was 300)
-ALIGN_SCALE = 15.0            # Strong reward for facing goal (was 5)
-STEP_COST = -0.5              # Higher step cost during goal mode - encourages efficiency
-GOAL_RADIUS = 0.45            # Distance to count as "reached"
-
-# Bonus just for actively pursuing goal
-R_GOAL_PURSUIT = 2.0          # Per-step bonus when moving toward goal
-
-# Progress toward last-known target position (when target not visible)
-LAST_KNOWN_PROGRESS_SCALE = 150.0  # Reward for moving toward last sighting (increased)
-LAST_KNOWN_ALIGN_SCALE = 5.0       # Reward for facing last known position
+GOAL_RADIUS = 0.45             # Distance to count as "reached"
 
 # =============================================================================
-# EXPLORATION REWARDS (SECONDARY - only when no goal)
+# GOAL-SEEKING REWARDS (when goal is visible)
 # =============================================================================
 
-R_NEW_CELL = 3.0              # Per new cell discovered (increased)
-R_NOVELTY_SCALE = 0.8         # Bonus for unvisited areas (increased)
-R_FRONTIER_BONUS = 5.0        # Moving toward frontiers (increased)
-R_COLLISION_EXPLORE = -300.0  # Collision during exploration (reduced)
-R_STEP_EXPLORE = -0.01        # Step cost during exploration (reduced penalty)
+PROGRESS_SCALE = 400.0         # Reward for getting closer to goal
+ALIGN_SCALE = 10.0             # Reward for facing goal (only when moving forward)
+STEP_COST = -0.3               # Per-step cost to encourage efficiency
 
 # =============================================================================
-# MISSION REWARDS
+# EXPLORATION REWARDS (when no goal visible)
 # =============================================================================
 
-R_MISSION_COMPLETE = 5000.0   # Fully explored AND goals reached
+R_NEW_CELL = 3.0               # Per new cell discovered
+R_NOVELTY_SCALE = 0.8          # Bonus for unvisited areas
+R_FRONTIER_BONUS = 5.0         # Moving toward frontiers
+R_STEP_EXPLORE = -0.01         # Small step cost during exploration
+
+# =============================================================================
+# SHAPING REWARDS (always active — help RL learn obstacle avoidance)
+# =============================================================================
+
+R_FORWARD_BONUS = 1.0          # Reward for moving forward
+R_STUCK_PENALTY = -1.0         # Penalty for not moving
+R_SPIN_PENALTY = -3.0          # Penalty for spinning in place
 
 # =============================================================================
 # GENERAL CONFIG
@@ -246,15 +216,15 @@ class NavigationState:
 
 class DynamicNavigator:
     """
-    Simple, robust obstacle avoidance.
+    LIDAR scan analyzer — provides obstacle awareness for the RL observation.
     
-    Key principle: Don't overthink it.
-    - If obstacle ahead: turn toward clearer side
-    - If obstacle to side: steer away from it
-    - If very close: back up while turning
+    This does NOT control the robot. It just processes LIDAR data into:
+    - Sector distances (for observation vector)
+    - Zone classification (for logging/visualization)
+    - Safety blend metric (for observation vector)
+    - Clearance in 4 quadrants
     
-    CRITICAL: Uses hysteresis to prevent oscillation - once we pick
-    a turn direction, we stick with it until we're clear.
+    The RL agent sees this data and learns to avoid obstacles on its own.
     """
     
     def __init__(self, num_sectors: int = 36):
@@ -267,13 +237,7 @@ class DynamicNavigator:
             for i in range(num_sectors)
         ])
         
-        self.intervention_history = deque(maxlen=100)
         self.last_nav_state: Optional[NavigationState] = None
-        
-        # HYSTERESIS: Remember which way we're turning to avoid oscillation
-        self._committed_turn_direction: Optional[float] = None  # +1 = left, -1 = right
-        self._commit_start_time: float = 0.0
-        self._min_commit_duration: float = 0.5  # Stick with decision for at least 0.5s
     
     def analyze_scan(self, scan: Optional[LaserScan]) -> NavigationState:
         """Analyze LIDAR and compute simple clearance metrics."""
@@ -383,220 +347,7 @@ class DynamicNavigator:
         else:
             return "CRITICAL"
     
-    def compute_safe_velocity(
-        self,
-        rl_v: float,
-        rl_w: float,
-        nav_state: NavigationState,
-        goal_angle: Optional[float] = None
-    ) -> Tuple[float, float, float]:
-        """
-        Compute safe velocity - SIMPLE LOGIC:
-        
-        1. If very close (EMERGENCY): back up + turn away
-        2. If close (DANGER): stop forward + turn toward clear side
-        3. If moderately close (CAUTION): slow down + steer toward clear side
-        4. Otherwise: let RL control
-        """
-        min_dist = nav_state.min_distance
-        
-        # === EMERGENCY: Back up and turn away ===
-        if min_dist < ZONE_EMERGENCY:
-            escape_v, escape_w = self._emergency_escape(nav_state)
-            self.intervention_history.append(0.95)
-            return escape_v, escape_w, 0.95
-        
-        # === DANGER: Stop forward motion, turn toward clear side ===
-        if min_dist < ZONE_DANGER:
-            safe_v, safe_w = self._danger_avoid(nav_state, rl_v, rl_w, goal_angle)
-            self.intervention_history.append(0.7)
-            return safe_v, safe_w, 0.7
-        
-        # === CAUTION: Slow down, steer toward clear side ===
-        if min_dist < ZONE_CAUTION:
-            safe_v, safe_w = self._caution_steer(nav_state, rl_v, rl_w, goal_angle)
-            self.intervention_history.append(0.4)
-            return safe_v, safe_w, 0.4
-        
-        # === AWARE: Light intervention if heading toward obstacle ===
-        if min_dist < ZONE_AWARE:
-            # Only intervene if going forward toward the obstacle
-            obstacle_ahead = abs(nav_state.min_angle) < math.pi / 3
-            if obstacle_ahead and rl_v > 0.1:
-                # Steer away slightly
-                steer = self._get_turn_direction(nav_state, goal_angle)
-                safe_w = rl_w + steer * 0.5
-                safe_w = np.clip(safe_w, -W_MAX, W_MAX)
-                self.intervention_history.append(0.1)
-                return rl_v * 0.9, float(safe_w), 0.1
-        
-        # === FREE: No intervention - clear any turn commitment ===
-        self._clear_commitment()
-        self.intervention_history.append(0.0)
-        return rl_v, rl_w, 0.0
-    
-    def _get_turn_direction(self, nav_state: NavigationState, goal_angle: Optional[float]) -> float:
-        """
-        Decide which way to turn: positive = left, negative = right.
-        
-        USES HYSTERESIS to prevent oscillation:
-        - Once we commit to a direction, stick with it for min_commit_duration
-        - Only change if the other side becomes MUCH clearer (>0.5m difference)
-        """
-        import time
-        now = time.time()
-        
-        left_clear = nav_state.left_clearance
-        right_clear = nav_state.right_clearance
-        
-        # Check if we should stick with our committed direction
-        if self._committed_turn_direction is not None:
-            time_committed = now - self._commit_start_time
-            
-            # Still within commitment period?
-            if time_committed < self._min_commit_duration:
-                return self._committed_turn_direction
-            
-            # Check if we should change (only if OTHER side is MUCH better)
-            if self._committed_turn_direction > 0:  # Currently turning left
-                # Only switch to right if right is MUCH clearer
-                if right_clear > left_clear + 0.5:
-                    self._committed_turn_direction = -1.0
-                    self._commit_start_time = now
-                    return -1.0
-                else:
-                    return 1.0  # Keep turning left
-            else:  # Currently turning right
-                # Only switch to left if left is MUCH clearer
-                if left_clear > right_clear + 0.5:
-                    self._committed_turn_direction = 1.0
-                    self._commit_start_time = now
-                    return 1.0
-                else:
-                    return -1.0  # Keep turning right
-        
-        # No commitment yet - make initial decision
-        # Strong preference for clearer side
-        if left_clear > right_clear + 0.2:
-            turn_dir = 1.0  # Turn left
-        elif right_clear > left_clear + 0.2:
-            turn_dir = -1.0  # Turn right
-        else:
-            # Similar clearance - use goal or obstacle position
-            if goal_angle is not None and min(left_clear, right_clear) > ZONE_DANGER:
-                turn_dir = 1.0 if goal_angle > 0 else -1.0
-            else:
-                # Turn away from closest obstacle
-                turn_dir = -1.0 if nav_state.min_angle > 0 else 1.0
-        
-        # Commit to this direction
-        self._committed_turn_direction = turn_dir
-        self._commit_start_time = now
-        
-        return turn_dir
-    
-    def _clear_commitment(self):
-        """Clear the turn commitment when we're safe again."""
-        self._committed_turn_direction = None
-    
-    def _emergency_escape(self, nav_state: NavigationState) -> Tuple[float, float]:
-        """
-        EMERGENCY: Very close to obstacle.
-        Back up while turning away - AGGRESSIVE.
-        """
-        # ALWAYS back up - faster than before
-        escape_v = -0.4
-        
-        # Turn toward clearer side (STRONG turn)
-        turn_dir = self._get_turn_direction(nav_state, None)
-        escape_w = turn_dir * W_MAX * 0.9  # Almost full turn rate
-        
-        return float(escape_v), float(escape_w)
-    
-    def _danger_avoid(
-        self, 
-        nav_state: NavigationState, 
-        rl_v: float, 
-        rl_w: float,
-        goal_angle: Optional[float]
-    ) -> Tuple[float, float]:
-        """
-        DANGER: Close to obstacle.
-        No forward motion toward obstacle, turn toward clear side.
-        """
-        obstacle_ahead = abs(nav_state.min_angle) < math.pi / 2
-        
-        # Velocity: stop or back up if obstacle ahead
-        if obstacle_ahead:
-            if nav_state.front_clearance < ZONE_DANGER:
-                safe_v = -0.25  # Back up more aggressively
-            else:
-                safe_v = -0.1  # Still back up a bit to create space
-        else:
-            # Obstacle to side - can stop or creep back
-            safe_v = min(0.0, rl_v * 0.1)
-        
-        # Turn toward clear side - DECISIVE
-        turn_dir = self._get_turn_direction(nav_state, goal_angle)
-        safe_w = turn_dir * W_MAX * 0.8  # Strong turn
-        
-        return float(safe_v), float(safe_w)
-    
-    def _caution_steer(
-        self,
-        nav_state: NavigationState,
-        rl_v: float,
-        rl_w: float,
-        goal_angle: Optional[float]
-    ) -> Tuple[float, float]:
-        """
-        CAUTION: Moderately close to obstacle.
-        Slow down, steer toward clearer side.
-        """
-        obstacle_ahead = abs(nav_state.min_angle) < math.pi / 2
-        
-        # Slow down based on proximity
-        proximity_factor = (nav_state.min_distance - ZONE_DANGER) / (ZONE_CAUTION - ZONE_DANGER)
-        proximity_factor = np.clip(proximity_factor, 0.2, 1.0)
-        
-        if obstacle_ahead:
-            safe_v = rl_v * proximity_factor * 0.5
-        else:
-            safe_v = rl_v * proximity_factor
-        
-        # Blend RL steering with safety steering
-        turn_dir = self._get_turn_direction(nav_state, goal_angle)
-        safety_w = turn_dir * W_MAX * 0.5
-        safe_w = rl_w * 0.5 + safety_w * 0.5  # 50/50 blend
-        safe_w = np.clip(safe_w, -W_MAX, W_MAX)
-        
-        return float(safe_v), float(safe_w)
-    
-    def compute_proximity_reward(self, nav_state: NavigationState) -> float:
-        min_dist = nav_state.min_distance
-        if min_dist >= MIN_SAFE_DISTANCE:
-            return R_CLEARANCE_BONUS
-        if min_dist >= ZONE_DANGER:
-            penalty_factor = 1.0 - (min_dist - ZONE_DANGER) / (MIN_SAFE_DISTANCE - ZONE_DANGER)
-            return R_PROXIMITY_SCALE * 0.2 * penalty_factor
-        elif min_dist >= ZONE_EMERGENCY:
-            penalty_factor = 1.0 - (min_dist - ZONE_EMERGENCY) / (ZONE_DANGER - ZONE_EMERGENCY)
-            return R_PROXIMITY_SCALE * 0.5 * (0.5 + 0.5 * penalty_factor)
-        else:
-            return R_PROXIMITY_SCALE
-    
-    def compute_intervention_penalty(self, intervention: float) -> float:
-        return R_SAFETY_INTERVENTION * intervention
-    
-    def get_average_intervention(self) -> float:
-        if len(self.intervention_history) == 0:
-            return 0.0
-        return float(np.mean(self.intervention_history))
 
-
-# Compatibility aliases
-SafetyState = NavigationState
-GraduatedSafetyBlender = DynamicNavigator
 
 # =============================================================================
 # Running Mean/Std for Normalization (unchanged)
@@ -1251,6 +1002,18 @@ class StretchRosInterface(Node):
         self.path_history: deque = deque(maxlen=PATH_HISTORY_LENGTH)
         
         self.get_logger().info("[VIZ] Publishing: /exploration_map, /visit_heatmap, /robot_path, /safety_zone, /goal_marker")
+        
+        # Sim reset service client
+        self.reset_client = self.create_client(Trigger, '/sim/reset')
+        self._sim_reset_available = False
+        if self.reset_client.wait_for_service(timeout_sec=2.0):
+            self._sim_reset_available = True
+            self.get_logger().info('[ROS] /sim/reset service FOUND — full sim reset enabled')
+        else:
+            self.get_logger().warn(
+                '[ROS] /sim/reset service NOT found — using soft reset only. '
+                'Patch your stretch_mujoco_driver to enable full sim reset.'
+            )
     
     def add_path_point(self, x: float, y: float):
         self.path_history.append((x, y))
@@ -1349,6 +1112,66 @@ class StretchRosInterface(Node):
         msg.angular.z = float(w)
         self.cmd_pub.publish(msg)
 
+    def reset_simulation(self, timeout: float = 5.0) -> bool:
+        """
+        Reset the MuJoCo simulation to its initial state.
+        
+        Returns True if the sim was successfully reset (robot teleported back),
+        False if using soft reset (robot stays in place).
+        """
+        # Step 1: Stop the robot immediately
+        for _ in range(10):
+            self.send_cmd(0.0, 0.0)
+            rclpy.spin_once(self, timeout_sec=0.01)
+        
+        # Step 2: Try to call the sim reset service
+        if self._sim_reset_available:
+            req = Trigger.Request()
+            future = self.reset_client.call_async(req)
+            
+            # Wait for response
+            start = time.time()
+            while not future.done() and (time.time() - start) < timeout:
+                rclpy.spin_once(self, timeout_sec=0.1)
+            
+            if future.done():
+                result = future.result()
+                if result and result.success:
+                    self.get_logger().info('[RESET] MuJoCo sim reset SUCCESS')
+                    self._wait_for_fresh_data()
+                    return True
+                else:
+                    msg = result.message if result else 'No response'
+                    self.get_logger().warn(f'[RESET] Sim reset failed: {msg}')
+            else:
+                self.get_logger().warn('[RESET] Sim reset timed out')
+        
+        # Step 3: Soft reset fallback — just stop and clear
+        self.get_logger().info('[RESET] Using soft reset (robot stays in place)')
+        self.send_cmd(0.0, 0.0)
+        time.sleep(0.2)
+        self._wait_for_fresh_data()
+        return False
+    
+    def _wait_for_fresh_data(self, timeout: float = 3.0):
+        """Wait for fresh odom and scan data after a reset."""
+        old_odom = self.last_odom
+        old_scan = self.last_scan
+        
+        start = time.time()
+        while time.time() - start < timeout:
+            rclpy.spin_once(self, timeout_sec=0.1)
+            
+            # Check if we got NEW messages (different object identity)
+            odom_fresh = (self.last_odom is not None and self.last_odom is not old_odom)
+            scan_fresh = (self.last_scan is not None and self.last_scan is not old_scan)
+            
+            if odom_fresh and scan_fresh:
+                return True
+        
+        self.get_logger().warn('[RESET] Timeout waiting for fresh sensor data')
+        return False
+
 
 # =============================================================================
 # Gym Environment with Graduated Safety
@@ -1356,13 +1179,14 @@ class StretchRosInterface(Node):
 
 class StretchExploreEnv(gym.Env):
     """
-    Environment with dynamic navigation system.
+    RL environment — NO safety overrides.
     
-    Key features:
-    1. VFH-inspired gap finding for obstacle avoidance
-    2. Smooth blending between RL and safety navigation
-    3. Goal-aware avoidance - prefers paths toward goal
-    4. Always moving - never completely stops
+    The RL agent has full control. Episodes terminate on:
+    - Collision (min_distance < ZONE_EMERGENCY)
+    - Goal reached (distance < GOAL_RADIUS) 
+    - Timeout (max_steps)
+    
+    Each termination triggers a sim reset via /sim/reset service.
     """
     
     def __init__(self, ros: StretchRosInterface, rnd_module: RNDModule,
@@ -1372,7 +1196,7 @@ class StretchExploreEnv(gym.Env):
         self.control_dt = control_dt
         self.rnd = rnd_module
         
-        # Navigation system (replaces old safety_blender)
+        # Navigator for scan analysis (observation only, NOT for control)
         self.navigator = DynamicNavigator(num_sectors=36)
         
         # Occupancy grid
@@ -1394,13 +1218,7 @@ class StretchExploreEnv(gym.Env):
         self.prev_action = np.zeros(2, dtype=np.float32)
         self.prev_goal_dist = 0.0
         
-        # Goal tracking to prevent immediate re-success at same location
-        self._last_goal_reached_pos = None  # (x, y) of last reached goal
-        self._min_goal_separation = 1.5  # Must be 1.5m from last goal to accept new goal
         self._goals_reached_this_episode = 0  # Count of goals reached
-        
-        # Track safety interventions for logging
-        self.episode_interventions = []
         
         # Observation space (added safety sector distances)
         grid_flat_size = GRID_SIZE * GRID_SIZE
@@ -1433,41 +1251,86 @@ class StretchExploreEnv(gym.Env):
         self.ros.wait_for_sensors()
         
         self.ros.get_logger().info(f"[ENV] Observation dim: {obs_dim}")
-        self.ros.get_logger().info(f"[ENV] Robot width: {ROBOT_WIDTH_M:.2f}m, Clearance: {DESIRED_CLEARANCE_M:.2f}m")
-        self.ros.get_logger().info(f"[ENV] Safety zones: FREE>{ZONE_FREE}m, AWARE>{ZONE_AWARE}m, "
-                                    f"CAUTION>{ZONE_CAUTION}m, DANGER>{ZONE_DANGER}m, EMERGENCY>{ZONE_EMERGENCY}m")
-        self.ros.get_logger().info(f"[ENV] DYNAMIC VFH NAVIGATION ENABLED")
+        self.ros.get_logger().info(f"[ENV] Collision threshold: {ZONE_EMERGENCY}m, Goal radius: {GOAL_RADIUS}m")
+        self.ros.get_logger().info(f"[ENV] NO SAFETY OVERRIDE — RL has full control")
     
     def reset(self, *, seed=None, options=None):
         super().reset(seed=seed)
         
+        # ============================================================
+        # PHASE 1: Reset the simulation
+        # ============================================================
+        
+        sim_was_reset = self.ros.reset_simulation()
+        
+        if sim_was_reset:
+            self.ros.get_logger().info(
+                f'[RESET] Episode {self.episode_index} — full sim reset'
+            )
+        else:
+            self.ros.get_logger().info(
+                f'[RESET] Episode {self.episode_index} — soft reset (in-place)'
+            )
+        
+        # ============================================================
+        # PHASE 2: Clear ALL episode state
+        # ============================================================
+        
+        # Core counters
         self.step_count = 0
         self.episode_return = 0.0
         self.prev_action[:] = 0.0
-        self.occ_grid.reset()
-        self.episode_interventions = []
-        self._goals_reached_this_episode = 0
-        self._had_goal_last_step = False  # Track goal state transitions
         
-        self.occ_grid.decay_visits()
+        # Occupancy grid — full reset since robot is back at start
+        self.occ_grid.reset()
+        if not sim_was_reset:
+            # Soft reset: keep some map knowledge but decay it
+            self.occ_grid.decay_visits()
+        
+        # Goal tracking
+        self._goals_reached_this_episode = 0
+        
+        # Clear goal state on the ROS interface
+        self.ros.last_goal = None
+        self.ros._last_goal_time = 0.0
+        self.ros._target_was_lost = False
+        self.ros._lost_time = 0.0
+        self.ros._last_known_target_pos = None
+        self.ros._last_known_target_time = 0.0
+        
+        # Clear last-known distance tracker (used in explore reward)
+        if hasattr(self, '_prev_last_known_dist'):
+            del self._prev_last_known_dist
+        
+        # Clear RViz markers
+        self.ros.path_history.clear()
+        
+        # ============================================================
+        # PHASE 3: Get fresh state
+        # ============================================================
         
         self.prev_goal_dist = self._goal_distance()
         
-        # Get initial navigation state
-        self.last_nav_state = self.navigator.analyze_scan(self.ros.last_scan)
-        self.last_safety_state = self.last_nav_state  # Compatibility
+        # Get initial navigation state from fresh scan
+        if self.ros.last_scan is not None:
+            self.last_nav_state = self.navigator.analyze_scan(self.ros.last_scan)
+        else:
+            self.last_nav_state = None
+        self.last_safety_state = self.last_nav_state
         
         obs = self._build_observation()
+        
         info = {
-            "has_goal": self.ros.last_goal is not None,
+            "has_goal": False,
             "goal_dist": self.prev_goal_dist,
-            "nav_zone": self.last_nav_state.zone if self.last_nav_state else "UNKNOWN"
+            "nav_zone": self.last_nav_state.zone if self.last_nav_state else "UNKNOWN",
+            "sim_reset": sim_was_reset,
         }
         
         return obs, info
     
     def step(self, action: np.ndarray):
-        # Process RL action
+        # Process RL action — NO SAFETY OVERRIDE, RL learns from consequences
         a = np.clip(action, -1.0, 1.0)
         rl_v = float(a[0]) * V_MAX
         rl_w = float(a[1]) * W_MAX
@@ -1476,30 +1339,10 @@ class StretchExploreEnv(gym.Env):
             rl_v = V_MIN_REVERSE
         
         # ============================================================
-        # DYNAMIC VFH NAVIGATION
+        # EXECUTE RAW RL ACTION (no safety blending)
         # ============================================================
         
-        # Analyze current scan
-        nav_state = self.navigator.analyze_scan(self.ros.last_scan)
-        self.last_nav_state = nav_state
-        self.last_safety_state = nav_state  # Compatibility
-        
-        # Get goal angle for navigation (if goal exists)
-        goal_angle = self._goal_angle() if self.ros.last_goal is not None else None
-        
-        # Compute safe velocity using VFH navigation
-        safe_v, safe_w, intervention = self.navigator.compute_safe_velocity(
-            rl_v, rl_w, nav_state, goal_angle
-        )
-        
-        # Track intervention
-        self.episode_interventions.append(intervention)
-        
-        # ============================================================
-        # EXECUTE SAFE ACTION
-        # ============================================================
-        
-        self.ros.send_cmd(safe_v, safe_w)
+        self.ros.send_cmd(rl_v, rl_w)
         
         # Wait for control period
         t_end = time.time() + self.control_dt
@@ -1515,167 +1358,180 @@ class StretchExploreEnv(gym.Env):
                 st["x"], st["y"], st["yaw"], scan
             )
         
-        # Update navigation state after movement
+        # Analyze scan for observation (NOT for control override)
         nav_state = self.navigator.analyze_scan(self.ros.last_scan)
         self.last_nav_state = nav_state
-        self.last_safety_state = nav_state  # Compatibility
+        self.last_safety_state = nav_state
         
         # Build observation
         obs = self._build_observation()
         
         # ============================================================
-        # COMPUTE REWARD WITH NAVIGATION SHAPING
+        # CHECK TERMINATION CONDITIONS
         # ============================================================
         
-        # Check goal validity with persistence timeout
+        terminated = False
+        collision = False
+        success = False
+        reward = 0.0
+        reward_terms = {}
+        
+        min_dist = nav_state.min_distance if nav_state else LIDAR_MAX_RANGE
+        
+        # --- COLLISION: episode ends ---
+        if min_dist < ZONE_EMERGENCY and self.step_count > 10:
+            terminated = True
+            collision = True
+            reward += R_COLLISION
+            reward_terms["collision"] = R_COLLISION
+        
+        # --- GOAL REACHED: episode ends ---
         has_goal = self.ros.last_goal is not None
+        d_goal = self._goal_distance()
         
-        if has_goal:
-            # Check if goal has timed out (no update for too long)
-            goal_age = time.time() - self.ros._last_goal_time
-            if goal_age > self.ros._goal_persist_timeout:
-                # Goal is stale - clear it and mark target as lost
-                self.ros.last_goal = None
-                has_goal = False
-                self.ros._target_was_lost = True
-                self.ros._lost_time = time.time()
-                if self.step_count % 100 == 0:
-                    self.ros.get_logger().info(f'[GOAL] Cleared stale goal (age: {goal_age:.1f}s > {self.ros._goal_persist_timeout:.0f}s)')
-        
-        # Check if last-known position has expired
-        if self.ros._last_known_target_pos is not None:
-            last_known_age = time.time() - self.ros._last_known_target_time
-            if last_known_age > self.ros._last_known_persist_timeout:
-                self.ros._last_known_target_pos = None
-        
-        # Check if new goal is too close to a recently reached goal
-        # This prevents immediate re-triggering when goal generator publishes same target
-        if has_goal and self._last_goal_reached_pos is not None:
-            goal_x = self.ros.last_goal.point.x
-            goal_y = self.ros.last_goal.point.y
-            last_x, last_y = self._last_goal_reached_pos
+        if has_goal and d_goal <= GOAL_RADIUS and not terminated:
+            terminated = True
+            success = True
+            reward += R_GOAL
+            reward_terms["goal"] = R_GOAL
+            self._goals_reached_this_episode += 1
             
-            dist_from_last_goal = math.hypot(goal_x - last_x, goal_y - last_y)
+            # Publish goal reached
+            reached_msg = PointStamped()
+            reached_msg.header.stamp = self.ros.get_clock().now().to_msg()
+            reached_msg.header.frame_id = "odom"
+            reached_msg.point.x = self.ros.last_goal.point.x
+            reached_msg.point.y = self.ros.last_goal.point.y
+            reached_msg.point.z = 0.0
+            self.ros.goal_reached_pub.publish(reached_msg)
             
-            if dist_from_last_goal < self._min_goal_separation:
-                # New goal is same as last reached goal - ignore it
-                # Robot must explore until target moves or different target found
-                has_goal = False
+            self.ros.get_logger().info(
+                f"[GOAL REACHED] dist={d_goal:.2f}m, reward={R_GOAL:.0f} -> EPISODE ENDS"
+            )
+        
+        # --- TIMEOUT: episode ends ---
+        truncated = self.step_count >= self.max_steps
+        if truncated and not terminated:
+            reward += R_TIMEOUT
+            reward_terms["timeout"] = R_TIMEOUT
+        
+        # ============================================================
+        # COMPUTE SHAPING REWARDS (only if episode continues)
+        # ============================================================
+        
+        if not terminated and not truncated:
+            if has_goal:
+                # Goal-seeking shaping
+                progress = self.prev_goal_dist - d_goal
+                r_progress = PROGRESS_SCALE * progress
+                reward_terms["progress"] = r_progress
+                reward += r_progress
+                
+                # Alignment — only when moving forward
+                if rl_v > 0.15:
+                    ang = self._goal_angle()
+                    r_align = ALIGN_SCALE * math.cos(ang)
+                    reward_terms["alignment"] = r_align
+                    reward += r_align
+                
+                reward += STEP_COST
+                reward_terms["step"] = STEP_COST
             else:
-                # Different goal location, clear the cooldown
-                self._last_goal_reached_pos = None
+                # Exploration shaping
+                r_discovery = R_NEW_CELL * new_cells
+                reward_terms["discovery"] = r_discovery
+                reward += r_discovery
+                
+                novelty = self.occ_grid.get_novelty(st["x"], st["y"])
+                r_novelty = R_NOVELTY_SCALE * novelty
+                reward_terms["novelty"] = r_novelty
+                reward += r_novelty
+                
+                frontier_angle = self.occ_grid.get_frontier_direction(st["x"], st["y"], st["yaw"])
+                if abs(frontier_angle) < math.pi / 3 and st["v_lin"] > 0.05:
+                    r_frontier = R_FRONTIER_BONUS * math.cos(frontier_angle)
+                    reward_terms["frontier"] = r_frontier
+                    reward += r_frontier
+                
+                # RND intrinsic reward
+                r_rnd = self.rnd.compute_intrinsic_reward(obs) * self.rnd_weight
+                reward_terms["rnd"] = r_rnd
+                reward += r_rnd
+                
+                reward += R_STEP_EXPLORE
+                reward_terms["step"] = R_STEP_EXPLORE
+            
+            # Movement shaping (always active — helps learn to move)
+            if st["v_lin"] > 0.2:
+                reward += R_FORWARD_BONUS
+                reward_terms["forward"] = R_FORWARD_BONUS
+            elif st["v_lin"] < 0.05 and abs(st["v_ang"]) < 0.1:
+                reward += R_STUCK_PENALTY
+                reward_terms["stuck"] = R_STUCK_PENALTY
+            
+            if st["v_lin"] < 0.1 and abs(st["v_ang"]) > 1.5:
+                reward += R_SPIN_PENALTY
+                reward_terms["spin"] = R_SPIN_PENALTY
         
-        # Re-detection bonus: reward for re-finding a lost target
-        r_redetection = 0.0
-        if has_goal and self.ros._target_was_lost:
-            r_redetection = R_REDETECTION
-            self.ros._target_was_lost = False
-            self.ros.get_logger().info(f'[REDETECT] Target re-acquired! Bonus +{R_REDETECTION:.0f}')
+        # ============================================================
+        # BOOKKEEPING
+        # ============================================================
         
-        # Log mode transitions
-        if has_goal and not self._had_goal_last_step:
-            d_goal = self._goal_distance()
-            self.ros.get_logger().info(f'[MODE CHANGE] EXPLORE -> GOAL | Target acquired at {d_goal:.2f}m')
-        elif not has_goal and self._had_goal_last_step:
-            self.ros.get_logger().info(f'[MODE CHANGE] GOAL -> EXPLORE | Target lost')
-        self._had_goal_last_step = has_goal
-        
-        if has_goal:
-            reward, terminated, info = self._compute_goal_reward(safe_v, safe_w, new_cells)
-            reward += r_redetection
-            if r_redetection > 0:
-                info["reward_terms"]["redetection"] = r_redetection
-        else:
-            reward, terminated, info = self._compute_explore_reward(new_cells, st, obs)
-        
-        # Add navigation-shaped rewards
-        proximity_reward = self.navigator.compute_proximity_reward(nav_state)
-        intervention_penalty = self.navigator.compute_intervention_penalty(intervention)
-        
-        reward += proximity_reward + intervention_penalty
-        
-        info["reward_terms"]["proximity"] = proximity_reward
-        info["reward_terms"]["intervention_penalty"] = intervention_penalty
-        info["nav_zone"] = nav_state.zone
-        info["safety_blend"] = nav_state.safety_blend
-        info["intervention"] = intervention
-        info["executed_v"] = safe_v
-        info["executed_w"] = safe_w
-        info["rl_v"] = rl_v
-        info["rl_w"] = rl_w
-        info["best_direction"] = nav_state.best_direction
-        info["num_gaps"] = len(nav_state.clear_gaps)
-        
-        # Update RND weight
+        self.prev_goal_dist = d_goal
         self.total_steps += 1
         self.rnd_weight = max(
             RND_WEIGHT_MIN,
             RND_WEIGHT_INITIAL * (RND_WEIGHT_DECAY ** self.total_steps)
         )
-        
         self.episode_return += reward
         self.prev_action[:] = a
         self.step_count += 1
         
-        truncated = self.step_count >= self.max_steps
+        done = terminated or truncated
         
-        # Check for "mission complete" termination:
-        # Environment fully explored AND at least one goal reached
-        stats = self.occ_grid.get_stats()
-        mission_complete = False
-        if stats['fully_explored'] and self._goals_reached_this_episode > 0:
-            terminated = True
-            mission_complete = True
-            info["mission_complete"] = True
-            
-            # Add mission complete bonus
-            reward += R_MISSION_COMPLETE
-            self.episode_return += R_MISSION_COMPLETE  # Also update episode total
-            info["reward_terms"]["mission_complete"] = R_MISSION_COMPLETE
-            
-            self.ros.get_logger().info(
-                f"[MISSION COMPLETE] Explored {stats['total_discovered']} cells, "
-                f"reached {self._goals_reached_this_episode} goal(s), bonus +{R_MISSION_COMPLETE:.0f}"
-            )
+        info = {
+            "collision": collision,
+            "success": success,
+            "exploring": not has_goal,
+            "goal_dist": d_goal,
+            "reward_terms": reward_terms,
+            "nav_zone": nav_state.zone if nav_state else "UNKNOWN",
+            "min_distance": min_dist,
+            "executed_v": rl_v,
+            "executed_w": rl_w,
+        }
         
         # Logging
-        if terminated or truncated:
-            mode = "GOAL" if has_goal else "EXPLORE"
-            if mission_complete:
-                status = "MISSION_COMPLETE"
-            elif info.get("success", False):
-                status = "SUCCESS"
-            elif info.get("collision", False):
+        if done:
+            stats = self.occ_grid.get_stats()
+            if success:
+                status = "GOAL_REACHED"
+            elif collision:
                 status = "COLLISION"
             else:
                 status = "TIMEOUT"
-            avg_intervention = np.mean(self.episode_interventions) if self.episode_interventions else 0.0
+            mode = "GOAL" if has_goal else "EXPLORE"
             self.ros.get_logger().info(
                 f"[EP {self.episode_index:04d}] {mode} {status} | "
                 f"Return {self.episode_return:+.1f} | Steps {self.step_count} | "
-                f"Cells {stats['total_discovered']} | Frontiers {stats['frontier_count']} | "
+                f"Cells {stats['total_discovered']} | "
                 f"Goals {self._goals_reached_this_episode} | "
-                f"Intervention {avg_intervention:.1%}"
+                f"MinDist {min_dist:.2f}m"
             )
             self.episode_index += 1
         
         # Debug logging
         if self.step_count % DEBUG_EVERY_N == 0:
             mode = "GOAL" if has_goal else "EXPLORE"
-            goal_info = ""
-            if has_goal:
-                d_goal = self._goal_distance()
-                goal_info = f"goal_dist={d_goal:.2f}m "
+            goal_info = f"goal_dist={d_goal:.2f}m " if has_goal else ""
             self.ros.get_logger().info(
-                f"[{mode}] step={self.step_count} zone={nav_state.zone} "
-                f"blend={nav_state.safety_blend:.0%} min_d={nav_state.min_distance:.2f}m "
-                f"gaps={len(nav_state.clear_gaps)} best_dir={math.degrees(nav_state.best_direction):.0f}° "
+                f"[{mode}] step={self.step_count} min_d={min_dist:.2f}m "
                 f"{goal_info}"
-                f"rl=[{rl_v:.2f},{rl_w:.2f}] safe=[{safe_v:.2f},{safe_w:.2f}] "
-                f"frontiers={stats['frontier_count']} goals={self._goals_reached_this_episode}"
+                f"cmd=[{rl_v:.2f},{rl_w:.2f}] "
+                f"r={reward:.2f}"
             )
         
-        # Publish reward breakdown
+        # Publish reward
         self._publish_reward_breakdown(reward, info, has_goal)
         
         # Publish visualization
@@ -1805,233 +1661,6 @@ class StretchExploreEnv(gym.Env):
             lk_marker.color.a = 0.6
             lk_marker.lifetime.sec = 1
             self.ros.last_known_marker_pub.publish(lk_marker)
-    
-    def _compute_explore_reward(self, new_cells: int, st: Dict, obs: np.ndarray) -> Tuple[float, bool, Dict]:
-        """Compute reward for exploration mode."""
-        reward = 0.0
-        terminated = False
-        collision = False
-        
-        r_discovery = R_NEW_CELL * new_cells
-        
-        novelty = self.occ_grid.get_novelty(st["x"], st["y"])
-        r_novelty = R_NOVELTY_SCALE * novelty
-        
-        frontier_angle = self.occ_grid.get_frontier_direction(st["x"], st["y"], st["yaw"])
-        if abs(frontier_angle) < math.pi / 3 and st["v_lin"] > 0.05:  # More lenient angle, lower velocity threshold
-            r_frontier = R_FRONTIER_BONUS * math.cos(frontier_angle)
-        else:
-            r_frontier = 0.0
-        
-        r_step = R_STEP_EXPLORE
-        
-        # RND intrinsic reward
-        r_rnd = self.rnd.compute_intrinsic_reward(obs) * self.rnd_weight
-        
-        # Movement bonus - encourage forward movement during exploration
-        r_movement = 0.0
-        if st["v_lin"] > 0.2:
-            r_movement = 1.0  # Increased bonus for moving forward
-        elif st["v_lin"] < 0.05 and abs(st["v_ang"]) < 0.1:
-            r_movement = -0.5  # Penalty for being stuck (not moving at all)
-        elif abs(st["v_ang"]) > 0.5 and st["v_lin"] < 0.1:
-            r_movement = -0.3  # Small penalty for spinning without forward motion
-        
-        # ANTI-SPIN: Penalize excessive spinning in exploration
-        r_spin_penalty = 0.0
-        if st["v_lin"] < 0.1 and abs(st["v_ang"]) > 1.5:
-            r_spin_penalty = -3.0  # Penalize spinning in place
-        
-        # Progress toward last-known target position (even when not currently visible)
-        # This is CRITICAL for re-finding lost targets
-        r_last_known_progress = 0.0
-        r_last_known_align = 0.0
-        r_last_known_forward = 0.0
-        if self.ros._last_known_target_pos is not None:
-            lk_x, lk_y = self.ros._last_known_target_pos
-            robot_x, robot_y = st["x"], st["y"]
-            
-            # Distance to last known position
-            dist_to_last_known = math.hypot(lk_x - robot_x, lk_y - robot_y)
-            
-            # Progress (getting closer)
-            if not hasattr(self, '_prev_last_known_dist'):
-                self._prev_last_known_dist = dist_to_last_known
-            
-            progress = self._prev_last_known_dist - dist_to_last_known
-            # STRONGER progress reward - this is important!
-            r_last_known_progress = LAST_KNOWN_PROGRESS_SCALE * progress * 2.0
-            self._prev_last_known_dist = dist_to_last_known
-            
-            # Alignment (facing toward last known position)
-            angle_to_last_known = math.atan2(lk_y - robot_y, lk_x - robot_x) - st["yaw"]
-            # Normalize to [-pi, pi]
-            while angle_to_last_known > math.pi:
-                angle_to_last_known -= 2 * math.pi
-            while angle_to_last_known < -math.pi:
-                angle_to_last_known += 2 * math.pi
-            
-            # Only reward alignment when moving forward (anti-spin)
-            if st["v_lin"] > 0.1:
-                r_last_known_align = LAST_KNOWN_ALIGN_SCALE * math.cos(angle_to_last_known) * 2.0
-            
-            # Bonus for moving forward toward last known position
-            if st["v_lin"] > 0.2 and abs(angle_to_last_known) < math.pi / 2:
-                r_last_known_forward = 2.0  # Moving toward last known position!
-        
-        # Collision - now based on ZONE_EMERGENCY (hard safety should prevent this)
-        r_collision = 0.0  # Initialize first
-        if self.last_safety_state and self.last_safety_state.min_distance < ZONE_EMERGENCY:
-            if self.step_count > 10:
-                terminated = True
-                collision = True
-                r_collision = R_COLLISION_EXPLORE
-        
-        reward = (r_discovery + r_novelty + r_frontier + r_step + r_collision + r_rnd + 
-                  r_movement + r_spin_penalty + r_last_known_progress + r_last_known_align + r_last_known_forward)
-        
-        info = {
-            "collision": collision,
-            "success": False,
-            "exploring": True,
-            "reward_terms": {
-                "discovery": r_discovery,
-                "novelty": r_novelty,
-                "frontier": r_frontier,
-                "step": r_step,
-                "collision": r_collision,
-                "rnd": r_rnd,
-                "movement": r_movement,
-                "spin_penalty": r_spin_penalty,
-                "last_known_progress": r_last_known_progress,
-                "last_known_align": r_last_known_align,
-                "last_known_forward": r_last_known_forward,
-            }
-        }
-        
-        return float(reward), terminated, info
-    
-    def _compute_goal_reward(self, v_cmd: float, w_cmd: float, new_cells: int) -> Tuple[float, bool, Dict]:
-        """
-        Compute reward for goal-seeking mode.
-        PRIMARY: Get to the goal - this is ALL that matters now
-        Exploration is DISABLED when we have a goal
-        
-        KEY FIX: Only reward alignment when moving forward, penalize spinning in place
-        """
-        reward = 0.0
-        terminated = False
-        collision = False
-        success = False
-        
-        d_goal = self._goal_distance()
-        ang = self._goal_angle()
-        
-        # === PRIMARY: Goal-seeking rewards - these DOMINATE ===
-        progress = self.prev_goal_dist - d_goal
-        r_progress = PROGRESS_SCALE * progress
-        
-        # Alignment reward - ONLY when moving forward!
-        # This prevents the "spin in place" behavior
-        r_align = 0.0
-        if v_cmd > 0.15:  # Only reward alignment when moving forward
-            r_align = ALIGN_SCALE * math.cos(ang)
-        
-        # Step cost - higher during goal mode to encourage efficiency
-        r_step = STEP_COST
-        
-        # === ANTI-SPIN: Penalize spinning without forward motion ===
-        r_spin_penalty = 0.0
-        if v_cmd < 0.1 and abs(w_cmd) > 1.0:
-            # Spinning in place - bad!
-            r_spin_penalty = -8.0
-        
-        # === FORWARD MOTION BONUS ===
-        r_forward = 0.0
-        if v_cmd > 0.2:
-            r_forward = 3.0  # Reward for actually moving forward
-        elif v_cmd < 0.05 and abs(w_cmd) < 0.5:
-            r_forward = -2.0  # Penalize being stationary
-        
-        # === STALL PENALTY: Not making progress ===
-        r_stall = 0.0
-        if abs(progress) < 0.01 and v_cmd < 0.15:
-            r_stall = -3.0  # Penalize no progress
-        
-        # Pursuit bonus - reward for actively moving toward goal
-        r_pursuit = 0.0
-        if progress > 0.01 and v_cmd > 0.1:  # Making progress and moving forward
-            r_pursuit = R_GOAL_PURSUIT * 2  # Double bonus for actual progress
-        elif progress < -0.01:  # Moving away from goal
-            r_pursuit = -R_GOAL_PURSUIT * 3  # Strong penalty for moving away
-        
-        r_goal = 0.0
-        if d_goal <= GOAL_RADIUS:
-            success = True
-            r_goal = R_GOAL
-            
-            self._goals_reached_this_episode += 1
-            self._last_goal_reached_pos = (self.ros.last_goal.point.x, self.ros.last_goal.point.y)
-            
-            # Publish goal reached message - signals goal generator to cycle targets
-            reached_msg = PointStamped()
-            reached_msg.header.stamp = self.ros.get_clock().now().to_msg()
-            reached_msg.header.frame_id = "odom"
-            reached_msg.point.x = self.ros.last_goal.point.x
-            reached_msg.point.y = self.ros.last_goal.point.y
-            reached_msg.point.z = 0.0
-            self.ros.goal_reached_pub.publish(reached_msg)
-            
-            self.ros.last_goal = None
-            
-            self.ros.get_logger().info(
-                f"[GOAL REACHED #{self._goals_reached_this_episode}] dist={d_goal:.2f}m, reward={r_goal:.0f}, continuing exploration"
-            )
-        
-        # === NO EXPLORATION REWARDS DURING GOAL MODE ===
-        # Goal is found - focus 100% on reaching it
-        # Exploration rewards are DISABLED to prevent distraction
-        
-        # === Collision check ===
-        r_collision = 0.0
-        if self.last_safety_state and self.last_safety_state.min_distance < ZONE_EMERGENCY:
-            if self.step_count > 10:
-                terminated = True
-                collision = True
-                r_collision = R_COLLISION
-        
-        # === Timeout ===
-        r_timeout = 0.0
-        if not terminated and self.step_count + 1 >= self.max_steps:
-            terminated = True
-            r_timeout = R_TIMEOUT
-        
-        self.prev_goal_dist = d_goal
-        
-        # Combine: ONLY goal-seeking rewards, no exploration
-        reward = (r_progress + r_align + r_step + r_pursuit + r_goal + 
-                  r_collision + r_timeout + r_spin_penalty + r_forward + r_stall)
-        
-        info = {
-            "collision": collision,
-            "success": success,
-            "exploring": False,
-            "goal_dist": d_goal,
-            "reward_terms": {
-                "progress": r_progress,
-                "alignment": r_align,
-                "step": r_step,
-                "pursuit": r_pursuit,
-                "goal": r_goal,
-                "collision": r_collision,
-                "timeout": r_timeout,
-                "spin_penalty": r_spin_penalty,
-                "forward_bonus": r_forward,
-                "stall_penalty": r_stall,
-            }
-        }
-        
-        return float(reward), terminated, info
     
     def _build_observation(self) -> np.ndarray:
         st = self._get_robot_state()
@@ -2547,8 +2176,8 @@ def main():
     env = StretchExploreEnv(ros, rnd_module)
     
     ros.get_logger().info(f"[AGENT] device={device} obs_dim={obs_dim} act_dim={act_dim}")
-    ros.get_logger().info(f"[AGENT] DYNAMIC VFH NAVIGATION ACTIVE")
-    ros.get_logger().info(f"[AGENT] Robot: {ROBOT_WIDTH_M:.2f}m wide, {DESIRED_CLEARANCE_M:.2f}m clearance")
+    ros.get_logger().info(f"[AGENT] NO SAFETY OVERRIDE — RL learns from raw consequences")
+    ros.get_logger().info(f"[AGENT] Episodes end on: COLLISION / GOAL_REACHED / TIMEOUT")
     
     # Create agent
     agent = TD3AgentCNN(obs_dim, act_dim, device=device, rnd_module=rnd_module)
@@ -2581,9 +2210,7 @@ def main():
             ros.get_logger().error(f"[CKPT] Save FAILED: {e}")
         
         stats = env.occ_grid.get_stats()
-        avg_intervention = env.navigator.get_average_intervention()
-        ros.get_logger().info(f"[FINAL] Cells discovered: {stats['total_discovered']}, "
-                               f"Avg navigation intervention: {avg_intervention:.1%}")
+        ros.get_logger().info(f"[FINAL] Cells discovered: {stats['total_discovered']}")
         
         try:
             executor.shutdown()
@@ -2598,7 +2225,7 @@ def main():
     
     # Inference mode
     if args.inference:
-        ros.get_logger().info("[MODE] INFERENCE (with VFH navigation)")
+        ros.get_logger().info("[MODE] INFERENCE (no safety override)")
         while True:
             obs, _ = env.reset()
             done = False
@@ -2608,7 +2235,7 @@ def main():
                 done = term or trunc
     
     # Training mode
-    ros.get_logger().info("[MODE] TRAINING (with VFH navigation)")
+    ros.get_logger().info("[MODE] TRAINING (no safety override)")
     obs, _ = env.reset()
     last_save = 0
     
@@ -2645,10 +2272,8 @@ def main():
         if t - last_save >= args.save_every:
             last_save = t
             stats = env.occ_grid.get_stats()
-            avg_intervention = env.safety_blender.get_average_intervention()
             ros.get_logger().info(
-                f"[CKPT] step={t} cells={stats['total_discovered']} "
-                f"intervention={avg_intervention:.1%}"
+                f"[CKPT] step={t} cells={stats['total_discovered']}"
             )
             try:
                 agent.save(ckpt_path + ".tmp")

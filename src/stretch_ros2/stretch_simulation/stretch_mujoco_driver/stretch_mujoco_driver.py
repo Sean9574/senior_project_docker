@@ -156,6 +156,9 @@ class StretchMujocoDriver(Node):
         sim.start(headless=not use_mujoco_viewer)
 
         self.sim = sim
+        self._sim_model = model            # Keep reference for hard reset
+        self._use_cameras = use_cameras
+        self._use_mujoco_viewer = use_mujoco_viewer
 
         # Initialize calibration offsets
         self.head_tilt_calibrated_offset_rad = 0.0
@@ -887,6 +890,96 @@ class StretchMujocoDriver(Node):
         response.message = "Stopped the robot."
         return response
 
+    def reset_simulation_callback(self, request, response):
+        """
+        Reset the MuJoCo simulation to its initial state.
+        
+        This is used by the RL learner to reset the environment between
+        episodes. It stops all motion, resets MuJoCo physics state, and
+        homes the joints so the robot is back at its starting configuration.
+        """
+        self.get_logger().info("[RESET] Simulation reset requested")
+        
+        try:
+            # Phase 1: Stop all motion immediately
+            with self.robot_stop_lock:
+                self.sim.set_base_velocity(0.0, 0.0)
+                self.linear_velocity_mps = 0.0
+                self.angular_velocity_radps = 0.0
+            
+            # Phase 2: Try direct MuJoCo reset (fastest, cleanest)
+            reset_done = False
+            
+            # Method A: Try sim.reset() if available (some stretch_mujoco versions)
+            if hasattr(self.sim, 'reset') and callable(self.sim.reset):
+                try:
+                    self.sim.reset()
+                    reset_done = True
+                    self.get_logger().info("[RESET] Used sim.reset()")
+                except Exception as e:
+                    self.get_logger().warn(f"[RESET] sim.reset() failed: {e}")
+            
+            # Method B: Try direct mj_resetData via sim internals
+            if not reset_done:
+                try:
+                    import mujoco
+                    # StretchMujocoSimulator may expose mjmodel/mjdata
+                    mjdata = getattr(self.sim, 'mjdata', None) or getattr(self.sim, 'data', None)
+                    mjmodel = getattr(self.sim, 'mjmodel', None) or getattr(self.sim, 'model', None)
+                    
+                    if mjmodel is not None and mjdata is not None:
+                        mujoco.mj_resetData(mjmodel, mjdata)
+                        mjdata.ctrl[:] = 0.0
+                        mujoco.mj_forward(mjmodel, mjdata)
+                        reset_done = True
+                        self.get_logger().info("[RESET] Used mj_resetData directly")
+                except Exception as e:
+                    self.get_logger().warn(f"[RESET] Direct mj_resetData failed: {e}")
+            
+            # Method C: Full sim restart (reliable but slower ~2-3s)
+            if not reset_done:
+                try:
+                    self.get_logger().info("[RESET] Restarting simulator (full reset)...")
+                    self.sim.stop()
+                    
+                    import time
+                    time.sleep(0.5)
+                    
+                    self.sim = StretchMujocoSimulator(
+                        model=self._sim_model,
+                        camera_hz=2,
+                        cameras_to_use=(
+                            [StretchCameras.cam_d435i_rgb, StretchCameras.cam_d435i_depth]
+                            if self._use_cameras
+                            else StretchCameras.none()
+                        ),
+                    )
+                    self.sim.start(headless=not self._use_mujoco_viewer)
+                    
+                    # Wait for sim to be ready
+                    time.sleep(1.0)
+                    reset_done = True
+                    self.get_logger().info("[RESET] Full sim restart complete")
+                except Exception as e:
+                    self.get_logger().error(f"[RESET] Full restart failed: {e}")
+            
+            # Phase 3: If no full reset worked, at least home the joints
+            if not reset_done:
+                self.get_logger().warn("[RESET] Falling back to home-only reset")
+                self.sim.home()
+                self.sim.set_base_velocity(0.0, 0.0)
+            
+            response.success = True
+            response.message = "Simulation reset complete"
+            self.get_logger().info("[RESET] Reset complete")
+            
+        except Exception as e:
+            response.success = False
+            response.message = f"Reset failed: {e}"
+            self.get_logger().error(f"[RESET] Reset failed: {e}")
+        
+        return response
+
     def home_the_robot_callback(self, request, response):
         self.get_logger().info("Received home_the_robot service call.")
         success, message = self.home_the_robot()
@@ -1356,6 +1449,14 @@ class StretchMujocoDriver(Node):
             self.stop_the_robot_callback,
             callback_group=self.main_group,
         )
+
+        self.reset_simulation_service = self.create_service(
+            Trigger,
+            "/sim/reset",
+            self.reset_simulation_callback,
+            callback_group=self.main_group,
+        )
+        self.get_logger().info("[SIM] /sim/reset service registered")
 
         self.home_the_robot_service = self.create_service(
             Trigger,
