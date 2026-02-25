@@ -430,7 +430,7 @@ class DynamicNavigator:
         self._turn_commit_exit_front = VFH_CAUTION_DIST + 0.15              # must clear front to exit
         self._turn_commit_min_time = 0.35                                   # seconds: prevents flapping
         self._turn_commit_w = 0.75 * W_MAX                                   # turning speed during commit
-        self._turn_commit_v = 0.00                                           # no backup bounce
+        self._turn_commit_v = 0.1                                           # no backup bounce
 
     def analyze_scan(self, scan: Optional[LaserScan]) -> NavigationState:
         if scan is None or len(scan.ranges) == 0:
@@ -544,6 +544,25 @@ class DynamicNavigator:
         if self._turn_commit_active:
             v = self._turn_commit_v
             w = float(self._turn_commit_dir * self._turn_commit_w)
+            if nav_state.min_distance <= (VFH_EMERGENCY_DIST + 0.03):
+                v = 0.0  # stop if extremely close, to prevent bounce
+            
+            if nav_state.front_clearance <= (VFH_EMERGENCY_DIST + 0.05):
+                v = 0.0# exit condition: (a) min time passed, (b) front is cleared enough OR we’re no longer near
+             # ---------------- CHANGE 4 GOES HERE ----------------
+            # Track best front clearance during this commit
+            if not hasattr(self, "_commit_best_front"):
+                self._commit_best_front = nav_state.front_clearance
+
+            self._commit_best_front = max(self._commit_best_front, nav_state.front_clearance)
+
+            # If after ~0.6s we haven't improved front clearance by ~10cm, flip turn direction
+            # (this helps corners / parallel-to-wall cases)
+            if (now >= (self._turn_commit_until - 0.35)) and (self._commit_best_front < (nav_state.front_clearance + 0.10)):
+                self._turn_commit_dir *= -1.0
+                self._turn_commit_until = now + 0.35
+                self._commit_best_front = nav_state.front_clearance
+            # ----------------------------------------------------
 
             # exit condition: (a) min time passed, (b) front is cleared enough OR we’re no longer near
             if (now >= self._turn_commit_until) and (
@@ -551,6 +570,8 @@ class DynamicNavigator:
                 or min_dist >= VFH_CAUTION_DIST
             ):
                 self._turn_commit_active = False
+                if hasattr(self, "_commit_best_front"):
+                    del self._commit_best_front
 
             # publish high intervention so your logs show we’re taking over
             blend = 0.95
