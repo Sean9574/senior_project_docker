@@ -1124,12 +1124,18 @@ class StretchRosInterface(Node):
             self.send_cmd(0.0, 0.0)
             rclpy.spin_once(self, timeout_sec=0.01)
         
-        # Step 2: Try to call the sim reset service
+        # Step 2: If we haven't found the service yet, try again
+        if not self._sim_reset_available:
+            if self.reset_client.wait_for_service(timeout_sec=2.0):
+                self._sim_reset_available = True
+                self.get_logger().info('[RESET] /sim/reset service found (late discovery)')
+        
+        # Step 3: Call the sim reset service
         if self._sim_reset_available:
             req = Trigger.Request()
             future = self.reset_client.call_async(req)
             
-            # Wait for response
+            # Spin until the service responds
             start = time.time()
             while not future.done() and (time.time() - start) < timeout:
                 rclpy.spin_once(self, timeout_sec=0.1)
@@ -1137,17 +1143,22 @@ class StretchRosInterface(Node):
             if future.done():
                 result = future.result()
                 if result and result.success:
-                    self.get_logger().info('[RESET] MuJoCo sim reset SUCCESS')
+                    self.get_logger().info('[RESET] Sim reset SUCCESS — robot teleported to start')
                     self._wait_for_fresh_data()
                     return True
                 else:
                     msg = result.message if result else 'No response'
-                    self.get_logger().warn(f'[RESET] Sim reset failed: {msg}')
+                    self.get_logger().warn(f'[RESET] Sim reset FAILED: {msg}')
             else:
-                self.get_logger().warn('[RESET] Sim reset timed out')
+                self.get_logger().warn('[RESET] Sim reset timed out — service did not respond')
+        else:
+            self.get_logger().error(
+                '[RESET] /sim/reset service NOT available! '
+                'Make sure you are running the patched stretch_mujoco_driver. '
+                'Falling back to soft reset (robot stays in place).'
+            )
         
-        # Step 3: Soft reset fallback — just stop and clear
-        self.get_logger().info('[RESET] Using soft reset (robot stays in place)')
+        # Step 4: Soft reset fallback
         self.send_cmd(0.0, 0.0)
         time.sleep(0.2)
         self._wait_for_fresh_data()
