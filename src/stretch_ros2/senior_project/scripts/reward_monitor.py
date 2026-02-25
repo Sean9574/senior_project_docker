@@ -2,11 +2,12 @@
 """
 Multi-Domain RL Training Monitor + Camera Streaming
 
-Features:
-- Auto-discovers ROS2 domains with reward topics
-- Streams camera/image topics via MJPEG
-- Smooth, non-jittery chart updates
-- Clean, soft UI design
+Updated for no-safety-override learner:
+- Episode outcomes: COLLISION / GOAL_REACHED / TIMEOUT
+- Min distance to obstacle tracking
+- New reward components: progress, alignment, discovery, novelty,
+  frontier, rnd, forward, stuck, spin, step, collision, goal, timeout
+- No more intervention/safety blend charts
 """
 
 import argparse
@@ -17,23 +18,22 @@ import sys
 import threading
 import time
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
-from concurrent.futures import ThreadPoolExecutor
-
-import rclpy
-from rclpy.context import Context
-from rclpy.executors import SingleThreadedExecutor
-from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, qos_profile_sensor_data
-from std_msgs.msg import Float32, String as StringMsg
-from sensor_msgs.msg import Image as RosImage
-
-from flask import Flask, render_template_string, Response, request, jsonify
-from flask_socketio import SocketIO
-from flask_cors import CORS
 
 import cv2
+import rclpy
 from cv_bridge import CvBridge
+from flask import Flask, Response, jsonify, render_template_string, request
+from flask_cors import CORS
+from flask_socketio import SocketIO
+from rclpy.context import Context
+from rclpy.executors import SingleThreadedExecutor
+from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
+from sensor_msgs.msg import Image as RosImage
+from std_msgs.msg import Float32
+from std_msgs.msg import String as StringMsg
 
 # =============================================================================
 # Configuration
@@ -41,7 +41,7 @@ from cv_bridge import CvBridge
 
 DEFAULT_PORT = 5555
 MAX_HISTORY_LENGTH = 1000
-UPDATE_RATE_HZ = 5  # Slower updates = smoother charts
+UPDATE_RATE_HZ = 5
 DEFAULT_SCAN_START = 0
 DEFAULT_SCAN_END = 50
 DEFAULT_SCAN_INTERVAL = 15.0
@@ -67,14 +67,26 @@ class DomainStats:
     current_episode_steps: int = 0
     last_episode_num: int = 0
     episode_count: int = 0
-    safety_zones: deque = field(default_factory=lambda: deque(maxlen=MAX_HISTORY_LENGTH))
-    intervention_rates: deque = field(default_factory=lambda: deque(maxlen=MAX_HISTORY_LENGTH))
     total_steps: int = 0
     last_update: float = 0.0
     goals_reached: int = 0
     frontiers: int = 0
     cells_discovered: int = 0
-    
+
+    # Episode outcome tracking
+    collisions: int = 0
+    successes: int = 0
+    timeouts: int = 0
+    _last_collision: bool = False
+    _last_success: bool = False
+
+    # Min distance tracking
+    min_distances: deque = field(default_factory=lambda: deque(maxlen=MAX_HISTORY_LENGTH))
+    nav_zones: deque = field(default_factory=lambda: deque(maxlen=MAX_HISTORY_LENGTH))
+
+    # Velocity tracking
+    velocities: deque = field(default_factory=lambda: deque(maxlen=MAX_HISTORY_LENGTH))
+
     # Goal generator status
     goal_status: Dict = field(default_factory=dict)
     goal_status_time: float = 0.0
@@ -90,47 +102,71 @@ class DomainStats:
     def add_breakdown(self, breakdown: Dict):
         timestamp = time.time()
 
+        # Reward components
         reward_terms = breakdown.get("reward_terms", {})
         for key, value in reward_terms.items():
             if key not in self.components:
                 self.components[key] = deque(maxlen=MAX_HISTORY_LENGTH)
             self.components[key].append((timestamp, value))
 
-        safety = breakdown.get("safety", {})
-        zone = safety.get("zone", "UNKNOWN")
-        intervention = safety.get("intervention", 0.0)
-        self.safety_zones.append((timestamp, zone))
-        self.intervention_rates.append((timestamp, intervention))
+        # Min distance (top-level field)
+        min_dist = breakdown.get("min_distance", 0.0)
+        if min_dist > 0:
+            self.min_distances.append((timestamp, min_dist))
 
+        # Nav zone (top-level field)
+        zone = breakdown.get("nav_zone", "UNKNOWN")
+        self.nav_zones.append((timestamp, zone))
+
+        # Velocity
+        vel = breakdown.get("velocity", {})
+        v = vel.get("v", 0.0)
+        self.velocities.append((timestamp, v))
+
+        # Goals
         goals = breakdown.get("goals_reached", 0)
         if goals > self.goals_reached:
             self.goals_reached = goals
 
+        # Explore stats
         explore_stats = breakdown.get("explore_stats", {})
         self.cells_discovered = explore_stats.get("total_discovered", self.cells_discovered)
         self.frontiers = explore_stats.get("frontier_count", self.frontiers)
+
+        # Episode boundary detection — track outcomes
+        collision = breakdown.get("collision", False)
+        success = breakdown.get("success", False)
 
         episode_num = breakdown.get("episode", 0)
         if episode_num > self.last_episode_num and self.last_episode_num > 0:
             if self.current_episode_steps > 0:
                 self.episode_returns.append(self.current_episode_return)
                 self.episode_count += 1
+                # Record how the PREVIOUS episode ended
+                if self._last_collision:
+                    self.collisions += 1
+                elif self._last_success:
+                    self.successes += 1
+                else:
+                    self.timeouts += 1
             self.current_episode_return = 0.0
             self.current_episode_steps = 0
             self.goals_reached = 0
         self.last_episode_num = episode_num
 
+        # Remember flags for next episode boundary
+        self._last_collision = collision
+        self._last_success = success
+
     def update_goal_status(self, status: Dict):
-        """Update goal generator status."""
         self.goal_status = status
         self.goal_status_time = time.time()
 
     def get_summary(self) -> Dict:
         recent_rewards = list(self.rewards)[-100:] if self.rewards else [0]
-        recent_interventions = [x[1] for x in list(self.intervention_rates)[-100:]] if self.intervention_rates else [0]
-        
-        # Goal status freshness (stale after 2 seconds)
+        recent_min_dists = [x[1] for x in list(self.min_distances)[-100:]] if self.min_distances else [0]
         goal_status_fresh = (time.time() - self.goal_status_time) < 2.0
+        total_outcomes = self.collisions + self.successes + self.timeouts
 
         return {
             "domain_id": self.domain_id,
@@ -145,7 +181,13 @@ class DomainStats:
             "current_episode_steps": self.current_episode_steps,
             "avg_reward_100": sum(recent_rewards) / len(recent_rewards) if recent_rewards else 0,
             "avg_episode_return": sum(self.episode_returns) / len(self.episode_returns) if self.episode_returns else 0,
-            "avg_intervention": sum(recent_interventions) / len(recent_interventions) if recent_interventions else 0,
+            "avg_min_distance": sum(recent_min_dists) / len(recent_min_dists) if recent_min_dists else 0,
+            "min_min_distance": min(recent_min_dists) if recent_min_dists else 0,
+            "collisions": self.collisions,
+            "successes": self.successes,
+            "timeouts": self.timeouts,
+            "collision_rate": self.collisions / total_outcomes if total_outcomes > 0 else 0,
+            "success_rate": self.successes / total_outcomes if total_outcomes > 0 else 0,
             "active": time.time() - self.last_update < 5.0,
             "goal_status": self.goal_status if goal_status_fresh else {},
         }
@@ -171,18 +213,36 @@ class DomainStats:
                     "values": [v[1] for v in vals]
                 }
 
-        zone_counts = {"FREE": 0, "AWARE": 0, "CAUTION": 0, "DANGER": 0, "EMERGENCY": 0}
-        for _, zone in list(self.safety_zones)[-500:]:
+        # Min distance plot
+        md_list = list(self.min_distances)[::step]
+        if md_list:
+            t0_md = md_list[0][0]
+            md_times = [(v[0] - t0_md) for v in md_list]
+            md_values = [v[1] for v in md_list]
+        else:
+            md_times, md_values = [], []
+
+        # Velocity plot
+        vel_list = list(self.velocities)[::step]
+        if vel_list:
+            t0_vel = vel_list[0][0]
+            vel_times = [(v[0] - t0_vel) for v in vel_list]
+            vel_values = [v[1] for v in vel_list]
+        else:
+            vel_times, vel_values = [], []
+
+        # Zone counts (last 500 steps)
+        zone_counts = {"FREE": 0, "AWARE": 0, "CAUTION": 0, "DANGER": 0, "EMERGENCY": 0, "CRITICAL": 0}
+        for _, zone in list(self.nav_zones)[-500:]:
             if zone in zone_counts:
                 zone_counts[zone] += 1
 
-        interventions = list(self.intervention_rates)[::step]
-        if interventions:
-            t0_int = interventions[0][0]
-            intervention_times = [(v[0] - t0_int) for v in interventions]
-            intervention_values = [v[1] for v in interventions]
-        else:
-            intervention_times, intervention_values = [], []
+        # Episode outcomes
+        outcomes = {
+            "collisions": self.collisions,
+            "successes": self.successes,
+            "timeouts": self.timeouts,
+        }
 
         return {
             "domain_id": self.domain_id,
@@ -190,8 +250,10 @@ class DomainStats:
             "rewards": {"times": rel_times, "values": rewards},
             "episode_returns": {"episodes": episode_indices, "values": episode_returns},
             "components": components_data,
-            "safety_zones": zone_counts,
-            "interventions": {"times": intervention_times, "values": intervention_values}
+            "min_distance": {"times": md_times, "values": md_values},
+            "velocity": {"times": vel_times, "values": vel_values},
+            "nav_zones": zone_counts,
+            "outcomes": outcomes,
         }
 
 
@@ -242,8 +304,7 @@ class DomainCollector:
 
         self._subs.append(self.node.create_subscription(Float32, reward_topic, lambda msg, k=stats_key: self._reward_cb(msg, k), qos))
         self._subs.append(self.node.create_subscription(StringMsg, breakdown_topic, lambda msg, k=stats_key: self._breakdown_cb(msg, k), qos))
-        
-        # Subscribe to goal generator status topic (try multiple patterns)
+
         goal_status_topics = [
             "/sam3_goal_generator/status",
             f"/{namespace}/sam3_goal_generator/status" if namespace else None,
@@ -339,10 +400,8 @@ class CameraCollector:
             return False
         if not topic.startswith("/"):
             topic = "/" + topic
-
         if self._sub is not None and self._sub_topic == topic:
             return True
-
         try:
             if self._sub is not None:
                 try:
@@ -350,7 +409,6 @@ class CameraCollector:
                 except:
                     pass
                 self._sub = None
-
             self._sub = self._node.create_subscription(RosImage, topic, self._image_cb, qos_profile_sensor_data)
             self._sub_topic = topic
             return True
@@ -364,7 +422,6 @@ class CameraCollector:
         with self._lock:
             if (now - self._latest_ts) < (1.0 / self.fps):
                 return
-
         try:
             cv_img = self._bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
             if self.max_width and cv_img is not None:
@@ -372,7 +429,6 @@ class CameraCollector:
                 if w > self.max_width:
                     scale = self.max_width / float(w)
                     cv_img = cv2.resize(cv_img, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
-
             ok, buf = cv2.imencode(".jpg", cv_img, [int(cv2.IMWRITE_JPEG_QUALITY), self.quality])
             if ok:
                 with self._lock:
@@ -416,7 +472,6 @@ class MultiDomainManager:
                 thread = threading.Thread(target=collector.spin, daemon=True)
                 thread.start()
                 self.threads[domain_id] = thread
-
                 if domain_id not in self.cameras:
                     self.cameras[domain_id] = CameraCollector(domain_id)
                 return True
@@ -432,11 +487,9 @@ class MultiDomainManager:
             time.sleep(0.3)
             topics = node.get_topic_names_and_types()
             has_reward = any(t[0].endswith("/reward") for t in topics)
-
             for tname, ttypes in topics:
                 if "sensor_msgs/msg/Image" in ttypes:
                     image_topics.append(tname)
-
             node.destroy_node()
             rclpy.shutdown(context=ctx)
             return did, has_reward, sorted(image_topics)
@@ -451,17 +504,14 @@ class MultiDomainManager:
         discovered = []
         with ThreadPoolExecutor(max_workers=10) as ex:
             results = list(ex.map(self._scan_domain_topics, range(start, end + 1)))
-
         for did, has_reward, image_topics in results:
             if image_topics:
                 self.domain_image_topics[did] = image_topics
             elif did not in self.domain_image_topics:
                 self.domain_image_topics[did] = []
-
             if has_reward and did not in self.collectors:
                 if self.add_domain(did):
                     discovered.append(did)
-
         return discovered
 
     def discover_namespaces_all(self):
@@ -485,10 +535,10 @@ class MultiDomainManager:
 
 
 # =============================================================================
-# Dashboard HTML - Clean Soft Design with Smooth Charts
+# Dashboard HTML
 # =============================================================================
 
-DASHBOARD_HTML = """
+DASHBOARD_HTML = r"""
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -499,659 +549,387 @@ DASHBOARD_HTML = """
   <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.5.4/socket.io.min.js"></script>
   <style>
     :root {
-      --bg: #f4f7fa;
-      --card: #ffffff;
-      --border: #e8ecf1;
-      --text: #2d3748;
-      --text-light: #718096;
-      --text-muted: #a0aec0;
-      --blue: #667eea;
-      --green: #48bb78;
-      --red: #fc8181;
-      --yellow: #f6e05e;
-      --purple: #9f7aea;
-      --radius: 16px;
-      --shadow: 0 2px 8px rgba(0,0,0,0.04);
+      --bg: #f4f7fa; --card: #ffffff; --border: #e8ecf1;
+      --text: #2d3748; --text-light: #718096; --text-muted: #a0aec0;
+      --blue: #667eea; --green: #48bb78; --red: #fc8181;
+      --yellow: #f6e05e; --purple: #9f7aea; --cyan: #4fd1c5;
+      --orange: #ed8936;
+      --radius: 16px; --shadow: 0 2px 8px rgba(0,0,0,0.04);
     }
-
     * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { font-family: 'Inter', -apple-system, sans-serif; background: var(--bg); color: var(--text); line-height: 1.5; }
 
-    body {
-      font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
-      background: var(--bg);
-      color: var(--text);
-      line-height: 1.5;
-    }
+    .header { background: var(--card); padding: 16px 24px; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center; box-shadow: var(--shadow); }
+    .header h1 { font-size: 18px; font-weight: 700; }
+    .header .subtitle { font-size: 12px; color: var(--text-muted); font-weight: 400; margin-left: 8px; }
+    .badge { background: linear-gradient(135deg, #eef2ff 0%, #f5f3ff 100%); border: 1px solid #c7d2fe; padding: 6px 14px; border-radius: 20px; font-size: 12px; font-weight: 600; color: var(--blue); }
 
-    .header {
-      background: var(--card);
-      padding: 16px 24px;
-      border-bottom: 1px solid var(--border);
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      box-shadow: var(--shadow);
-    }
+    .container { padding: 20px 24px; max-width: 1400px; margin: 0 auto; }
 
-    .header h1 {
-      font-size: 18px;
-      font-weight: 700;
-      color: var(--text);
-    }
+    .tabs { display: flex; gap: 10px; margin-bottom: 20px; flex-wrap: wrap; }
+    .tab { padding: 10px 18px; background: var(--card); border: 1px solid var(--border); border-radius: 12px; cursor: pointer; font-size: 13px; font-weight: 500; color: var(--text-light); transition: all 0.2s; display: flex; align-items: center; gap: 8px; box-shadow: var(--shadow); }
+    .tab:hover { border-color: var(--blue); color: var(--blue); }
+    .tab.active { background: linear-gradient(135deg, var(--blue) 0%, #7c3aed 100%); border-color: transparent; color: white; box-shadow: 0 4px 12px rgba(102,126,234,0.3); }
+    .tab .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--text-muted); }
+    .tab.live .dot { background: var(--green); animation: pulse 2s infinite; }
+    .tab.active .dot { background: rgba(255,255,255,0.6); }
+    .tab.active.live .dot { background: white; }
+    @keyframes pulse { 0%,100% { opacity:1; } 50% { opacity:0.5; } }
 
-    .badge {
-      background: linear-gradient(135deg, #eef2ff 0%, #f5f3ff 100%);
-      border: 1px solid #c7d2fe;
-      padding: 6px 14px;
-      border-radius: 20px;
-      font-size: 12px;
-      font-weight: 600;
-      color: var(--blue);
-    }
+    .card { background: var(--card); border: 1px solid var(--border); border-radius: var(--radius); padding: 20px; box-shadow: var(--shadow); margin-bottom: 16px; }
+    .card h3 { font-size: 13px; font-weight: 600; color: var(--text-light); text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 16px; }
 
-    .container {
-      padding: 20px 24px;
-      max-width: 1400px;
-      margin: 0 auto;
-    }
+    .stats-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 12px; margin-bottom: 20px; }
+    .stat { background: var(--card); border: 1px solid var(--border); border-radius: var(--radius); padding: 16px; box-shadow: var(--shadow); }
+    .stat .label { font-size: 11px; font-weight: 600; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.3px; }
+    .stat .value { font-size: 22px; font-weight: 700; margin-top: 4px; }
+    .stat .sub { font-size: 11px; color: var(--text-muted); margin-top: 2px; }
+    .green { color: var(--green) !important; }
+    .red { color: var(--red) !important; }
+    .blue { color: var(--blue) !important; }
+    .orange { color: var(--orange) !important; }
+    .purple { color: var(--purple) !important; }
 
-    .tabs {
-      display: flex;
-      gap: 10px;
-      margin-bottom: 20px;
-      flex-wrap: wrap;
-    }
-
-    .tab {
-      padding: 10px 18px;
-      background: var(--card);
-      border: 1px solid var(--border);
-      border-radius: 12px;
-      cursor: pointer;
-      font-size: 13px;
-      font-weight: 500;
-      color: var(--text-light);
-      transition: all 0.2s;
-      display: flex;
-      align-items: center;
-      gap: 8px;
-      box-shadow: var(--shadow);
-    }
-
-    .tab:hover {
-      border-color: var(--blue);
-      color: var(--blue);
-    }
-
-    .tab.active {
-      background: linear-gradient(135deg, var(--blue) 0%, #7c3aed 100%);
-      border-color: transparent;
-      color: white;
-      box-shadow: 0 4px 12px rgba(102, 126, 234, 0.3);
-    }
-
-    .tab .dot {
-      width: 8px;
-      height: 8px;
-      border-radius: 50%;
-      background: var(--text-muted);
-    }
-
-    .tab.live .dot {
-      background: var(--green);
-      animation: pulse 2s infinite;
-    }
-
-    .tab.active .dot {
-      background: rgba(255,255,255,0.6);
-    }
-
-    .tab.active.live .dot {
-      background: white;
-    }
-
-    @keyframes pulse {
-      0%, 100% { opacity: 1; }
-      50% { opacity: 0.5; }
-    }
-
-    .card {
-      background: var(--card);
-      border: 1px solid var(--border);
-      border-radius: var(--radius);
-      padding: 20px;
-      box-shadow: var(--shadow);
-      margin-bottom: 16px;
-    }
-
-    .card h3 {
-      font-size: 13px;
-      font-weight: 600;
-      color: var(--text-light);
-      text-transform: uppercase;
-      letter-spacing: 0.5px;
-      margin-bottom: 16px;
-    }
-
-    .stats-row {
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
-      gap: 12px;
-      margin-bottom: 20px;
-    }
-
-    .stat {
-      background: var(--card);
-      border: 1px solid var(--border);
-      border-radius: var(--radius);
-      padding: 16px;
-      box-shadow: var(--shadow);
-    }
-
-    .stat .label {
-      font-size: 11px;
-      font-weight: 600;
-      color: var(--text-muted);
-      text-transform: uppercase;
-      letter-spacing: 0.3px;
-    }
-
-    .stat .value {
-      font-size: 24px;
-      font-weight: 700;
-      margin-top: 4px;
-    }
-
-    .stat .value.green { color: var(--green); }
-    .stat .value.red { color: var(--red); }
-    .stat .value.blue { color: var(--blue); }
-    .stat .value.purple { color: var(--purple); }
-
-    .grid {
-      display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 16px;
-    }
-
-    @media (max-width: 1000px) {
-      .grid { grid-template-columns: 1fr; }
-    }
-
+    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+    @media (max-width: 1000px) { .grid { grid-template-columns: 1fr; } }
     .chart { height: 240px; }
 
-    .camera-container {
-      position: relative;
-      background: #1a202c;
-      border-radius: 12px;
-      overflow: hidden;
-    }
+    .camera-container { position: relative; background: #1a202c; border-radius: 12px; overflow: hidden; }
+    .camera-img { width: 100%; height: 300px; object-fit: contain; display: block; }
+    .empty { text-align: center; padding: 60px; color: var(--text-muted); }
 
-    .camera-img {
-      width: 100%;
-      height: 300px;
-      object-fit: contain;
-      display: block;
-    }
+    .summary-box { background: linear-gradient(135deg, #eef2ff 0%, #faf5ff 100%); border: 1px solid #ddd6fe; border-radius: var(--radius); padding: 20px; margin-bottom: 20px; }
+    .summary-box h3 { color: var(--blue); margin-bottom: 16px; }
+    .summary-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 16px; }
+    .summary-stat { text-align: center; }
+    .summary-stat .label { font-size: 10px; color: var(--text-muted); text-transform: uppercase; }
+    .summary-stat .value { font-size: 20px; font-weight: 700; margin-top: 4px; }
 
-    .camera-select {
-      padding: 8px 12px;
-      border: 1px solid var(--border);
-      border-radius: 8px;
-      font-size: 12px;
-      background: var(--card);
-      color: var(--text);
-      min-width: 200px;
-    }
+    .outcome-bar { display: flex; height: 28px; border-radius: 8px; overflow: hidden; margin-bottom: 12px; }
+    .outcome-bar .segment { display: flex; align-items: center; justify-content: center; font-size: 11px; font-weight: 600; color: white; min-width: 30px; transition: width 0.5s; }
+    .outcome-bar .seg-collision { background: #e53e3e; }
+    .outcome-bar .seg-success { background: #38a169; }
+    .outcome-bar .seg-timeout { background: #d69e2e; }
 
-    .zones {
-      display: flex;
-      gap: 8px;
-      flex-wrap: wrap;
-      margin-top: 12px;
-    }
+    .chip { padding: 4px 14px; border-radius: 16px; font-size: 12px; font-weight: 600; display: inline-block; margin: 2px; }
+    .chip.collision { background: #fed7d7; color: #c53030; }
+    .chip.success { background: #c6f6d5; color: #276749; }
+    .chip.timeout { background: #fefcbf; color: #975a16; }
 
-    .zone {
-      padding: 4px 12px;
-      border-radius: 16px;
-      font-size: 11px;
-      font-weight: 600;
-    }
+    .goal-status { margin-top: 12px; padding: 12px 16px; background: linear-gradient(135deg, #f0fdf4 0%, #ecfdf5 100%); border: 1px solid #bbf7d0; border-radius: 12px; font-size: 13px; }
+    .goal-status.searching { background: linear-gradient(135deg, #fefce8 0%, #fef9c3 100%); border-color: #fde047; }
+    .goal-status .status-row { display: flex; justify-content: space-between; padding: 4px 0; border-bottom: 1px solid rgba(0,0,0,0.05); }
+    .goal-status .status-row:last-child { border-bottom: none; }
+    .goal-status .status-label { color: var(--text-muted); font-weight: 500; }
+    .goal-status .status-value { font-weight: 600; color: var(--text); }
+    .goal-status .status-value.found { color: var(--green); }
+    .goal-status .status-value.searching { color: #ca8a04; }
 
-    .zone.FREE { background: #c6f6d5; color: #276749; }
-    .zone.AWARE { background: #fefcbf; color: #975a16; }
-    .zone.CAUTION { background: #fed7aa; color: #c05621; }
-    .zone.DANGER { background: #fed7d7; color: #c53030; }
-    .zone.EMERGENCY { background: #feb2b2; color: #9b2c2c; }
-
-    .empty {
-      text-align: center;
-      padding: 60px;
-      color: var(--text-muted);
-    }
-
-    .summary-box {
-      background: linear-gradient(135deg, #eef2ff 0%, #faf5ff 100%);
-      border: 1px solid #ddd6fe;
-      border-radius: var(--radius);
-      padding: 20px;
-      margin-bottom: 20px;
-    }
-
-    .summary-box h3 {
-      color: var(--blue);
-      margin-bottom: 16px;
-    }
-
-    .summary-grid {
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
-      gap: 16px;
-    }
-
-    .summary-stat {
-      text-align: center;
-    }
-
-    .summary-stat .label {
-      font-size: 10px;
-      color: var(--text-muted);
-      text-transform: uppercase;
-    }
-
-    .summary-stat .value {
-      font-size: 20px;
-      font-weight: 700;
-      margin-top: 4px;
-    }
-
-    .goal-status {
-      margin-top: 12px;
-      padding: 12px 16px;
-      background: linear-gradient(135deg, #f0fdf4 0%, #ecfdf5 100%);
-      border: 1px solid #bbf7d0;
-      border-radius: 12px;
-      font-size: 13px;
-    }
-
-    .goal-status.searching {
-      background: linear-gradient(135deg, #fefce8 0%, #fef9c3 100%);
-      border-color: #fde047;
-    }
-
-    .goal-status .status-row {
-      display: flex;
-      justify-content: space-between;
-      padding: 4px 0;
-      border-bottom: 1px solid rgba(0,0,0,0.05);
-    }
-
-    .goal-status .status-row:last-child {
-      border-bottom: none;
-    }
-
-    .goal-status .status-label {
-      color: var(--text-muted);
-      font-weight: 500;
-    }
-
-    .goal-status .status-value {
-      font-weight: 600;
-      color: var(--text);
-    }
-
-    .goal-status .status-value.found {
-      color: var(--green);
-    }
-
-    .goal-status .status-value.searching {
-      color: #ca8a04;
-    }
+    .reward-legend { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+    .reward-legend .item { display: flex; align-items: center; gap: 4px; font-size: 10px; color: var(--text-light); }
+    .reward-legend .swatch { width: 10px; height: 10px; border-radius: 3px; }
   </style>
 </head>
 <body>
   <div class="header">
-    <h1>RL Training Monitor</h1>
+    <h1>RL Training Monitor<span class="subtitle">No Safety Override &mdash; RL Learns From Consequences</span></h1>
     <span class="badge" id="badge">Scanning...</span>
   </div>
-
   <div class="container">
     <div class="tabs" id="tabs"></div>
     <div id="content"><div class="empty">Scanning for ROS2 domains...</div></div>
   </div>
 
-  <script>
-    const socket = io();
-    let domains = {};
-    let selected = 'all';
-    let chartsInitialized = {};
+<script>
+const socket = io();
+let domains = {};
+let selected = 'all';
 
-    const colors = {
-      blue: '#667eea', green: '#48bb78', red: '#fc8181',
-      yellow: '#ecc94b', purple: '#9f7aea', cyan: '#4fd1c5'
-    };
+const C = {
+  blue:'#667eea', green:'#48bb78', red:'#fc8181', yellow:'#ecc94b',
+  purple:'#9f7aea', cyan:'#4fd1c5', orange:'#ed8936', gray:'#a0aec0',
+  darkred:'#e53e3e', darkgreen:'#38a169', darkyellow:'#d69e2e', teal:'#38b2ac',
+  lime:'#68d391', pink:'#f687b3'
+};
 
-    const layoutBase = {
-      paper_bgcolor: 'rgba(0,0,0,0)',
-      plot_bgcolor: 'rgba(0,0,0,0)',
-      font: { color: '#718096', size: 10 },
-      margin: { l: 40, r: 16, t: 24, b: 32 },
-      xaxis: { gridcolor: '#edf2f7', zerolinecolor: '#e2e8f0' },
-      yaxis: { gridcolor: '#edf2f7', zerolinecolor: '#e2e8f0' },
-      showlegend: false
-    };
+// Reward component -> color mapping
+const compColors = {
+  // Goal-seeking
+  progress:  C.green,
+  alignment: C.blue,
+  goal:      C.darkyellow,
+  // Exploration
+  discovery: C.purple,
+  novelty:   C.cyan,
+  frontier:  C.teal,
+  rnd:       '#63b3ed',
+  // Movement shaping
+  forward:   C.lime,
+  stuck:     C.orange,
+  spin:      C.pink,
+  step:      C.gray,
+  // Terminal
+  collision: C.darkred,
+  timeout:   '#b7791f',
+};
 
-    const config = { displayModeBar: false, responsive: true };
+const layoutBase = {
+  paper_bgcolor:'rgba(0,0,0,0)', plot_bgcolor:'rgba(0,0,0,0)',
+  font:{color:'#718096',size:10}, margin:{l:45,r:16,t:24,b:32},
+  xaxis:{gridcolor:'#edf2f7',zerolinecolor:'#e2e8f0'},
+  yaxis:{gridcolor:'#edf2f7',zerolinecolor:'#e2e8f0'},
+  showlegend:false
+};
+const cfg = {displayModeBar:false, responsive:true};
 
-    socket.on('connect', () => document.getElementById('badge').textContent = 'Connected');
-    socket.on('disconnect', () => document.getElementById('badge').textContent = 'Disconnected');
+socket.on('connect', () => document.getElementById('badge').textContent = 'Connected');
+socket.on('disconnect', () => document.getElementById('badge').textContent = 'Disconnected');
 
-    socket.on('update', data => {
-      domains = data.domains || {};
-      const n = Object.keys(domains).length;
-      document.getElementById('badge').textContent = n + ' Domain' + (n !== 1 ? 's' : '');
-      
-      // Only rebuild tabs, not full content
-      renderTabs();
-      
-      // Update charts without rebuilding HTML
-      if (selected === 'all') {
-        updateAllCharts();
-      } else if (domains[selected]) {
-        updateDomainCharts(selected);
-        updateGoalStatus(domains[selected].summary.goal_status);
-      }
-    });
+socket.on('update', data => {
+  domains = data.domains || {};
+  const n = Object.keys(domains).length;
+  document.getElementById('badge').textContent = n + ' Domain' + (n!==1?'s':'');
+  renderTabs();
+  if (selected === 'all') updateAllView();
+  else if (domains[selected]) updateDomainView(selected);
+});
 
-    function render() {
-      renderTabs();
-      if (selected === 'all') renderAllView();
-      else renderDomainView(selected);
+function renderTabs() {
+  const keys = Object.keys(domains);
+  let h = '<div class="tab '+(selected==='all'?'active':'')+'" onclick="sel(\'all\')">Overview</div>';
+  keys.forEach(k => {
+    const s = domains[k].summary;
+    h += '<div class="tab '+(selected===k?'active':'')+' '+(s.active?'live':'')+'" onclick="sel(\''+k+'\')">' +
+         '<div class="dot"></div>'+s.display_name+'</div>';
+  });
+  document.getElementById('tabs').innerHTML = h;
+}
+
+function sel(k) { selected = k; render(); }
+function render() { renderTabs(); if (selected==='all') renderAllView(); else renderDomainView(selected); }
+
+// ========== ALL VIEW ==========
+
+function renderAllView() {
+  const vals = Object.values(domains);
+  if (!vals.length) { document.getElementById('content').innerHTML = '<div class="empty">No domains found yet...</div>'; return; }
+  const totSteps = vals.reduce((a,d) => a+d.summary.total_steps, 0);
+  const totEp = vals.reduce((a,d) => a+d.summary.episode_count, 0);
+  const totCol = vals.reduce((a,d) => a+d.summary.collisions, 0);
+  const totSuc = vals.reduce((a,d) => a+d.summary.successes, 0);
+  const totTo = vals.reduce((a,d) => a+d.summary.timeouts, 0);
+  const active = vals.filter(d => d.summary.active).length;
+  const rets = vals.filter(d => d.summary.episode_count>0).map(d => d.summary.avg_episode_return);
+  const avgRet = rets.length ? rets.reduce((a,b)=>a+b,0)/rets.length : 0;
+
+  let h = '<div class="summary-box"><h3>Cross-Domain Summary</h3><div class="summary-grid">' +
+    ss('Total Steps', totSteps.toLocaleString()) +
+    ss('Episodes', totEp) +
+    ss('Collisions', totCol, C.darkred) +
+    ss('Goals Reached', totSuc, C.darkgreen) +
+    ss('Timeouts', totTo, C.darkyellow) +
+    ss('Avg Return', avgRet.toFixed(1), avgRet>=0?C.green:C.red) +
+    ss('Active', active+'/'+vals.length, C.green) +
+  '</div></div>';
+  h += '<div class="card"><h3>Episode Returns (All Domains)</h3><div id="allChart" class="chart" style="height:280px"></div></div>';
+  document.getElementById('content').innerHTML = h;
+  drawAllChart();
+}
+
+function updateAllView() {
+  if (!document.getElementById('allChart')) { renderAllView(); return; }
+  drawAllChart();
+}
+
+function drawAllChart() {
+  const traces = [];
+  const cls = [C.blue, C.green, C.purple, C.red, C.cyan, C.yellow];
+  let ci = 0;
+  Object.values(domains).forEach(d => {
+    const p = d.plot_data;
+    if (p.episode_returns.values.length) {
+      traces.push({x:p.episode_returns.episodes, y:p.episode_returns.values, type:'scatter', mode:'lines', name:p.display_name, line:{color:cls[ci++%cls.length],width:2}});
     }
+  });
+  if (traces.length) Plotly.react('allChart', traces, {...layoutBase, showlegend:true, legend:{bgcolor:'rgba(0,0,0,0)',font:{size:10}}, xaxis:{...layoutBase.xaxis,title:'Episode'}, yaxis:{...layoutBase.yaxis,title:'Return'}}, cfg);
+}
 
-    function renderTabs() {
-      const keys = Object.keys(domains);
-      let h = '<div class="tab ' + (selected === 'all' ? 'active' : '') + '" onclick="sel(\\'all\\')">Overview</div>';
-      keys.forEach(k => {
-        const s = domains[k].summary;
-        h += '<div class="tab ' + (selected === k ? 'active' : '') + ' ' + (s.active ? 'live' : '') + '" onclick="sel(\\'' + k + '\\')">' +
-             '<div class="dot"></div>' + s.display_name + '</div>';
-      });
-      document.getElementById('tabs').innerHTML = h;
+function ss(label, value, color) {
+  return '<div class="summary-stat"><div class="label">'+label+'</div><div class="value" style="'+(color?'color:'+color:'')+'">' + value + '</div></div>';
+}
+
+// ========== DOMAIN VIEW ==========
+
+function renderDomainView(k) {
+  const d = domains[k]; if (!d) return;
+  const s = d.summary;
+  const defaultTopic = '/sam3_goal_generator/visualization';
+  const total = s.collisions + s.successes + s.timeouts;
+  const colPct = total>0 ? (s.collisions/total*100).toFixed(0) : 0;
+  const sucPct = total>0 ? (s.successes/total*100).toFixed(0) : 0;
+  const toPct  = total>0 ? (s.timeouts/total*100).toFixed(0) : 0;
+
+  let h = '<div class="stats-row">' +
+    statBox('Steps', s.total_steps.toLocaleString(), '', '') +
+    statBox('Episodes', s.episode_count, '', '') +
+    statBox('Collisions', s.collisions, 'red', colPct+'% of eps') +
+    statBox('Goals', s.successes, 'green', sucPct+'% of eps') +
+    statBox('Timeouts', s.timeouts, 'orange', toPct+'% of eps') +
+    statBox('Cells', s.cells_discovered, 'blue', '') +
+    statBox('Cur Return', s.current_episode_return.toFixed(1), s.current_episode_return>=0?'green':'red', 'step '+s.current_episode_steps) +
+    statBox('Avg Return', s.avg_episode_return.toFixed(1), s.avg_episode_return>=0?'green':'red', '') +
+    statBox('Avg Min Dist', s.avg_min_distance.toFixed(2)+'m', s.avg_min_distance>0.4?'green':'orange', 'closest: '+s.min_min_distance.toFixed(2)+'m') +
+  '</div>';
+
+  // Outcome bar
+  if (total > 0) {
+    h += '<div class="outcome-bar">';
+    if (s.collisions>0) h += '<div class="segment seg-collision" style="width:'+colPct+'%">'+s.collisions+'</div>';
+    if (s.successes>0) h += '<div class="segment seg-success" style="width:'+sucPct+'%">'+s.successes+'</div>';
+    if (s.timeouts>0) h += '<div class="segment seg-timeout" style="width:'+toPct+'%">'+s.timeouts+'</div>';
+    h += '</div>';
+  }
+
+  h += '<div class="grid">' +
+    '<div class="card"><h3>Camera Feed</h3>' +
+    '<div class="camera-container"><img class="camera-img" id="camImg" src="/stream/'+s.domain_id+'?topic='+encodeURIComponent(defaultTopic)+'"/></div>' +
+    '<div class="goal-status" id="goalStatus"></div></div>' +
+    '<div class="card"><h3>Real-Time Reward</h3><div id="rewChart" class="chart"></div></div>' +
+  '</div>';
+
+  h += '<div class="grid">' +
+    '<div class="card"><h3>Episode Returns</h3><div id="epChart" class="chart"></div></div>' +
+    '<div class="card"><h3>Min Distance to Obstacle</h3><div id="minDistChart" class="chart"></div></div>' +
+  '</div>';
+
+  h += '<div class="grid">' +
+    '<div class="card"><h3>Episode Outcomes</h3><div id="outcomeChart" class="chart"></div></div>' +
+    '<div class="card"><h3>Reward Components</h3><div id="compChart" class="chart"></div>' +
+    '<div class="reward-legend" id="compLegend"></div></div>' +
+  '</div>';
+
+  h += '<div class="grid">' +
+    '<div class="card"><h3>Velocity (RL Output)</h3><div id="velChart" class="chart"></div></div>' +
+    '<div class="card"><h3>Nav Zone Distribution</h3><div id="zoneChart" class="chart"></div></div>' +
+  '</div>';
+
+  document.getElementById('content').innerHTML = h;
+  updateDomainView(k);
+}
+
+function statBox(label, value, colorClass, sub) {
+  return '<div class="stat"><div class="label">'+label+'</div><div class="value '+colorClass+'">'+value+'</div>'+(sub?'<div class="sub">'+sub+'</div>':'')+'</div>';
+}
+
+function updateDomainView(k) {
+  const d = domains[k]; if (!d) return;
+  const s = d.summary, p = d.plot_data;
+
+  updateGoalStatus(s.goal_status);
+
+  // Reward chart
+  if (p.rewards.values.length) {
+    Plotly.react('rewChart', [{x:p.rewards.times, y:p.rewards.values, type:'scatter', mode:'lines', line:{color:C.blue,width:2}, fill:'tozeroy', fillcolor:'rgba(102,126,234,0.1)'}], {...layoutBase, xaxis:{...layoutBase.xaxis,title:'Time (s)'}}, cfg);
+  }
+
+  // Episode returns + rolling average
+  if (p.episode_returns.values.length) {
+    const ra = [];
+    for (let i=0; i<p.episode_returns.values.length; i++) {
+      const w = p.episode_returns.values.slice(Math.max(0,i-9), i+1);
+      ra.push(w.reduce((a,b)=>a+b,0)/w.length);
     }
+    Plotly.react('epChart', [
+      {x:p.episode_returns.episodes, y:p.episode_returns.values, type:'scatter', mode:'lines+markers', name:'Return', line:{color:C.green,width:2}, marker:{size:4}},
+      {x:p.episode_returns.episodes, y:ra, type:'scatter', mode:'lines', name:'10-ep avg', line:{color:C.yellow,width:2.5}}
+    ], {...layoutBase, showlegend:true, legend:{bgcolor:'rgba(0,0,0,0)',x:0.02,y:0.98}, xaxis:{...layoutBase.xaxis,title:'Episode'}}, cfg);
+  }
 
-    function sel(k) {
-      selected = k;
-      chartsInitialized = {};
-      render();  // Full render only on tab switch
+  // Min distance chart with collision threshold line
+  if (p.min_distance.values.length) {
+    const t0 = p.min_distance.times[0];
+    const tEnd = p.min_distance.times[p.min_distance.times.length-1];
+    Plotly.react('minDistChart', [
+      {x:p.min_distance.times, y:p.min_distance.values, type:'scatter', mode:'lines', name:'Min Dist', line:{color:C.orange,width:2}, fill:'tozeroy', fillcolor:'rgba(237,137,54,0.08)'},
+      {x:[t0, tEnd], y:[0.30, 0.30], type:'scatter', mode:'lines', name:'Collision (0.30m)', line:{color:C.darkred,width:1.5,dash:'dash'}, hoverinfo:'name'}
+    ], {...layoutBase, showlegend:true, legend:{bgcolor:'rgba(0,0,0,0)',font:{size:9}}, xaxis:{...layoutBase.xaxis,title:'Time (s)'}, yaxis:{...layoutBase.yaxis,title:'meters',rangemode:'tozero'}}, cfg);
+  }
+
+  // Outcomes pie chart
+  const oc = p.outcomes;
+  const ovals = [], olabels = [], ocolors = [];
+  if (oc.collisions>0) { ovals.push(oc.collisions); olabels.push('Collision ('+oc.collisions+')'); ocolors.push(C.darkred); }
+  if (oc.successes>0)  { ovals.push(oc.successes);  olabels.push('Goal ('+oc.successes+')');       ocolors.push(C.darkgreen); }
+  if (oc.timeouts>0)   { ovals.push(oc.timeouts);   olabels.push('Timeout ('+oc.timeouts+')');     ocolors.push(C.darkyellow); }
+  if (ovals.length) {
+    Plotly.react('outcomeChart', [{values:ovals, labels:olabels, type:'pie', marker:{colors:ocolors}, textinfo:'label+percent', textfont:{size:11}, hole:0.5}], {...layoutBase}, cfg);
+  }
+
+  // Reward components time series
+  const traces = [];
+  const legendItems = [];
+  const compOrder = ['progress','alignment','goal','discovery','novelty','frontier','rnd','forward','stuck','spin','step','collision','timeout'];
+  compOrder.forEach(n => {
+    const cd = p.components[n];
+    if (cd && cd.values.length) {
+      const color = compColors[n] || C.gray;
+      traces.push({x:cd.times, y:cd.values, type:'scatter', mode:'lines', name:n, line:{color:color, width:1.5}});
+      legendItems.push({name:n, color:color});
     }
-    
-    function updateAllCharts() {
-      if (!document.getElementById('allChart')) return;
-      const vals = Object.values(domains);
-      if (!vals.length) return;
-      
-      const traces = [];
-      const cls = [colors.blue, colors.green, colors.purple, colors.red, colors.cyan, colors.yellow];
-      let ci = 0;
-      Object.values(domains).forEach(d => {
-        const p = d.plot_data;
-        if (p.episode_returns.values.length) {
-          traces.push({
-            x: p.episode_returns.episodes,
-            y: p.episode_returns.values,
-            type: 'scatter',
-            mode: 'lines',
-            name: p.display_name,
-            line: { color: cls[ci++ % cls.length], width: 2 }
-          });
-        }
-      });
-      if (traces.length) {
-        Plotly.react('allChart', traces, {
-          ...layoutBase,
-          showlegend: true,
-          legend: { bgcolor: 'rgba(0,0,0,0)', font: { size: 10 } },
-          xaxis: { ...layoutBase.xaxis, title: 'Episode' },
-          yaxis: { ...layoutBase.yaxis, title: 'Return' }
-        }, config);
-      }
-      
-      // Update summary stats
-      const totSteps = vals.reduce((a, d) => a + d.summary.total_steps, 0);
-      const totEp = vals.reduce((a, d) => a + d.summary.episode_count, 0);
-      const active = vals.filter(d => d.summary.active).length;
-      document.querySelectorAll('.summary-stat .value').forEach((el, i) => {
-        if (i === 0) el.textContent = totSteps.toLocaleString();
-        if (i === 1) el.textContent = totEp;
-        if (i === 4) el.textContent = active + '/' + vals.length;
-      });
-    }
-    
-    function updateDomainCharts(k) {
-      const d = domains[k];
-      if (!d) return;
-      
-      const s = d.summary;
-      const p = d.plot_data;
-      
-      // Update stat values without rebuilding HTML
-      const statEls = document.querySelectorAll('.stat .value');
-      if (statEls.length >= 7) {
-        statEls[0].textContent = s.total_steps.toLocaleString();
-        statEls[1].textContent = s.episode_count;
-        statEls[2].textContent = s.goals_reached;
-        statEls[3].textContent = s.cells_discovered;
-        statEls[4].textContent = s.current_episode_return.toFixed(1);
-        statEls[5].textContent = s.avg_episode_return.toFixed(1);
-        statEls[6].textContent = (s.avg_intervention * 100).toFixed(0) + '%';
-      }
-      
-      // Update charts
-      drawRewardChart(p);
-      drawEpisodeChart(p);
-      drawInterventionChart(p);
-      drawZoneChart(p);
-      drawComponentsChart(p);
-    }
-
-    function renderAllView() {
-      const vals = Object.values(domains);
-      if (!vals.length) {
-        document.getElementById('content').innerHTML = '<div class="empty">No domains found yet...</div>';
-        return;
-      }
-
-      const totSteps = vals.reduce((a, d) => a + d.summary.total_steps, 0);
-      const totEp = vals.reduce((a, d) => a + d.summary.episode_count, 0);
-      const totGoals = vals.reduce((a, d) => a + d.summary.goals_reached, 0);
-      const active = vals.filter(d => d.summary.active).length;
-      const rets = vals.filter(d => d.summary.episode_count > 0).map(d => d.summary.avg_episode_return);
-      const avgRet = rets.length ? rets.reduce((a, b) => a + b, 0) / rets.length : 0;
-
-      let h = '<div class="summary-box"><h3>Cross-Domain Summary</h3><div class="summary-grid">' +
-        '<div class="summary-stat"><div class="label">Total Steps</div><div class="value">' + totSteps.toLocaleString() + '</div></div>' +
-        '<div class="summary-stat"><div class="label">Episodes</div><div class="value">' + totEp + '</div></div>' +
-        '<div class="summary-stat"><div class="label">Goals</div><div class="value">' + totGoals + '</div></div>' +
-        '<div class="summary-stat"><div class="label">Avg Return</div><div class="value" style="color:' + (avgRet >= 0 ? colors.green : colors.red) + '">' + avgRet.toFixed(1) + '</div></div>' +
-        '<div class="summary-stat"><div class="label">Active</div><div class="value" style="color:' + colors.green + '">' + active + '/' + vals.length + '</div></div>' +
-      '</div></div>';
-
-      h += '<div class="card"><h3>Episode Returns (All Domains)</h3><div id="allChart" class="chart" style="height:280px"></div></div>';
-
-      document.getElementById('content').innerHTML = h;
-
-      // Draw comparison chart
-      const traces = [];
-      const cls = [colors.blue, colors.green, colors.purple, colors.red, colors.cyan, colors.yellow];
-      let ci = 0;
-      Object.values(domains).forEach(d => {
-        const p = d.plot_data;
-        if (p.episode_returns.values.length) {
-          traces.push({
-            x: p.episode_returns.episodes,
-            y: p.episode_returns.values,
-            type: 'scatter',
-            mode: 'lines',
-            name: p.display_name,
-            line: { color: cls[ci++ % cls.length], width: 2 }
-          });
-        }
-      });
-      if (traces.length) {
-        Plotly.newPlot('allChart', traces, {
-          ...layoutBase,
-          showlegend: true,
-          legend: { bgcolor: 'rgba(0,0,0,0)', font: { size: 10 } },
-          xaxis: { ...layoutBase.xaxis, title: 'Episode' },
-          yaxis: { ...layoutBase.yaxis, title: 'Return' }
-        }, config);
-      }
-    }
-
-    function renderDomainView(k) {
-      const d = domains[k];
-      if (!d) return;
-
-      const s = d.summary;
-      const p = d.plot_data;
-
-      // Fetch camera topics - but we only care about sam3_goal_generator/visualization
-      const defaultTopic = '/sam3_goal_generator/visualization';
-
-      let h = '<div class="stats-row">' +
-        '<div class="stat"><div class="label">Steps</div><div class="value">' + s.total_steps.toLocaleString() + '</div></div>' +
-        '<div class="stat"><div class="label">Episodes</div><div class="value">' + s.episode_count + '</div></div>' +
-        '<div class="stat"><div class="label">Goals</div><div class="value green">' + s.goals_reached + '</div></div>' +
-        '<div class="stat"><div class="label">Cells</div><div class="value blue">' + s.cells_discovered + '</div></div>' +
-        '<div class="stat"><div class="label">Current Return</div><div class="value ' + (s.current_episode_return >= 0 ? 'green' : 'red') + '">' + s.current_episode_return.toFixed(1) + '</div></div>' +
-        '<div class="stat"><div class="label">Avg Return</div><div class="value ' + (s.avg_episode_return >= 0 ? 'green' : 'red') + '">' + s.avg_episode_return.toFixed(1) + '</div></div>' +
-        '<div class="stat"><div class="label">Intervention</div><div class="value ' + (s.avg_intervention < 0.3 ? 'green' : '') + '">' + (s.avg_intervention * 100).toFixed(0) + '%</div></div>' +
-      '</div>';
-
-      h += '<div class="grid">' +
-        '<div class="card"><h3>Camera Feed</h3>' +
-        '<div class="camera-container"><img class="camera-img" id="camImg" src="/stream/' + s.domain_id + '?topic=' + encodeURIComponent(defaultTopic) + '"/></div>' +
-        '<div class="goal-status" id="goalStatus"></div></div>' +
-        '<div class="card"><h3>Real-Time Reward</h3><div id="rewChart" class="chart"></div></div>' +
-      '</div>';
-
-      h += '<div class="grid">' +
-        '<div class="card"><h3>Episode Returns</h3><div id="epChart" class="chart"></div></div>' +
-        '<div class="card"><h3>Intervention Rate</h3><div id="intChart" class="chart"></div></div>' +
-      '</div>';
-
-      h += '<div class="grid">' +
-        '<div class="card"><h3>Safety Zones</h3><div id="zoneChart" class="chart"></div>' +
-        '<div class="zones">' + Object.entries(p.safety_zones).filter(z => z[1] > 0).map(z => '<span class="zone ' + z[0] + '">' + z[0] + ': ' + z[1] + '</span>').join('') + '</div></div>' +
-        '<div class="card"><h3>Reward Components</h3><div id="compChart" class="chart"></div></div>' +
-      '</div>';
-
-      document.getElementById('content').innerHTML = h;
-
-      // Update goal status panel
-      updateGoalStatus(s.goal_status);
-
-      // Draw charts using Plotly.react for smooth updates
-      drawRewardChart(p);
-      drawEpisodeChart(p);
-      drawInterventionChart(p);
-      drawZoneChart(p);
-      drawComponentsChart(p);
-    }
-
-    function updateGoalStatus(gs) {
-      const el = document.getElementById('goalStatus');
-      if (!el) return;
-
-      if (!gs || Object.keys(gs).length === 0) {
-        el.innerHTML = '<div style="color:var(--text-muted);text-align:center;padding:8px;">No goal generator data</div>';
-        el.className = 'goal-status';
-        return;
-      }
-
-      const found = gs.found === true;
-      el.className = 'goal-status' + (found ? '' : ' searching');
-
-      let html = '<div class="status-row"><span class="status-label">Target</span><span class="status-value">' + (gs.target || '—') + '</span></div>';
-      html += '<div class="status-row"><span class="status-label">Status</span><span class="status-value ' + (found ? 'found' : 'searching') + '">' + (found ? '✓ Found' : '○ Searching...') + '</span></div>';
-
-      if (found) {
-        html += '<div class="status-row"><span class="status-label">Distance</span><span class="status-value">' + (gs.distance ? gs.distance.toFixed(2) + 'm' : '—') + '</span></div>';
-        html += '<div class="status-row"><span class="status-label">Confidence</span><span class="status-value">' + (gs.confidence ? (gs.confidence * 100).toFixed(0) + '%' : '—') + '</span></div>';
-        html += '<div class="status-row"><span class="status-label">Depth Method</span><span class="status-value">' + (gs.depth_method || '—') + '</span></div>';
-        if (gs.goal_position) {
-          html += '<div class="status-row"><span class="status-label">Goal Position</span><span class="status-value">(' + gs.goal_position[0].toFixed(2) + ', ' + gs.goal_position[1].toFixed(2) + ')</span></div>';
-        }
-      } else if (gs.message) {
-        html += '<div class="status-row"><span class="status-label">Info</span><span class="status-value" style="font-size:11px">' + gs.message + '</span></div>';
-      }
-
-      if (gs.available_methods) {
-        html += '<div class="status-row"><span class="status-label">Available</span><span class="status-value" style="font-size:11px">' + gs.available_methods.join(', ') + '</span></div>';
-      }
-
-      el.innerHTML = html;
-    }
-
-    function drawRewardChart(p) {
-      if (!p.rewards.values.length) return;
-      Plotly.react('rewChart', [{
-        x: p.rewards.times, y: p.rewards.values,
-        type: 'scatter', mode: 'lines',
-        line: { color: colors.blue, width: 2 },
-        fill: 'tozeroy', fillcolor: 'rgba(102,126,234,0.1)'
-      }], { ...layoutBase, xaxis: { ...layoutBase.xaxis, title: 'Time (s)' } }, config);
-    }
-
-    function drawEpisodeChart(p) {
-      if (!p.episode_returns.values.length) return;
-      const ra = [];
-      for (let i = 0; i < p.episode_returns.values.length; i++) {
-        const w = p.episode_returns.values.slice(Math.max(0, i - 9), i + 1);
-        ra.push(w.reduce((a, b) => a + b, 0) / w.length);
-      }
-      Plotly.react('epChart', [
-        { x: p.episode_returns.episodes, y: p.episode_returns.values, type: 'scatter', mode: 'lines+markers', name: 'Return', line: { color: colors.green, width: 2 }, marker: { size: 4 } },
-        { x: p.episode_returns.episodes, y: ra, type: 'scatter', mode: 'lines', name: 'Avg', line: { color: colors.yellow, width: 2.5 } }
-      ], { ...layoutBase, showlegend: true, legend: { bgcolor: 'rgba(0,0,0,0)', x: 0.02, y: 0.98 }, xaxis: { ...layoutBase.xaxis, title: 'Episode' } }, config);
-    }
-
-    function drawInterventionChart(p) {
-      if (!p.interventions.values.length) return;
-      Plotly.react('intChart', [{
-        x: p.interventions.times, y: p.interventions.values.map(v => v * 100),
-        type: 'scatter', mode: 'lines',
-        line: { color: colors.red, width: 2 },
-        fill: 'tozeroy', fillcolor: 'rgba(252,129,129,0.1)'
-      }], { ...layoutBase, xaxis: { ...layoutBase.xaxis, title: 'Time (s)' }, yaxis: { ...layoutBase.yaxis, title: '%', range: [0, 100] } }, config);
-    }
-
-    function drawZoneChart(p) {
-      const zc = { FREE: colors.green, AWARE: '#9ae6b4', CAUTION: colors.yellow, DANGER: '#feb2b2', EMERGENCY: colors.red };
-      const zones = Object.entries(p.safety_zones).filter(z => z[1] > 0);
-      if (!zones.length) return;
-      Plotly.react('zoneChart', [{
-        values: zones.map(z => z[1]),
-        labels: zones.map(z => z[0]),
-        type: 'pie',
-        marker: { colors: zones.map(z => zc[z[0]] || '#a0aec0') },
-        textinfo: 'label+percent',
-        textfont: { size: 10 },
-        hole: 0.5
-      }], { ...layoutBase }, config);
-    }
-
-    function drawComponentsChart(p) {
-      const cc = { discovery: colors.purple, proximity: colors.red, step: '#a0aec0', novelty: colors.cyan, rnd: '#4fd1c5', goal: colors.yellow };
-      const traces = [];
-      Object.entries(p.components).forEach(([n, d]) => {
-        if (d.values.length) traces.push({ x: d.times, y: d.values, type: 'scatter', mode: 'lines', name: n, line: { color: cc[n] || '#a0aec0', width: 1.5 } });
-      });
-      if (traces.length) {
-        Plotly.react('compChart', traces, { ...layoutBase, showlegend: true, legend: { bgcolor: 'rgba(0,0,0,0)', font: { size: 9 } }, xaxis: { ...layoutBase.xaxis, title: 'Time (s)' } }, config);
+  });
+  // Also show any unexpected components
+  Object.keys(p.components).forEach(n => {
+    if (!compOrder.includes(n)) {
+      const cd = p.components[n];
+      if (cd && cd.values.length) {
+        traces.push({x:cd.times, y:cd.values, type:'scatter', mode:'lines', name:n, line:{color:C.gray, width:1.5}});
+        legendItems.push({name:n, color:C.gray});
       }
     }
-  </script>
+  });
+  if (traces.length) {
+    Plotly.react('compChart', traces, {...layoutBase, showlegend:false, xaxis:{...layoutBase.xaxis,title:'Time (s)'}}, cfg);
+    const legendEl = document.getElementById('compLegend');
+    if (legendEl) legendEl.innerHTML = legendItems.map(i => '<div class="item"><div class="swatch" style="background:'+i.color+'"></div>'+i.name+'</div>').join('');
+  }
+
+  // Velocity chart
+  if (p.velocity.values.length) {
+    Plotly.react('velChart', [{x:p.velocity.times, y:p.velocity.values, type:'scatter', mode:'lines', line:{color:C.cyan,width:2}, fill:'tozeroy', fillcolor:'rgba(79,209,197,0.1)'}], {...layoutBase, xaxis:{...layoutBase.xaxis,title:'Time (s)'}, yaxis:{...layoutBase.yaxis,title:'m/s'}}, cfg);
+  }
+
+  // Nav zone distribution pie
+  const zc = {FREE:C.green, AWARE:'#9ae6b4', CAUTION:C.yellow, DANGER:'#feb2b2', EMERGENCY:C.red, CRITICAL:'#9b2c2c'};
+  const zones = Object.entries(p.nav_zones).filter(z => z[1] > 0);
+  if (zones.length) {
+    Plotly.react('zoneChart', [{
+      values:zones.map(z=>z[1]), labels:zones.map(z=>z[0]), type:'pie',
+      marker:{colors:zones.map(z=>zc[z[0]]||C.gray)}, textinfo:'label+percent', textfont:{size:10}, hole:0.5
+    }], {...layoutBase}, cfg);
+  }
+}
+
+function updateGoalStatus(gs) {
+  const el = document.getElementById('goalStatus');
+  if (!el) return;
+  if (!gs || Object.keys(gs).length===0) {
+    el.innerHTML = '<div style="color:var(--text-muted);text-align:center;padding:8px;">No goal generator data</div>';
+    el.className = 'goal-status'; return;
+  }
+  const found = gs.found===true;
+  el.className = 'goal-status'+(found?'':' searching');
+  let html = '<div class="status-row"><span class="status-label">Target</span><span class="status-value">'+(gs.target||'\u2014')+'</span></div>';
+  html += '<div class="status-row"><span class="status-label">Status</span><span class="status-value '+(found?'found':'searching')+'">'+(found?'\u2713 Found':'\u25CB Searching...')+'</span></div>';
+  if (found) {
+    html += '<div class="status-row"><span class="status-label">Distance</span><span class="status-value">'+(gs.distance?gs.distance.toFixed(2)+'m':'\u2014')+'</span></div>';
+    html += '<div class="status-row"><span class="status-label">Confidence</span><span class="status-value">'+(gs.confidence?(gs.confidence*100).toFixed(0)+'%':'\u2014')+'</span></div>';
+    if (gs.goal_position) html += '<div class="status-row"><span class="status-label">Goal Pos</span><span class="status-value">('+gs.goal_position[0].toFixed(2)+', '+gs.goal_position[1].toFixed(2)+')</span></div>';
+  } else if (gs.message) {
+    html += '<div class="status-row"><span class="status-label">Info</span><span class="status-value" style="font-size:11px">'+gs.message+'</span></div>';
+  }
+  el.innerHTML = html;
+}
+</script>
 </body>
 </html>
 """
@@ -1183,10 +961,8 @@ def create_app(stats: Dict[str, DomainStats], mgr: MultiDomainManager):
         cam = mgr.get_camera(domain_id)
         if cam is None:
             return
-
         cam.ensure_subscription(topic)
         boundary = b"--frame\r\n"
-
         while True:
             frame = cam.latest_jpeg()
             if frame:
@@ -1225,15 +1001,21 @@ def main():
     args = parser.parse_args()
 
     print(f"""
-    RL Training Monitor
-    ===================
+    RL Training Monitor (No Safety Override)
+    =========================================
     http://localhost:{args.port}
     Scanning domains {args.scan_start}-{args.scan_end}
+
+    REWARD SYSTEM:
+      Terminal:  collision=-500, goal_reached=+2000, timeout=-50
+      Goal:     progress (closer=+), alignment (facing goal=+), step cost (-)
+      Explore:  discovery, novelty, frontier, rnd, step cost (-)
+      Shaping:  forward (+1), stuck (-1), spin (-3)
+      Collision threshold: 0.30m (LIDAR min distance)
     """)
 
     stats: Dict[str, DomainStats] = {}
     mgr = MultiDomainManager(stats)
-
     mgr.discover_domains(args.scan_start, args.scan_end)
 
     app, sio, updater = create_app(stats, mgr)
