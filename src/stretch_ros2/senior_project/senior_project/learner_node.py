@@ -637,6 +637,48 @@ class PrioritizedReplayBuffer:
             self.tree.update(tree_idx, priority)
             
             self.max_priority = max(self.max_priority, abs(td_error) + PER_EPSILON)
+    
+    def save(self, path: str):
+        """Save replay buffer data to disk."""
+        np.savez_compressed(
+            path,
+            obs=self.obs[:self.count],
+            acts=self.acts[:self.count],
+            rews=self.rews[:self.count],
+            next_obs=self.next_obs[:self.count],
+            done=self.done[:self.count],
+            ptr=self.ptr,
+            count=self.count,
+        )
+    
+    def load(self, path: str):
+        """Load replay buffer data from disk."""
+        if not os.path.exists(path):
+            return False
+        try:
+            data = np.load(path)
+            count = int(data["count"])
+            if count == 0:
+                return False
+            
+            # Restore data (handle size mismatch if replay_size changed)
+            n = min(count, self.size)
+            self.obs[:n] = data["obs"][:n]
+            self.acts[:n] = data["acts"][:n]
+            self.rews[:n] = data["rews"][:n]
+            self.next_obs[:n] = data["next_obs"][:n]
+            self.done[:n] = data["done"][:n]
+            self.ptr = int(data["ptr"]) % self.size
+            self.count = n
+            
+            # Rebuild sum tree with uniform priorities
+            self.tree = SumTree(self.size)
+            for i in range(n):
+                self.tree.add(self.max_priority ** self.alpha)
+            
+            return True
+        except Exception:
+            return False
 
 
 # =============================================================================
@@ -1417,7 +1459,7 @@ class StretchExploreEnv(gym.Env):
             self.ros.goal_reached_pub.publish(reached_msg)
             
             self.ros.get_logger().info(
-                f"[GOAL REACHED] dist={d_goal:.2f}m, reward={R_GOAL:.0f} -> EPISODE ENDS"
+                f"\033[92m[GOAL REACHED]\033[0m dist={d_goal:.2f}m, reward={R_GOAL:.0f} -> EPISODE ENDS"
             )
         
         # --- TIMEOUT: episode ends ---
@@ -1516,15 +1558,16 @@ class StretchExploreEnv(gym.Env):
         if done:
             stats = self.occ_grid.get_stats()
             if success:
-                status = "GOAL_REACHED"
+                status = "\033[92mGOAL_REACHED\033[0m"
             elif collision:
-                status = "COLLISION"
+                status = "\033[91mCOLLISION\033[0m"
             else:
-                status = "TIMEOUT"
+                status = "\033[93mTIMEOUT\033[0m"
             mode = "GOAL" if has_goal else "EXPLORE"
+            ret_color = "\033[92m" if self.episode_return >= 0 else "\033[91m"
             self.ros.get_logger().info(
                 f"[EP {self.episode_index:04d}] {mode} {status} | "
-                f"Return {self.episode_return:+.1f} | Steps {self.step_count} | "
+                f"Return {ret_color}{self.episode_return:+.1f}\033[0m | Steps {self.step_count} | "
                 f"Cells {stats['total_discovered']} | "
                 f"Goals {self._goals_reached_this_episode} | "
                 f"MinDist {min_dist:.2f}m"
@@ -1837,18 +1880,12 @@ class StretchExploreEnv(gym.Env):
             "reward_terms": info.get("reward_terms", {}),
             "collision": info.get("collision", False),
             "success": info.get("success", False),
-            "mission_complete": info.get("mission_complete", False),
             "goals_reached": self._goals_reached_this_episode,
-            "navigation": {
-                "zone": info.get("nav_zone", "UNKNOWN"),
-                "blend": info.get("safety_blend", 0.0),
-                "intervention": info.get("intervention", 0.0),
-                "rl_v": info.get("rl_v", 0.0),
-                "rl_w": info.get("rl_w", 0.0),
-                "executed_v": info.get("executed_v", 0.0),
-                "executed_w": info.get("executed_w", 0.0),
-                "best_direction": info.get("best_direction", 0.0),
-                "num_gaps": info.get("num_gaps", 0),
+            "min_distance": info.get("min_distance", 0.0),
+            "nav_zone": info.get("nav_zone", "UNKNOWN"),
+            "velocity": {
+                "v": info.get("executed_v", 0.0),
+                "w": info.get("executed_w", 0.0),
             },
             "state": {
                 "x": st["x"],
@@ -2081,8 +2118,8 @@ class TD3AgentCNN:
             for tp, sp in zip(target.parameters(), source.parameters()):
                 tp.data.mul_(1.0 - self.tau).add_(self.tau * sp.data)
     
-    def save(self, path: str):
-        torch.save({
+    def save(self, path: str, extra_state: Optional[Dict] = None):
+        payload = {
             "actor": self.actor.state_dict(),
             "critic1": self.critic1.state_dict(),
             "critic2": self.critic2.state_dict(),
@@ -2093,9 +2130,13 @@ class TD3AgentCNN:
             "critic_opt": self.critic_opt.state_dict(),
             "total_updates": self.total_updates,
             "rnd": self.rnd.state_dict_custom(),
-        }, path)
+        }
+        if extra_state is not None:
+            payload["training_state"] = extra_state
+        torch.save(payload, path)
     
-    def load(self, path: str, strict: bool = True):
+    def load(self, path: str, strict: bool = True) -> Optional[Dict]:
+        """Load checkpoint. Returns training_state dict if present, else None."""
         payload = torch.load(path, map_location=self.device)
         self.actor.load_state_dict(payload["actor"], strict=strict)
         self.critic1.load_state_dict(payload["critic1"], strict=strict)
@@ -2111,6 +2152,7 @@ class TD3AgentCNN:
                 self.rnd.load_state_dict_custom(payload["rnd"])
         except Exception:
             pass
+        return payload.get("training_state", None)
 
 
 # =============================================================================
@@ -2196,29 +2238,164 @@ def main():
     # Replay buffer
     replay = PrioritizedReplayBuffer(obs_dim, act_dim, size=args.replay_size, device=device)
     
-    # Load checkpoint
+    # =====================================================================
+    # LOAD CHECKPOINT — restores weights + training state + replay buffer
+    # =====================================================================
+    
+    # ANSI colors for terminal
+    G = "\033[92m"  # Green
+    R = "\033[91m"  # Red
+    Y = "\033[93m"  # Yellow
+    B = "\033[94m"  # Blue
+    W = "\033[97m"  # White bold
+    RST = "\033[0m" # Reset
+    
+    resume_step = 0  # Which training step to resume from
+    replay_path = os.path.join(args.ckpt_dir, "replay_buffer.npz")
+    
+    ros.get_logger().info(f"[CKPT] Checkpoint dir: {B}{args.ckpt_dir}{RST}")
+    ros.get_logger().info(f"[CKPT] Looking for: {B}{ckpt_path}{RST}")
+    
     if AUTO_LOAD_CHECKPOINT and os.path.exists(ckpt_path):
-        ros.get_logger().info(f"[CKPT] Loading from {ckpt_path}")
+        file_size_mb = os.path.getsize(ckpt_path) / 1e6
+        ros.get_logger().info(f"[CKPT] Found checkpoint ({file_size_mb:.1f} MB) — loading...")
         try:
-            agent.load(ckpt_path, strict=False)
-            ros.get_logger().info("[CKPT] Load SUCCESS")
+            training_state = agent.load(ckpt_path, strict=False)
+            ros.get_logger().info(f"[CKPT] {G}✓ Network weights loaded successfully{RST}")
+            
+            if training_state is not None:
+                resume_step = training_state.get("step", 0)
+                env.episode_index = training_state.get("episode_index", 1)
+                env.total_steps = training_state.get("total_steps", 0)
+                env.rnd_weight = training_state.get("rnd_weight", RND_WEIGHT_INITIAL)
+                
+                # Restore observation normalizer
+                if "obs_rms_mean" in training_state:
+                    env.obs_rms.mean = training_state["obs_rms_mean"]
+                    env.obs_rms.var = training_state["obs_rms_var"]
+                    env.obs_rms.count = training_state["obs_rms_count"]
+                    ros.get_logger().info(f"[CKPT] {G}✓ Observation normalizer restored{RST} (count={env.obs_rms.count:.0f})")
+                else:
+                    ros.get_logger().warn(f"[CKPT] {Y}✗ No obs_rms in training state — normalizer starts fresh{RST}")
+                
+                ros.get_logger().info(
+                    f"[CKPT] {G}✓ Training state restored:{RST} step={W}{resume_step}{RST}, "
+                    f"episode={W}{env.episode_index}{RST}, total_steps={W}{env.total_steps}{RST}, "
+                    f"rnd_weight={env.rnd_weight:.4f}"
+                )
+            else:
+                ros.get_logger().warn(
+                    f"[CKPT] {Y}✗ No training state in checkpoint (old format){RST} — "
+                    "weights loaded but step/episode/replay start from 0"
+                )
+            
+            # Load replay buffer (check for broken temp files from old bug)
+            replay_loaded = False
+            search_paths = [
+                replay_path,
+                replay_path + ".tmp.npz",
+                replay_path.replace(".npz", ".npz.tmp.npz"),
+            ]
+            ros.get_logger().info(f"[CKPT] Looking for replay buffer...")
+            for rp in search_paths:
+                if os.path.exists(rp):
+                    rp_size_mb = os.path.getsize(rp) / 1e6
+                    ros.get_logger().info(f"[CKPT] Found: {B}{rp}{RST} ({rp_size_mb:.1f} MB)")
+                    if replay.load(rp):
+                        ros.get_logger().info(f"[CKPT] {G}✓ Replay buffer loaded: {replay.count} transitions{RST}")
+                        # Rename to correct path if loaded from broken name
+                        if rp != replay_path:
+                            try:
+                                os.replace(rp, replay_path)
+                                ros.get_logger().info(f"[CKPT] {G}Renamed{RST} {rp} → {replay_path}")
+                            except Exception as e:
+                                ros.get_logger().warn(f"[CKPT] {Y}Could not rename: {e}{RST}")
+                        replay_loaded = True
+                        break
+                    else:
+                        ros.get_logger().warn(f"[CKPT] {R}✗ Replay buffer file exists but failed to load{RST}")
+            if not replay_loaded:
+                ros.get_logger().warn(f"[CKPT] {Y}✗ No replay buffer found — starting empty (will need to refill){RST}")
+            
+            # Summary
+            skip_explore = resume_step >= args.start_steps
+            ros.get_logger().info(
+                f"\n{W}{'='*50}\n"
+                f"  CHECKPOINT LOAD SUMMARY\n"
+                f"{'='*50}{RST}\n"
+                f"  Weights:       {G}✓ loaded{RST}\n"
+                f"  Training step: {W}{resume_step}{RST}\n"
+                f"  Episode:       {W}{env.episode_index}{RST}\n"
+                f"  Replay buffer: {G if replay.count > 0 else Y}{replay.count} transitions{RST}\n"
+                f"  Updates done:  {W}{agent.total_updates}{RST}\n"
+                f"  Skip random:   {G + 'YES' if skip_explore else Y + 'NO (need ' + str(args.start_steps - resume_step) + ' more random steps)'}{RST}\n"
+                f"{W}{'='*50}{RST}"
+            )
+            
         except Exception as e:
-            ros.get_logger().warn(f"[CKPT] Load FAILED (model architecture changed?): {e}")
+            ros.get_logger().error(
+                f"\n{R}{'='*50}\n"
+                f"  CHECKPOINT LOAD FAILED\n"
+                f"{'='*50}\n"
+                f"  Error: {e}\n"
+                f"  Starting from scratch with random weights\n"
+                f"{'='*50}{RST}"
+            )
+    else:
+        if not os.path.exists(ckpt_path):
+            ros.get_logger().info(f"[CKPT] {Y}No checkpoint found at {ckpt_path} — starting fresh{RST}")
+        else:
+            ros.get_logger().info(f"[CKPT] {Y}AUTO_LOAD_CHECKPOINT disabled — starting fresh{RST}")
+    
+    # =====================================================================
+    # SAVE HELPER — saves everything needed to resume training
+    # =====================================================================
+    
+    def save_full_checkpoint(step: int, label: str = "periodic"):
+        """Save agent weights + training state + replay buffer."""
+        training_state = {
+            "step": step,
+            "episode_index": env.episode_index,
+            "total_steps": env.total_steps,
+            "rnd_weight": env.rnd_weight,
+            "obs_rms_mean": env.obs_rms.mean,
+            "obs_rms_var": env.obs_rms.var,
+            "obs_rms_count": env.obs_rms.count,
+        }
+        
+        try:
+            agent.save(ckpt_path + ".tmp", extra_state=training_state)
+            os.replace(ckpt_path + ".tmp", ckpt_path)
+        except Exception as e:
+            ros.get_logger().error(f"[CKPT] {R}✗ Agent save failed: {e}{RST}")
+            return
+        
+        try:
+            replay_tmp = replay_path.replace(".npz", "_tmp.npz")
+            replay.save(replay_tmp)
+            # np.savez_compressed may add .npz if not present
+            if not os.path.exists(replay_tmp) and os.path.exists(replay_tmp + ".npz"):
+                replay_tmp = replay_tmp + ".npz"
+            os.replace(replay_tmp, replay_path)
+        except Exception as e:
+            ros.get_logger().warn(f"[CKPT] {Y}✗ Replay save failed: {e}{RST}")
+        
+        ros.get_logger().info(
+            f"[CKPT] {G}✓ {label} save{RST} at step={W}{step}{RST} | "
+            f"episode={W}{env.episode_index}{RST} | replay={W}{replay.count}{RST}"
+        )
     
     # Shutdown handler
     def shutdown_and_save(signum=None, frame=None):
+        nonlocal resume_step
         try:
             ros.send_cmd(0.0, 0.0)
         except:
             pass
         
-        ros.get_logger().info(f"[CKPT] Saving to {ckpt_path}")
-        try:
-            agent.save(ckpt_path + ".tmp")
-            os.replace(ckpt_path + ".tmp", ckpt_path)
-            ros.get_logger().info("[CKPT] Save SUCCESS")
-        except Exception as e:
-            ros.get_logger().error(f"[CKPT] Save FAILED: {e}")
+        # Use the current step from the training loop
+        current_step = getattr(shutdown_and_save, '_current_step', resume_step)
+        save_full_checkpoint(current_step, label="shutdown")
         
         stats = env.occ_grid.get_stats()
         ros.get_logger().info(f"[FINAL] Cells discovered: {stats['total_discovered']}")
@@ -2245,13 +2422,30 @@ def main():
                 obs, r, term, trunc, info = env.step(act)
                 done = term or trunc
     
-    # Training mode
-    ros.get_logger().info("[MODE] TRAINING (no safety override)")
-    obs, _ = env.reset()
-    last_save = 0
+    # =====================================================================
+    # TRAINING LOOP — resumes from saved step
+    # =====================================================================
     
-    for t in range(1, args.total_steps + 1):
-        # Random actions at start
+    start_step = resume_step + 1
+    ros.get_logger().info(
+        f"\n{G}{'='*50}\n"
+        f"  TRAINING STARTED\n"
+        f"{'='*50}{RST}\n"
+        f"  Mode:          {W}TRAINING (no safety override){RST}\n"
+        f"  Resuming from: {W}step {start_step}{RST}\n"
+        f"  Replay buffer: {W}{replay.count} transitions{RST}\n"
+        f"  Target steps:  {W}{args.total_steps}{RST}\n"
+        f"{G}{'='*50}{RST}"
+    )
+    
+    obs, _ = env.reset()
+    last_save = resume_step
+    
+    for t in range(start_step, args.total_steps + 1):
+        # Track current step for shutdown handler
+        shutdown_and_save._current_step = t
+        
+        # Random actions at start (skipped if resuming past start_steps)
         if t < args.start_steps:
             v = np.random.uniform(0.2, 1.0)
             w = np.random.uniform(-0.5, 0.5)
@@ -2282,15 +2476,7 @@ def main():
         # Save
         if t - last_save >= args.save_every:
             last_save = t
-            stats = env.occ_grid.get_stats()
-            ros.get_logger().info(
-                f"[CKPT] step={t} cells={stats['total_discovered']}"
-            )
-            try:
-                agent.save(ckpt_path + ".tmp")
-                os.replace(ckpt_path + ".tmp", ckpt_path)
-            except Exception as e:
-                ros.get_logger().warn(f"[CKPT] Save failed: {e}")
+            save_full_checkpoint(t, label="periodic")
     
     shutdown_and_save()
 
