@@ -69,14 +69,35 @@ ZONE_EMERGENCY = 0.30   # Hard override - last resort
 # =============================================================================
 
 # =============================================================================
-# EPISODE TERMINATION REWARDS
+# CURRICULUM LEARNING — the key insight:
+# The agent must learn WHAT TO DO before learning WHAT NOT TO DO.
+#
+# Phase 1 (0-30k steps): "Learn to move and explore"
+#   - Collisions DON'T end the episode, just a bump penalty
+#   - Agent builds positive experience: exploration, goal-seeking
+#   - No collision trauma → no degenerate avoidance strategies
+#
+# Phase 2 (30k-80k steps): "Learn that collisions matter"
+#   - Collisions END the episode with moderate penalty
+#   - Agent already knows exploration is rewarding
+#   - Now refines behavior to avoid obstacles while exploring
+#
+# Phase 3 (80k+ steps): "Full difficulty"
+#   - Full collision penalty
+#   - Agent is skilled enough to navigate without fear
 # =============================================================================
 
-R_GOAL = 2000.0               # Reaching goal -> episode ends
-R_COLLISION = -100.0           # Collision -> episode ends (was -500, too harsh = spinning)
-R_TIMEOUT = -50.0              # Episode timeout -> episode ends
+CURRICULUM_PHASE1_END = 30_000    # Steps: collisions don't end episode
+CURRICULUM_PHASE2_END = 80_000    # Steps: moderate collision penalty
 
-GOAL_RADIUS = 0.45             # Distance to count as "reached"
+R_COLLISION_PHASE1 = -10.0        # Bump penalty (episode continues)
+R_COLLISION_PHASE2 = -50.0        # Moderate (episode ends)
+R_COLLISION_PHASE3 = -100.0       # Full penalty (episode ends)
+
+R_GOAL = 2000.0                   # Reaching goal -> episode ends
+R_TIMEOUT = -50.0                 # Episode timeout -> episode ends
+
+GOAL_RADIUS = 0.45                # Distance to count as "reached"
 
 # =============================================================================
 # GOAL-SEEKING REWARDS (when goal is visible)
@@ -84,7 +105,7 @@ GOAL_RADIUS = 0.45             # Distance to count as "reached"
 
 PROGRESS_SCALE = 400.0         # Reward for getting closer to goal
 ALIGN_SCALE = 10.0             # Reward for facing goal (only when moving forward)
-STEP_COST = -1.0               # Per-step cost to encourage urgency (was -0.3)
+STEP_COST = -1.5               # Per-step cost with goal (was -1.0 — creeping was too cheap)
 
 # =============================================================================
 # EXPLORATION REWARDS (when no goal visible)
@@ -92,22 +113,22 @@ STEP_COST = -1.0               # Per-step cost to encourage urgency (was -0.3)
 
 R_NEW_CELL = 3.0               # Per new cell discovered
 R_NOVELTY_SCALE = 0.8          # Bonus for unvisited areas
-R_FRONTIER_BONUS = 5.0         # Moving toward frontiers
-R_STEP_EXPLORE = -0.1          # Step cost during exploration (was -0.01)
+R_FRONTIER_BONUS = 8.0         # Steering toward frontiers (always-on with sign)
+R_REVISIT_SCALE = 0.5          # Per extra visit beyond 2, up to -5.0/step
+R_STEP_EXPLORE = -0.3          # Step cost during exploration (was -0.1 — no urgency)
 
 # =============================================================================
 # SHAPING REWARDS (always active)
-# Robot always moves forward, so:
-# - No stuck penalty needed (impossible to stop)
-# - Spin = excessive steering relative to speed
-# - Proximity reward teaches careful navigation near obstacles
 # =============================================================================
 
-R_FORWARD_BONUS = 2.0          # Bonus for faster forward motion (v > 0.5)
-R_SPIN_PENALTY = -5.0          # Penalty for excessive steering (|ω| > 2.0)
+R_FORWARD_SCALE = 4.0          # Forward bonus scales with speed: reward = scale * (v/V_MAX)
+                                # At v=0.3:  +0.96/step (barely anything)
+                                # At v=0.7:  +2.24/step (decent)
+                                # At v=1.25: +4.0/step (full bonus)
+R_STUCK_PENALTY = -3.0         # Penalty for not moving (v < 0.05)
 R_PROXIMITY_BONUS = 2.0        # Bonus for navigating near obstacles safely
 PROXIMITY_SWEET_SPOT = 0.6     # Ideal distance from nearest obstacle (meters)
-PROXIMITY_RANGE = 0.3          # Gaussian width — how tightly to reward sweet spot
+PROXIMITY_RANGE = 0.3          # Gaussian width
 
 # =============================================================================
 # GENERAL CONFIG
@@ -125,9 +146,16 @@ GRID_MAX_RANGE = 12.0
 
 # Movement Limits
 V_MAX = 1.25
-V_MIN_FORWARD = 0.15           # Robot ALWAYS moves forward at least this fast
-W_MAX = 3.0                    # Was 7.0 — too fast, enabled spin exploit
+W_MAX = 3.0
 V_MIN_REVERSE = -0.05
+MIN_TURN_RADIUS = 0.20          # Physical constraint — real robots have turn limits
+                                # Prevents 5cm death spirals but allows corner navigation
+                                # Agent CAN stop (v=0), but turn radius applies when moving
+
+# Velocity smoothing — prevents wild swings between steps
+# EMA: smoothed = α * new + (1-α) * previous
+# α=0.3 means ~70% of previous velocity carries over
+CMD_SMOOTHING_ALPHA = 0.3      # 0.0 = no change ever, 1.0 = no smoothing
 
 # RND Config
 RND_WEIGHT_INITIAL = 1.0
@@ -1278,6 +1306,10 @@ class StretchExploreEnv(gym.Env):
         self.prev_action = np.zeros(2, dtype=np.float32)
         self.prev_goal_dist = 0.0
         
+        # Smoothed velocity commands (EMA)
+        self._smooth_v = 0.0
+        self._smooth_w = 0.0
+        
         self._goals_reached_this_episode = 0  # Count of goals reached
         
         # Observation space (added safety sector distances)
@@ -1340,6 +1372,8 @@ class StretchExploreEnv(gym.Env):
         self.step_count = 0
         self.episode_return = 0.0
         self.prev_action[:] = 0.0
+        self._smooth_v = 0.0
+        self._smooth_w = 0.0
         
         # Occupancy grid — full reset since robot is back at start
         self.occ_grid.reset()
@@ -1390,19 +1424,36 @@ class StretchExploreEnv(gym.Env):
         return obs, info
     
     def step(self, action: np.ndarray):
-        # Process RL action — agent controls speed and steering
-        # CRITICAL: Robot ALWAYS moves forward. No spinning. No stopping.
-        # a[0] in [-1,1] maps to [V_MIN_FORWARD, V_MAX]
-        # a[1] in [-1,1] maps to [-W_MAX, W_MAX]
+        # Process RL action — agent has FULL CONTROL
+        # a[0] in [-1,1] maps to [V_MIN_REVERSE, V_MAX]
+        # a[1] in [-1,1] maps to [-w_limit, w_limit] (turn radius enforced)
         a = np.clip(action, -1.0, 1.0)
-        rl_v = V_MIN_FORWARD + (float(a[0]) + 1.0) * 0.5 * (V_MAX - V_MIN_FORWARD)
-        rl_w = float(a[1]) * W_MAX
+        
+        # Linear velocity: full range including stop
+        rl_v = float(a[0]) * V_MAX
+        if rl_v < V_MIN_REVERSE:
+            rl_v = V_MIN_REVERSE
+        
+        # Angular velocity: turn radius couples steering to speed
+        # When moving fast → can steer sharply
+        # When moving slow → gentle arcs only
+        # When stopped → can rotate in place slowly (for reorientation)
+        if abs(rl_v) > 0.05:
+            w_limit = min(abs(rl_v) / MIN_TURN_RADIUS, W_MAX)
+        else:
+            w_limit = 0.5  # Allow slow rotation when nearly stopped (for reorientation)
+        rl_w = float(a[1]) * w_limit
+        
+        # Smooth velocity commands (EMA) — prevents wild swings
+        # Real robots have inertia; this simulates it and produces cleaner motion
+        self._smooth_v = CMD_SMOOTHING_ALPHA * rl_v + (1.0 - CMD_SMOOTHING_ALPHA) * self._smooth_v
+        self._smooth_w = CMD_SMOOTHING_ALPHA * rl_w + (1.0 - CMD_SMOOTHING_ALPHA) * self._smooth_w
         
         # ============================================================
-        # EXECUTE RAW RL ACTION (no safety blending)
+        # EXECUTE SMOOTHED ACTION
         # ============================================================
         
-        self.ros.send_cmd(rl_v, rl_w)
+        self.ros.send_cmd(self._smooth_v, self._smooth_w)
         
         # Wait for control period
         t_end = time.time() + self.control_dt
@@ -1427,7 +1478,7 @@ class StretchExploreEnv(gym.Env):
         obs = self._build_observation()
         
         # ============================================================
-        # CHECK TERMINATION CONDITIONS
+        # CHECK TERMINATION CONDITIONS (curriculum-aware)
         # ============================================================
         
         terminated = False
@@ -1438,12 +1489,36 @@ class StretchExploreEnv(gym.Env):
         
         min_dist = nav_state.min_distance if nav_state else LIDAR_MAX_RANGE
         
-        # --- COLLISION: episode ends ---
+        # --- Determine curriculum phase ---
+        total = self.total_steps
+        if total < CURRICULUM_PHASE1_END:
+            phase = 1
+        elif total < CURRICULUM_PHASE2_END:
+            phase = 2
+        else:
+            phase = 3
+        
+        # --- COLLISION CHECK ---
         if min_dist < ZONE_EMERGENCY and self.step_count > 10:
-            terminated = True
             collision = True
-            reward += R_COLLISION
-            reward_terms["collision"] = R_COLLISION
+            
+            if phase == 1:
+                # Phase 1: Bump penalty, episode CONTINUES
+                # Agent learns "that hurt" but keeps exploring
+                # Builds positive experience without collision trauma
+                reward += R_COLLISION_PHASE1
+                reward_terms["collision"] = R_COLLISION_PHASE1
+                # NOT terminated — episode continues
+            elif phase == 2:
+                # Phase 2: Moderate penalty, episode ends
+                terminated = True
+                reward += R_COLLISION_PHASE2
+                reward_terms["collision"] = R_COLLISION_PHASE2
+            else:
+                # Phase 3: Full penalty, episode ends
+                terminated = True
+                reward += R_COLLISION_PHASE3
+                reward_terms["collision"] = R_COLLISION_PHASE3
         
         # --- GOAL REACHED: episode ends ---
         has_goal = self.ros.last_goal is not None
@@ -1497,21 +1572,37 @@ class StretchExploreEnv(gym.Env):
                 reward += STEP_COST
                 reward_terms["step"] = STEP_COST
             else:
-                # Exploration shaping
+                # Exploration shaping — maximize coverage efficiency
+                
+                # Discovery: reward new cells found this step
                 r_discovery = R_NEW_CELL * new_cells
                 reward_terms["discovery"] = r_discovery
                 reward += r_discovery
                 
+                # Novelty: diminishing reward for visiting known areas
                 novelty = self.occ_grid.get_novelty(st["x"], st["y"])
                 r_novelty = R_NOVELTY_SCALE * novelty
                 reward_terms["novelty"] = r_novelty
                 reward += r_novelty
                 
+                # Frontier steering: ALWAYS active, scales with cos(angle)
+                # cos(0) = +1 (heading straight at frontier)
+                # cos(π) = -1 (heading away from frontier → NEGATIVE reward)
+                # This gives the agent a continuous gradient to steer toward unknowns
                 frontier_angle = self.occ_grid.get_frontier_direction(st["x"], st["y"], st["yaw"])
-                if abs(frontier_angle) < math.pi / 3 and st["v_lin"] > 0.05:
+                if frontier_angle != 0.0:  # 0.0 means no frontier found
                     r_frontier = R_FRONTIER_BONUS * math.cos(frontier_angle)
                     reward_terms["frontier"] = r_frontier
                     reward += r_frontier
+                
+                # Revisit penalty: escalates with visit count
+                # First 2 visits are free, then -0.5 per extra visit, capped at -5
+                robot_key = self.occ_grid.world_to_grid_key(st["x"], st["y"])
+                visit_count = self.occ_grid.visit_counts.get(robot_key, 0)
+                if visit_count > 2:
+                    r_revisit = -R_REVISIT_SCALE * min(visit_count - 2, 10)
+                    reward_terms["revisit"] = r_revisit
+                    reward += r_revisit
                 
                 # RND intrinsic reward
                 r_rnd = self.rnd.compute_intrinsic_reward(obs) * self.rnd_weight
@@ -1521,17 +1612,19 @@ class StretchExploreEnv(gym.Env):
                 reward += R_STEP_EXPLORE
                 reward_terms["step"] = R_STEP_EXPLORE
             
-            # Movement shaping (robot always moves forward)
+            # Movement shaping
             
-            # Speed bonus — faster forward motion is rewarded
-            if st["v_lin"] > 0.5:
-                reward += R_FORWARD_BONUS
-                reward_terms["forward"] = R_FORWARD_BONUS
+            # Speed-scaled forward bonus — faster = more reward
+            # Creeping at 0.3 m/s gets almost nothing, full speed gets +4/step
+            if st["v_lin"] > 0.05:
+                r_forward = R_FORWARD_SCALE * (st["v_lin"] / V_MAX)
+                reward += r_forward
+                reward_terms["forward"] = r_forward
             
-            # Excessive steering penalty — high ω wastes forward progress
-            if abs(st["v_ang"]) > 2.0:
-                reward += R_SPIN_PENALTY
-                reward_terms["spin"] = R_SPIN_PENALTY
+            # Stuck penalty — standing still wastes time
+            if abs(st["v_lin"]) < 0.05 and abs(st["v_ang"]) < 0.3:
+                reward += R_STUCK_PENALTY
+                reward_terms["stuck"] = R_STUCK_PENALTY
             
             # Proximity reward — navigating NEAR obstacles without hitting them
             # Gaussian reward centered on sweet spot distance
@@ -1566,8 +1659,11 @@ class StretchExploreEnv(gym.Env):
             "reward_terms": reward_terms,
             "nav_zone": nav_state.zone if nav_state else "UNKNOWN",
             "min_distance": min_dist,
-            "executed_v": rl_v,
-            "executed_w": rl_w,
+            "executed_v": self._smooth_v,
+            "executed_w": self._smooth_w,
+            "raw_v": rl_v,
+            "raw_w": rl_w,
+            "curriculum_phase": phase,
         }
         
         # Logging
@@ -1581,14 +1677,21 @@ class StretchExploreEnv(gym.Env):
                 status = "\033[93mTIMEOUT\033[0m"
             mode = "GOAL" if has_goal else "EXPLORE"
             ret_color = "\033[92m" if self.episode_return >= 0 else "\033[91m"
+            phase_str = f"\033[94mP{phase}\033[0m"
             self.ros.get_logger().info(
-                f"[EP {self.episode_index:04d}] {mode} {status} | "
+                f"[EP {self.episode_index:04d}] {phase_str} {mode} {status} | "
                 f"Return {ret_color}{self.episode_return:+.1f}\033[0m | Steps {self.step_count} | "
                 f"Cells {stats['total_discovered']} | "
                 f"Goals {self._goals_reached_this_episode} | "
                 f"MinDist {min_dist:.2f}m"
             )
             self.episode_index += 1
+        elif collision:
+            # Phase 1: collision didn't end episode — log the bump
+            self.ros.get_logger().info(
+                f"\033[93m[BUMP]\033[0m step={self.step_count} min_d={min_dist:.2f}m "
+                f"penalty={R_COLLISION_PHASE1} (Phase 1 — episode continues)"
+            )
         
         # Debug logging
         if self.step_count % DEBUG_EVERY_N == 0:
@@ -1597,7 +1700,7 @@ class StretchExploreEnv(gym.Env):
             self.ros.get_logger().info(
                 f"[{mode}] step={self.step_count} min_d={min_dist:.2f}m "
                 f"{goal_info}"
-                f"cmd=[{rl_v:.2f},{rl_w:.2f}] "
+                f"cmd=[{self._smooth_v:.2f},{self._smooth_w:.2f}] "
                 f"r={reward:.2f}"
             )
         
@@ -1913,6 +2016,7 @@ class StretchExploreEnv(gym.Env):
             },
             "explore_stats": stats,
             "rnd_weight": self.rnd_weight,
+            "curriculum_phase": info.get("curriculum_phase", 0),
             "episode": self.episode_index,
             "step": self.step_count,
         }
@@ -2456,18 +2560,41 @@ def main():
     
     obs, _ = env.reset()
     last_save = resume_step
+    last_phase = 0  # Track curriculum phase transitions
     
     for t in range(start_step, args.total_steps + 1):
         # Track current step for shutdown handler
         shutdown_and_save._current_step = t
         
+        # Curriculum phase transition logging
+        if env.total_steps < CURRICULUM_PHASE1_END:
+            current_phase = 1
+        elif env.total_steps < CURRICULUM_PHASE2_END:
+            current_phase = 2
+        else:
+            current_phase = 3
+        
+        if current_phase != last_phase:
+            phase_names = {
+                1: f"{G}Phase 1: LEARN TO EXPLORE{RST} (collisions = bump, episode continues)",
+                2: f"{Y}Phase 2: LEARN TO AVOID{RST} (collisions end episode, moderate penalty)",
+                3: f"{W}Phase 3: FULL DIFFICULTY{RST} (collisions end episode, full penalty)",
+            }
+            ros.get_logger().info(
+                f"\n{W}{'='*50}\n"
+                f"  CURRICULUM TRANSITION → {phase_names[current_phase]}\n"
+                f"  Total steps: {env.total_steps}\n"
+                f"{'='*50}{RST}"
+            )
+            last_phase = current_phase
+        
         # Random actions at start (skipped if resuming past start_steps)
-        # a[0] in [-1,1] maps to [V_MIN_FORWARD, V_MAX] — always moving forward
-        # a[1] in [-1,1] maps to [-W_MAX, W_MAX] — steering
+        # a[0] in [-1,1]: negative = reverse/stop, positive = forward
+        # a[1] in [-1,1]: steering (turn radius limited by step())
         if t < args.start_steps:
             act = np.array([
-                np.random.uniform(-0.5, 1.0),   # Bias toward faster speeds
-                np.random.uniform(-0.7, 0.7),    # Moderate steering
+                np.random.uniform(0.0, 1.0),     # Bias forward during exploration
+                np.random.uniform(-0.8, 0.8),     # Moderate steering
             ], dtype=np.float32)
         else:
             act = agent.act(obs, noise_std=args.expl_noise)
