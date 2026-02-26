@@ -73,7 +73,7 @@ ZONE_EMERGENCY = 0.30   # Hard override - last resort
 # =============================================================================
 
 R_GOAL = 2000.0               # Reaching goal -> episode ends
-R_COLLISION = -500.0           # Collision -> episode ends
+R_COLLISION = -100.0           # Collision -> episode ends (was -500, too harsh = spinning)
 R_TIMEOUT = -50.0              # Episode timeout -> episode ends
 
 GOAL_RADIUS = 0.45             # Distance to count as "reached"
@@ -84,7 +84,7 @@ GOAL_RADIUS = 0.45             # Distance to count as "reached"
 
 PROGRESS_SCALE = 400.0         # Reward for getting closer to goal
 ALIGN_SCALE = 10.0             # Reward for facing goal (only when moving forward)
-STEP_COST = -0.3               # Per-step cost to encourage efficiency
+STEP_COST = -1.0               # Per-step cost to encourage urgency (was -0.3)
 
 # =============================================================================
 # EXPLORATION REWARDS (when no goal visible)
@@ -93,15 +93,21 @@ STEP_COST = -0.3               # Per-step cost to encourage efficiency
 R_NEW_CELL = 3.0               # Per new cell discovered
 R_NOVELTY_SCALE = 0.8          # Bonus for unvisited areas
 R_FRONTIER_BONUS = 5.0         # Moving toward frontiers
-R_STEP_EXPLORE = -0.01         # Small step cost during exploration
+R_STEP_EXPLORE = -0.1          # Step cost during exploration (was -0.01)
 
 # =============================================================================
-# SHAPING REWARDS (always active — help RL learn obstacle avoidance)
+# SHAPING REWARDS (always active)
+# Robot always moves forward, so:
+# - No stuck penalty needed (impossible to stop)
+# - Spin = excessive steering relative to speed
+# - Proximity reward teaches careful navigation near obstacles
 # =============================================================================
 
-R_FORWARD_BONUS = 1.0          # Reward for moving forward
-R_STUCK_PENALTY = -1.0         # Penalty for not moving
-R_SPIN_PENALTY = -3.0          # Penalty for spinning in place
+R_FORWARD_BONUS = 2.0          # Bonus for faster forward motion (v > 0.5)
+R_SPIN_PENALTY = -5.0          # Penalty for excessive steering (|ω| > 2.0)
+R_PROXIMITY_BONUS = 2.0        # Bonus for navigating near obstacles safely
+PROXIMITY_SWEET_SPOT = 0.6     # Ideal distance from nearest obstacle (meters)
+PROXIMITY_RANGE = 0.3          # Gaussian width — how tightly to reward sweet spot
 
 # =============================================================================
 # GENERAL CONFIG
@@ -118,9 +124,10 @@ GRID_RESOLUTION = 0.5
 GRID_MAX_RANGE = 12.0
 
 # Movement Limits
-V_MAX = 2.00
-W_MAX = 7.0
-V_MIN_REVERSE = -0.10
+V_MAX = 1.25
+V_MIN_FORWARD = 0.15           # Robot ALWAYS moves forward at least this fast
+W_MAX = 3.0                    # Was 7.0 — too fast, enabled spin exploit
+V_MIN_REVERSE = -0.05
 
 # RND Config
 RND_WEIGHT_INITIAL = 1.0
@@ -1383,13 +1390,13 @@ class StretchExploreEnv(gym.Env):
         return obs, info
     
     def step(self, action: np.ndarray):
-        # Process RL action — NO SAFETY OVERRIDE, RL learns from consequences
+        # Process RL action — agent controls speed and steering
+        # CRITICAL: Robot ALWAYS moves forward. No spinning. No stopping.
+        # a[0] in [-1,1] maps to [V_MIN_FORWARD, V_MAX]
+        # a[1] in [-1,1] maps to [-W_MAX, W_MAX]
         a = np.clip(action, -1.0, 1.0)
-        rl_v = float(a[0]) * V_MAX
+        rl_v = V_MIN_FORWARD + (float(a[0]) + 1.0) * 0.5 * (V_MAX - V_MIN_FORWARD)
         rl_w = float(a[1]) * W_MAX
-        
-        if rl_v < V_MIN_REVERSE:
-            rl_v = V_MIN_REVERSE
         
         # ============================================================
         # EXECUTE RAW RL ACTION (no safety blending)
@@ -1514,17 +1521,26 @@ class StretchExploreEnv(gym.Env):
                 reward += R_STEP_EXPLORE
                 reward_terms["step"] = R_STEP_EXPLORE
             
-            # Movement shaping (always active — helps learn to move)
-            if st["v_lin"] > 0.2:
+            # Movement shaping (robot always moves forward)
+            
+            # Speed bonus — faster forward motion is rewarded
+            if st["v_lin"] > 0.5:
                 reward += R_FORWARD_BONUS
                 reward_terms["forward"] = R_FORWARD_BONUS
-            elif st["v_lin"] < 0.05 and abs(st["v_ang"]) < 0.1:
-                reward += R_STUCK_PENALTY
-                reward_terms["stuck"] = R_STUCK_PENALTY
             
-            if st["v_lin"] < 0.1 and abs(st["v_ang"]) > 1.5:
+            # Excessive steering penalty — high ω wastes forward progress
+            if abs(st["v_ang"]) > 2.0:
                 reward += R_SPIN_PENALTY
                 reward_terms["spin"] = R_SPIN_PENALTY
+            
+            # Proximity reward — navigating NEAR obstacles without hitting them
+            # Gaussian reward centered on sweet spot distance
+            # Teaches "careful navigation" not "avoid everything"
+            if min_dist < 2.0:  # Only reward when obstacles are nearby
+                dist_from_sweet = (min_dist - PROXIMITY_SWEET_SPOT) / PROXIMITY_RANGE
+                prox_r = R_PROXIMITY_BONUS * math.exp(-0.5 * dist_from_sweet ** 2)
+                reward += prox_r
+                reward_terms["proximity"] = prox_r
         
         # ============================================================
         # BOOKKEEPING
@@ -2446,10 +2462,13 @@ def main():
         shutdown_and_save._current_step = t
         
         # Random actions at start (skipped if resuming past start_steps)
+        # a[0] in [-1,1] maps to [V_MIN_FORWARD, V_MAX] — always moving forward
+        # a[1] in [-1,1] maps to [-W_MAX, W_MAX] — steering
         if t < args.start_steps:
-            v = np.random.uniform(0.2, 1.0)
-            w = np.random.uniform(-0.5, 0.5)
-            act = np.array([v, w], dtype=np.float32)
+            act = np.array([
+                np.random.uniform(-0.5, 1.0),   # Bias toward faster speeds
+                np.random.uniform(-0.7, 0.7),    # Moderate steering
+            ], dtype=np.float32)
         else:
             act = agent.act(obs, noise_std=args.expl_noise)
         
