@@ -118,7 +118,7 @@ GRID_RESOLUTION = 0.5
 GRID_MAX_RANGE = 12.0
 
 # Movement Limits
-V_MAX = 1.25
+V_MAX = 2.00
 W_MAX = 7.0
 V_MIN_REVERSE = -0.05
 
