@@ -760,8 +760,8 @@ class EgoOccupancyGrid:
         self.visit_counts[robot_key] = self.visit_counts.get(robot_key, 0) + 1
         
         # Probabilistic update parameters
-        FREE_DECREMENT = 0.15   # How much a pass-through ray lowers obstacle probability
-        OBS_INCREMENT = 0.25    # How much a hit raises obstacle probability
+        FREE_DECREMENT = 0.2    # How much a pass-through ray lowers obstacle probability (faster clearing)
+        OBS_INCREMENT = 0.2     # How much a hit raises obstacle probability (needs more hits to confirm)
         OBS_THRESHOLD = 0.7     # Above this = obstacle for display/nav
         FREE_THRESHOLD = 0.4    # Below this = confirmed free
         
@@ -776,8 +776,10 @@ class EgoOccupancyGrid:
             ray_angle_world = robot_yaw + angle_min + i * angle_inc + LIDAR_FORWARD_OFFSET_RAD
             
             # Mark cells along the ray as FREE (reduce obstacle probability)
+            # Stop half a cell before the endpoint to avoid clearing the actual obstacle
             step = self.resolution * 0.4
-            for d in np.arange(step, r - self.resolution * 0.3, step):
+            clear_limit = r - self.resolution * 0.5
+            for d in np.arange(step, max(clear_limit, step), step):
                 wx = robot_x + d * math.cos(ray_angle_world)
                 wy = robot_y + d * math.sin(ray_angle_world)
                 
