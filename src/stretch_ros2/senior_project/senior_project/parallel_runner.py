@@ -54,6 +54,7 @@ class ParallelRunner:
         sim_base_domain: int = 10,
         sam3_mode: str = "dedicated",
         sam3_base_port: int = 8100,
+        sync_every: int = 300,
     ):
         self.num_sims = num_sims
         self.target = target
@@ -70,8 +71,10 @@ class ParallelRunner:
         self.sim_base_domain = sim_base_domain
         self.sam3_mode = sam3_mode
         self.sam3_base_port = sam3_base_port
+        self.sync_every = sync_every
 
         self.processes: List[subprocess.Popen] = []
+        self.sync_process: Optional[subprocess.Popen] = None
         self.start_time: Optional[datetime] = None
         self._shutdown_requested = False
 
@@ -211,6 +214,10 @@ class ParallelRunner:
             print(f"  SAM3 Server Mode: SHARED (port {self.sam3_base_port})")
         print(f"  Sim Domains: {self.sim_base_domain} - {self.sim_base_domain + self.num_sims - 1}")
         print(f"  NOTE: All sims use SHARED SAM3 server (not starting their own)")
+        if self.sync_every > 0 and self.num_sims > 1:
+            print(f"  Federated Sync: every {self.sync_every}s")
+        else:
+            print(f"  Federated Sync: disabled")
         print(f"{'='*60}\n")
 
         for sim_id in range(self.num_sims):
@@ -227,11 +234,40 @@ class ParallelRunner:
 
         print(f"\n[Runner] All {len(self.processes)} simulations started!")
         print(f"[Runner] Logs: {self.base_ckpt_dir}/sim_*/logs/")
+
+        # Start federated weight sync if multiple sims
+        if self.num_sims > 1 and self.sync_every > 0:
+            sync_script = os.path.join(os.path.dirname(__file__), "federated_sync.py")
+            if os.path.exists(sync_script):
+                sync_cmd = [
+                    sys.executable, sync_script,
+                    "--num_sims", str(self.num_sims),
+                    "--ckpt_dir", self.base_ckpt_dir,
+                    "--sync_every", str(self.sync_every),
+                    "--weighted",
+                ]
+                self.sync_process = subprocess.Popen(sync_cmd, preexec_fn=os.setsid)
+                print(f"[Runner] Federated sync started (every {self.sync_every}s, pid={self.sync_process.pid})")
+            else:
+                print(f"[Runner] WARNING: federated_sync.py not found at {sync_script}, skipping sync")
+
         print("[Runner] Press Ctrl+C to stop all simulations\n")
 
     def stop_all(self):
         """Stop all simulations gracefully."""
         print("[Runner] Stopping all simulations.")
+
+        # Stop federated sync first
+        if self.sync_process and self.sync_process.poll() is None:
+            try:
+                os.killpg(os.getpgid(self.sync_process.pid), signal.SIGTERM)
+                self.sync_process.wait(timeout=5)
+                print("[Runner] Federated sync stopped.")
+            except Exception:
+                try:
+                    os.killpg(os.getpgid(self.sync_process.pid), signal.SIGKILL)
+                except Exception:
+                    pass
 
         for i, proc in enumerate(self.processes):
             try:
@@ -380,6 +416,10 @@ def main():
         help="Automatically merge checkpoints when training ends"
     )
     parser.add_argument(
+        "--sync_every", type=int, default=300,
+        help="Seconds between federated weight syncs (0 to disable, default: 300)"
+    )
+    parser.add_argument(
         "--stagger_delay", type=float, default=10.0,
         help="Delay between launching simulations in seconds (default: 10.0)"
     )
@@ -448,6 +488,7 @@ def main():
         sim_base_domain=args.sim_base_domain,
         sam3_mode=args.sam3_mode,
         sam3_base_port=args.sam3_base_port,
+        sync_every=args.sync_every,
     )
 
     runner.start_all()
