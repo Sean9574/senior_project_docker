@@ -759,6 +759,12 @@ class EgoOccupancyGrid:
         robot_key = self.world_to_grid_key(robot_x, robot_y)
         self.visit_counts[robot_key] = self.visit_counts.get(robot_key, 0) + 1
         
+        # Probabilistic update parameters
+        FREE_DECREMENT = 0.15   # How much a pass-through ray lowers obstacle probability
+        OBS_INCREMENT = 0.25    # How much a hit raises obstacle probability
+        OBS_THRESHOLD = 0.7     # Above this = obstacle for display/nav
+        FREE_THRESHOLD = 0.4    # Below this = confirmed free
+        
         for i in range(0, n_rays, 3):
             original_r = ranges[i]
             
@@ -769,17 +775,21 @@ class EgoOccupancyGrid:
             r = min(original_r, range_max)
             ray_angle_world = robot_yaw + angle_min + i * angle_inc + LIDAR_FORWARD_OFFSET_RAD
             
-            # Mark cells along the ray as FREE
+            # Mark cells along the ray as FREE (reduce obstacle probability)
             step = self.resolution * 0.4
-            for d in np.arange(step, r, step):
+            for d in np.arange(step, r - self.resolution * 0.3, step):
                 wx = robot_x + d * math.cos(ray_angle_world)
                 wy = robot_y + d * math.sin(ray_angle_world)
                 
                 world_key = self.world_to_grid_key(wx, wy)
                 if world_key not in self.world_grid:
-                    self.world_grid[world_key] = 0.5
+                    # New cell — start at 0.5 (unknown prior), mark as free
+                    self.world_grid[world_key] = 0.3
                     self.total_cells_discovered += 1
                     self.cells_discovered_this_step += 1
+                else:
+                    # Existing cell — ray passes through, so reduce obstacle probability
+                    self.world_grid[world_key] = max(0.0, self.world_grid[world_key] - FREE_DECREMENT)
                 
                 ego_x, ego_y = self._world_to_ego(wx, wy, robot_x, robot_y, robot_yaw)
                 gx = int(ego_x / self.resolution) + self.half_size
@@ -801,7 +811,10 @@ class EgoOccupancyGrid:
                 if world_key not in self.world_grid:
                     self.total_cells_discovered += 1
                     self.cells_discovered_this_step += 1
-                self.world_grid[world_key] = 1.0
+                    self.world_grid[world_key] = OBS_INCREMENT
+                else:
+                    # Increase obstacle probability (capped at 1.0)
+                    self.world_grid[world_key] = min(1.0, self.world_grid[world_key] + OBS_INCREMENT)
                 
                 ego_x, ego_y = self._world_to_ego(wx, wy, robot_x, robot_y, robot_yaw)
                 gx = int(ego_x / self.resolution) + self.half_size
@@ -851,7 +864,7 @@ class EgoOccupancyGrid:
             for dy in range(-search_radius, search_radius + 1):
                 key = (robot_key[0] + dx, robot_key[1] + dy)
                 
-                if self.world_grid.get(key, 0) != 0.5:
+                if self.world_grid.get(key, 0) > 0.4:  # Not a free cell (unknown or obstacle)
                     continue
                 
                 has_unknown_neighbor = False
@@ -891,7 +904,7 @@ class EgoOccupancyGrid:
         # Count frontier cells (free cells with unknown neighbors)
         frontier_count = 0
         for key, value in self.world_grid.items():
-            if value != 0.5:  # Not a free cell
+            if value > 0.4:  # Not a free cell (uncertain or obstacle)
                 continue
             for ndx, ndy in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
                 neighbor_key = (key[0] + ndx, key[1] + ndy)
@@ -941,11 +954,13 @@ class EgoOccupancyGrid:
             for gx in range(min_x, max_x + 1):
                 key = (gx, gy)
                 if key not in self.world_grid:
-                    data.append(-1)
-                elif self.world_grid[key] >= 0.8:
-                    data.append(100)
+                    data.append(-1)  # Unknown
+                elif self.world_grid[key] >= 0.7:
+                    data.append(100)  # Obstacle (high probability)
+                elif self.world_grid[key] <= 0.4:
+                    data.append(0)    # Free (low probability)
                 else:
-                    data.append(0)
+                    data.append(50)   # Uncertain
         
         msg = OccupancyGrid()
         msg.header.frame_id = frame_id
