@@ -67,7 +67,7 @@ DOCKER_RUN_ARGS=(
   -e CUDA_CACHE_DISABLE=0
   -e CUDA_CACHE_MAXSIZE=2147483648
   -e CUDNN_BENCHMARK=1
-  -v "$HOME/rl_checkpoints:/home/stretch/ament_ws/src/stretch_ros2/senior_project/parallel_training"
+  -v "$HOME/rl_checkpoints:/home/stretch/rl_checkpoints"
 )
 
 if [ -n "$DISPLAY_VALUE" ]; then
