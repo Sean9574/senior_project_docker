@@ -408,7 +408,7 @@ def main():
     )
     parser.add_argument(
         "--ckpt_dir", type=str,
-        default=os.path.expanduser("~/ament_ws/src/stretch_ros2/senior_project/parallel_training"),
+        default=os.path.expanduser("~/rl_checkpoints"),
         help="Base checkpoint directory"
     )
     parser.add_argument(
