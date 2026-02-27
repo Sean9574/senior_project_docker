@@ -90,7 +90,7 @@ ZONE_EMERGENCY = 0.30   # Hard override - last resort
 CURRICULUM_PHASE1_END = 30_000    # Steps: collisions don't end episode
 CURRICULUM_PHASE2_END = 80_000    # Steps: moderate collision penalty
 
-R_COLLISION_PHASE1 = -10.0        # Bump penalty (episode continues)
+R_COLLISION_PHASE1 = -3.0         # Bump penalty (episode continues) — must be < forward bonus so agent still wants to move
 R_COLLISION_PHASE2 = -50.0        # Moderate (episode ends)
 R_COLLISION_PHASE3 = -100.0       # Full penalty (episode ends)
 
@@ -121,12 +121,13 @@ R_STEP_EXPLORE = -0.3          # Step cost during exploration (was -0.1 — no u
 # SHAPING REWARDS (always active)
 # =============================================================================
 
-R_FORWARD_SCALE = 4.0          # Forward bonus scales with speed: reward = scale * (v/V_MAX)
-                                # At v=0.3:  +0.96/step (barely anything)
-                                # At v=0.7:  +2.24/step (decent)
-                                # At v=1.25: +4.0/step (full bonus)
-R_STUCK_PENALTY = -3.0         # Penalty for not moving (v < 0.05)
-R_PROXIMITY_BONUS = 2.0        # Bonus for navigating near obstacles safely
+R_FORWARD_SCALE = 6.0          # Forward bonus scales with speed — MUST dominate collision penalty
+                                # At v=0.3:  +1.44/step
+                                # At v=0.7:  +3.36/step
+                                # At v=1.25: +6.0/step (full bonus)
+R_STUCK_PENALTY = -5.0         # Penalty for not covering ground (displacement-based, not velocity)
+R_SPIN_PENALTY = -4.0          # Penalty for spinning in place (high ω, low v)
+R_PROXIMITY_BONUS = 0.0        # DISABLED — was rewarding wall-hugging
 PROXIMITY_SWEET_SPOT = 0.6     # Ideal distance from nearest obstacle (meters)
 PROXIMITY_RANGE = 0.3          # Gaussian width
 
@@ -154,8 +155,8 @@ MIN_TURN_RADIUS = 0.20          # Physical constraint — real robots have turn 
 
 # Velocity smoothing — prevents wild swings between steps
 # EMA: smoothed = α * new + (1-α) * previous
-# α=0.3 means ~70% of previous velocity carries over
-CMD_SMOOTHING_ALPHA = 0.3      # 0.0 = no change ever, 1.0 = no smoothing
+# α=0.6 — still some smoothing but agent can respond within 2-3 steps
+CMD_SMOOTHING_ALPHA = 0.6      # 0.0 = no change ever, 1.0 = no smoothing
 
 # RND Config
 RND_WEIGHT_INITIAL = 1.0
@@ -1310,6 +1311,11 @@ class StretchExploreEnv(gym.Env):
         self._smooth_v = 0.0
         self._smooth_w = 0.0
         
+        # Displacement tracking (anti-gaming)
+        self._last_pos = (0.0, 0.0)
+        self._displacement_window = 0.0
+        self._displacement_steps = 0
+        
         self._goals_reached_this_episode = 0  # Count of goals reached
         
         # Observation space (added safety sector distances)
@@ -1374,6 +1380,12 @@ class StretchExploreEnv(gym.Env):
         self.prev_action[:] = 0.0
         self._smooth_v = 0.0
         self._smooth_w = 0.0
+        
+        # Displacement tracking — for anti-gaming stuck detection
+        st = self._get_robot_state()
+        self._last_pos = (st["x"], st["y"])
+        self._displacement_window = 0.0  # Rolling displacement over last N steps
+        self._displacement_steps = 0
         
         # Occupancy grid — full reset since robot is back at start
         self.occ_grid.reset()
@@ -1441,7 +1453,7 @@ class StretchExploreEnv(gym.Env):
         if abs(rl_v) > 0.05:
             w_limit = min(abs(rl_v) / MIN_TURN_RADIUS, W_MAX)
         else:
-            w_limit = 0.5  # Allow slow rotation when nearly stopped (for reorientation)
+            w_limit = 0.3  # Slow rotation when stopped — just enough to reorient, not to game
         rl_w = float(a[1]) * w_limit
         
         # Smooth velocity commands (EMA) — prevents wild swings
@@ -1612,24 +1624,45 @@ class StretchExploreEnv(gym.Env):
                 reward += R_STEP_EXPLORE
                 reward_terms["step"] = R_STEP_EXPLORE
             
-            # Movement shaping
+            # Movement shaping — DISPLACEMENT-BASED (anti-gaming)
+            
+            # Track actual ground covered (spinning in place = 0 displacement)
+            dx = st["x"] - self._last_pos[0]
+            dy = st["y"] - self._last_pos[1]
+            step_displacement = math.hypot(dx, dy)
+            self._last_pos = (st["x"], st["y"])
+            
+            # Rolling displacement over a window (catches slow creeping too)
+            DISPLACEMENT_WINDOW = 20  # steps
+            decay = (DISPLACEMENT_WINDOW - 1) / DISPLACEMENT_WINDOW
+            self._displacement_window = self._displacement_window * decay + step_displacement
+            self._displacement_steps = min(self._displacement_steps + 1, DISPLACEMENT_WINDOW)
+            avg_displacement = self._displacement_window / max(self._displacement_steps, 1)
             
             # Speed-scaled forward bonus — faster = more reward
-            # Creeping at 0.3 m/s gets almost nothing, full speed gets +4/step
+            # Only counts actual forward movement, not spinning
             if st["v_lin"] > 0.05:
                 r_forward = R_FORWARD_SCALE * (st["v_lin"] / V_MAX)
                 reward += r_forward
                 reward_terms["forward"] = r_forward
             
-            # Stuck penalty — standing still wastes time
-            if abs(st["v_lin"]) < 0.05 and abs(st["v_ang"]) < 0.3:
+            # SPIN PENALTY — high angular velocity with low linear velocity
+            # This is the #1 degenerate strategy: spin in place to avoid everything
+            if abs(st["v_ang"]) > 0.2 and abs(st["v_lin"]) < 0.15:
+                spin_ratio = abs(st["v_ang"]) / max(abs(st["v_lin"]) + 0.01, 0.01)
+                r_spin = R_SPIN_PENALTY * min(spin_ratio / 5.0, 1.0)
+                reward += r_spin
+                reward_terms["spin"] = r_spin
+            
+            # STUCK PENALTY — based on displacement, NOT velocity
+            # Spinning in place, creeping, or oscillating all get caught
+            if self._displacement_steps >= 10 and avg_displacement < 0.02:
                 reward += R_STUCK_PENALTY
                 reward_terms["stuck"] = R_STUCK_PENALTY
             
             # Proximity reward — navigating NEAR obstacles without hitting them
-            # Gaussian reward centered on sweet spot distance
-            # Teaches "careful navigation" not "avoid everything"
-            if min_dist < 2.0:  # Only reward when obstacles are nearby
+            # Only active when actually MOVING (no free reward for sitting near walls)
+            if min_dist < 2.0 and st["v_lin"] > 0.2 and R_PROXIMITY_BONUS > 0:
                 dist_from_sweet = (min_dist - PROXIMITY_SWEET_SPOT) / PROXIMITY_RANGE
                 prox_r = R_PROXIMITY_BONUS * math.exp(-0.5 * dist_from_sweet ** 2)
                 reward += prox_r
