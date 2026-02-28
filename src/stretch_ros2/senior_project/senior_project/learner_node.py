@@ -146,7 +146,7 @@ GRID_RESOLUTION = 0.5
 GRID_MAX_RANGE = 12.0
 
 # Movement Limits
-V_MAX = 2.50
+V_MAX = 2.00
 W_MAX = 3.0
 V_MIN_REVERSE = -0.05
 MIN_TURN_RADIUS = 0.20          # Physical constraint — real robots have turn limits
