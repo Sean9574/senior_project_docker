@@ -146,7 +146,7 @@ GRID_RESOLUTION = 0.5
 GRID_MAX_RANGE = 12.0
 
 # Movement Limits
-V_MAX = 1.25
+V_MAX = 2.50
 W_MAX = 3.0
 V_MIN_REVERSE = -0.05
 MIN_TURN_RADIUS = 0.20          # Physical constraint — real robots have turn limits
@@ -760,8 +760,10 @@ class EgoOccupancyGrid:
         self.visit_counts[robot_key] = self.visit_counts.get(robot_key, 0) + 1
         
         # Probabilistic update parameters
-        FREE_DECREMENT = 0.2    # How much a pass-through ray lowers obstacle probability (faster clearing)
-        OBS_INCREMENT = 0.2     # How much a hit raises obstacle probability (needs more hits to confirm)
+        # OBS must be stronger than FREE because many more rays pass through
+        # a cell than hit it — walls get cleared otherwise
+        FREE_DECREMENT = 0.1    # Gentle clearing — needs several pass-throughs to override
+        OBS_INCREMENT = 0.35    # Strong confirmation — 2 hits to reach threshold
         OBS_THRESHOLD = 0.7     # Above this = obstacle for display/nav
         FREE_THRESHOLD = 0.4    # Below this = confirmed free
         
@@ -776,9 +778,10 @@ class EgoOccupancyGrid:
             ray_angle_world = robot_yaw + angle_min + i * angle_inc + LIDAR_FORWARD_OFFSET_RAD
             
             # Mark cells along the ray as FREE (reduce obstacle probability)
-            # Stop half a cell before the endpoint to avoid clearing the actual obstacle
+            # Stop one full cell before the endpoint so wall cells aren't cleared
+            # by rays that hit them from different angles
             step = self.resolution * 0.4
-            clear_limit = r - self.resolution * 0.5
+            clear_limit = r - self.resolution * 1.0
             for d in np.arange(step, max(clear_limit, step), step):
                 wx = robot_x + d * math.cos(ray_angle_world)
                 wy = robot_y + d * math.sin(ray_angle_world)
@@ -1454,23 +1457,20 @@ class StretchExploreEnv(gym.Env):
     
     def step(self, action: np.ndarray):
         # Process RL action — agent has FULL CONTROL
-        # a[0] in [-1,1] maps to [V_MIN_REVERSE, V_MAX]
+        # a[0] in [-1,1] maps to [V_MIN_FORWARD, V_MAX] — ALWAYS moving forward
         # a[1] in [-1,1] maps to [-w_limit, w_limit] (turn radius enforced)
         a = np.clip(action, -1.0, 1.0)
         
-        # Linear velocity: full range including stop
-        rl_v = float(a[0]) * V_MAX
-        if rl_v < V_MIN_REVERSE:
-            rl_v = V_MIN_REVERSE
+        # Linear velocity: ALWAYS FORWARD — no stopping, no gaming
+        # a[0] = -1 → V_MIN_FORWARD (slow but moving)
+        # a[0] =  0 → midpoint
+        # a[0] = +1 → V_MAX (full speed)
+        V_MIN_FORWARD = 0.25  # Robot MUST always move at least this fast
+        rl_v = V_MIN_FORWARD + (float(a[0]) + 1.0) * 0.5 * (V_MAX - V_MIN_FORWARD)
         
         # Angular velocity: turn radius couples steering to speed
-        # When moving fast → can steer sharply
-        # When moving slow → gentle arcs only
-        # When stopped → can rotate in place slowly (for reorientation)
-        if abs(rl_v) > 0.05:
-            w_limit = min(abs(rl_v) / MIN_TURN_RADIUS, W_MAX)
-        else:
-            w_limit = 0.3  # Slow rotation when stopped — just enough to reorient, not to game
+        # Always moving forward, so always have good steering authority
+        w_limit = min(rl_v / MIN_TURN_RADIUS, W_MAX)
         rl_w = float(a[1]) * w_limit
         
         # Smooth velocity commands (EMA) — prevents wild swings
@@ -1641,49 +1641,21 @@ class StretchExploreEnv(gym.Env):
                 reward += R_STEP_EXPLORE
                 reward_terms["step"] = R_STEP_EXPLORE
             
-            # Movement shaping — DISPLACEMENT-BASED (anti-gaming)
+            # Movement shaping — SPEED BONUS
+            # Robot is always moving forward (min 0.25 m/s), so reward going faster
+            # No need for stuck/spin penalties since zero velocity is impossible
             
-            # Track actual ground covered (spinning in place = 0 displacement)
-            dx = st["x"] - self._last_pos[0]
-            dy = st["y"] - self._last_pos[1]
-            step_displacement = math.hypot(dx, dy)
+            # Speed bonus — scales with velocity, encourages not just crawling at minimum
+            speed_ratio = (st["v_lin"] - 0.25) / (V_MAX - 0.25)  # 0 at min, 1 at max
+            speed_ratio = max(0.0, speed_ratio)  # Clamp in case physics lags
+            r_forward = R_FORWARD_SCALE * speed_ratio
+            reward += r_forward
+            reward_terms["forward"] = r_forward
+            
+            # Track displacement for info (no longer used for penalty)
+            dx_disp = st["x"] - self._last_pos[0]
+            dy_disp = st["y"] - self._last_pos[1]
             self._last_pos = (st["x"], st["y"])
-            
-            # Rolling displacement over a window (catches slow creeping too)
-            DISPLACEMENT_WINDOW = 20  # steps
-            decay = (DISPLACEMENT_WINDOW - 1) / DISPLACEMENT_WINDOW
-            self._displacement_window = self._displacement_window * decay + step_displacement
-            self._displacement_steps = min(self._displacement_steps + 1, DISPLACEMENT_WINDOW)
-            avg_displacement = self._displacement_window / max(self._displacement_steps, 1)
-            
-            # Speed-scaled forward bonus — faster = more reward
-            # Only counts actual forward movement, not spinning
-            if st["v_lin"] > 0.05:
-                r_forward = R_FORWARD_SCALE * (st["v_lin"] / V_MAX)
-                reward += r_forward
-                reward_terms["forward"] = r_forward
-            
-            # SPIN PENALTY — high angular velocity with low linear velocity
-            # This is the #1 degenerate strategy: spin in place to avoid everything
-            if abs(st["v_ang"]) > 0.2 and abs(st["v_lin"]) < 0.15:
-                spin_ratio = abs(st["v_ang"]) / max(abs(st["v_lin"]) + 0.01, 0.01)
-                r_spin = R_SPIN_PENALTY * min(spin_ratio / 5.0, 1.0)
-                reward += r_spin
-                reward_terms["spin"] = r_spin
-            
-            # STUCK PENALTY — based on displacement, NOT velocity
-            # Spinning in place, creeping, or oscillating all get caught
-            if self._displacement_steps >= 10 and avg_displacement < 0.02:
-                reward += R_STUCK_PENALTY
-                reward_terms["stuck"] = R_STUCK_PENALTY
-            
-            # Proximity reward — navigating NEAR obstacles without hitting them
-            # Only active when actually MOVING (no free reward for sitting near walls)
-            if min_dist < 2.0 and st["v_lin"] > 0.2 and R_PROXIMITY_BONUS > 0:
-                dist_from_sweet = (min_dist - PROXIMITY_SWEET_SPOT) / PROXIMITY_RANGE
-                prox_r = R_PROXIMITY_BONUS * math.exp(-0.5 * dist_from_sweet ** 2)
-                reward += prox_r
-                reward_terms["proximity"] = prox_r
         
         # ============================================================
         # BOOKKEEPING
@@ -2643,7 +2615,7 @@ def main():
         # a[1] in [-1,1]: steering (turn radius limited by step())
         if t < args.start_steps:
             act = np.array([
-                np.random.uniform(0.0, 1.0),     # Bias forward during exploration
+                np.random.uniform(-0.5, 1.0),    # Full speed range (always forward now)
                 np.random.uniform(-0.8, 0.8),     # Moderate steering
             ], dtype=np.float32)
         else:
