@@ -67,46 +67,67 @@ ZONE_DANGER = 0.45
 ZONE_EMERGENCY = 0.30
 
 # =============================================================================
-# REWARD SHAPING — SIMPLIFIED
-# Principle: max 4-5 terms active at once, no conflicting signals
+# REWARD SHAPING — ANTI-GAMING v2
+#
+# Design principles:
+#   1. ONE positive reward per mode (progress OR discovery). That's the objective.
+#   2. Step cost creates time pressure — the only way to "win" is to accomplish the task.
+#   3. Heading efficiency replaces spin penalty — continuous signal, no dead zones.
+#   4. Displacement is a tiny nudge, not a reward worth farming.
+#   5. Remove everything redundant (frontier closing, revisit, exploration cap).
+#
+# Goal mode:  progress (ratchet) + step cost                      = 2 terms
+# Explore:    discovery          + step cost                      = 2 terms
+# Always:     displacement (small) + heading waste + stagnation   = 1-3 terms
+# Terminal:   collision / goal / timeout                          = 1 term
+# Max active: 5 terms. Clean signal.
 # =============================================================================
 
-# --- Curriculum (now performance-based, these are fallback step limits) ---
-CURRICULUM_PHASE1_FALLBACK = 50_000   # Force phase 2 if metrics haven't triggered it
-CURRICULUM_PHASE2_FALLBACK = 120_000  # Force phase 3
+# --- Curriculum (performance-based, these are fallback step limits) ---
+CURRICULUM_PHASE1_FALLBACK = 50_000
+CURRICULUM_PHASE2_FALLBACK = 120_000
 
 # Performance thresholds for curriculum transitions
-PHASE1_TO_2_AVG_EP_LEN = 200         # Avg episode > 200 steps → agent survives, move to phase 2
-PHASE1_TO_2_WINDOW = 50              # Rolling window of episodes
-PHASE2_TO_3_COLLISION_RATE = 0.30    # Collision rate < 30% → move to phase 3
+PHASE1_TO_2_AVG_EP_LEN = 200
+PHASE1_TO_2_WINDOW = 50
+PHASE2_TO_3_COLLISION_RATE = 0.30
 PHASE2_TO_3_WINDOW = 50
 
 R_COLLISION_PHASE1 = -5.0
 R_COLLISION_PHASE2 = -50.0
 R_COLLISION_PHASE3 = -100.0
 
-COLLISION_COOLDOWN_STEPS = 8          # Was 15 — faster feedback
+COLLISION_COOLDOWN_STEPS = 8
 
 R_GOAL = 2000.0
 R_TIMEOUT = -50.0
 GOAL_RADIUS = 0.45
 
-# --- Goal-seeking (3 terms) ---
+# --- Goal-seeking (2 terms: ratchet progress + step cost) ---
 PROGRESS_SCALE = 400.0
-ALIGN_SCALE = 3.0                     # Was 10.0 — was dominating at distance
 STEP_COST = -1.5
 
-# --- Exploration (4 terms) ---
+# --- Exploration (2 terms: discovery + step cost) ---
 R_NEW_CELL = 3.0
-R_FRONTIER_BONUS = 3.0               # Was 8.0 — ±8/step was larger than everything else
-R_REVISIT_SCALE = 0.5
 R_STEP_EXPLORE = -0.3
 
-# --- Movement shaping (1 term) ---
-R_FORWARD_SCALE = 5.0                # Speed bonus — scales with velocity
-R_STOP_PENALTY = -1.0                # Small penalty for very low speed (< 0.1 m/s)
-                                      # Agent CAN stop, just discouraged
-R_SPIN_PENALTY = -4.0
+# --- Movement (always active, small nudge) ---
+R_DISPLACEMENT = 2.0             # Was 8.0 — gentle nudge, NOT an objective
+                                 # At 0.2m/step = 0.4/step. Won't dominate.
+
+# --- Heading efficiency (replaces spin penalty — no dead zones to exploit) ---
+# Tracks cumulative heading change vs cumulative displacement over rolling window.
+# Straight driving: ratio ≈ 0. Gradual 90° turn: ratio ≈ 0.8. Spinning: ratio → ∞.
+# Penalizes proportionally once ratio exceeds threshold — smooth gradient, no cliff.
+HEADING_WINDOW = 25              # Steps in rolling window
+HEADING_RATIO_THRESHOLD = 4.0    # Above this = wasteful turning (allows 4 rad/m)
+R_HEADING_WASTE = -1.5           # Penalty per step when ratio exceeds threshold
+                                 # Scales with how bad the ratio is
+
+# --- Stagnation (displacement gate) ---
+DISPLACEMENT_WINDOW = 25         # Rolling window (longer = harder to game with a lurch)
+DISPLACEMENT_GATE_M = 0.4        # Was 0.3 — must move 0.4m in 25 steps (0.016m/step avg)
+R_STAGNATION = -2.0              # Penalty when gate fails
 
 # =============================================================================
 # GENERAL CONFIG
@@ -126,7 +147,8 @@ GRID_MAX_RANGE = 12.0
 V_MAX = 2.00
 W_MAX = 3.0
 V_MIN_REVERSE = -0.05
-MIN_TURN_RADIUS = 0.20
+MIN_TURN_RADIUS = 0.40                    # Was 0.20 — more car-like, physically harder to spin
+W_STOPPED_LIMIT = 0.6                     # Max angular vel when nearly stopped (was W_MAX*0.5=1.5)
 
 # Velocity smoothing
 CMD_SMOOTHING_ALPHA = 0.75            # Was 0.6 — more responsive
@@ -1000,6 +1022,15 @@ class StretchExploreEnv(gym.Env):
         self._cached_frontier_angle = 0.0
         self._cached_new_cells = 0
 
+        # Anti-gaming: displacement + heading tracking
+        self._pos_history = deque(maxlen=DISPLACEMENT_WINDOW)
+        self._heading_changes = deque(maxlen=HEADING_WINDOW)  # abs heading change per step
+        self._step_displacements = deque(maxlen=HEADING_WINDOW)  # displacement per step
+        self._last_yaw = 0.0
+
+        # Anti-gaming: ratchet progress for goal-seeking
+        self._best_goal_dist = float('inf')
+
         # Observation space: lidar(36) + goal(5) + vel(2) + prev_act(2) + has_goal(1) + grid(256) + frontier(2) + novelty(1)
         grid_flat_size = GRID_SIZE * GRID_SIZE  # 256
         obs_dim = NUM_LIDAR_BINS + 5 + 2 + 2 + 1 + grid_flat_size + 2 + 1  # = 305
@@ -1040,9 +1071,14 @@ class StretchExploreEnv(gym.Env):
         self._episode_had_collision = False
         self._cached_frontier_angle = 0.0
         self._cached_new_cells = 0
+        self._best_goal_dist = float('inf')
+        self._pos_history.clear()
+        self._heading_changes.clear()
+        self._step_displacements.clear()
 
         st = self._get_robot_state()
         self._last_pos = (st["x"], st["y"])
+        self._last_yaw = st["yaw"]
 
         self.occ_grid.reset()
         if not sim_was_reset:
@@ -1058,6 +1094,7 @@ class StretchExploreEnv(gym.Env):
         self.ros.path_history.clear()
 
         self.prev_goal_dist = self._goal_distance()
+        self._best_goal_dist = self.prev_goal_dist if self.prev_goal_dist > 0 else float('inf')
 
         if self.ros.last_scan is not None:
             self.last_nav_state = self.navigator.analyze_scan(self.ros.last_scan)
@@ -1079,8 +1116,8 @@ class StretchExploreEnv(gym.Env):
         if rl_v > 0.05:
             w_limit = min(rl_v / MIN_TURN_RADIUS, W_MAX)
         else:
-            # When nearly stopped, allow in-place rotation (but penalized)
-            w_limit = W_MAX * 0.5
+            # When nearly stopped, only allow slow rotation
+            w_limit = W_STOPPED_LIMIT
         rl_w = float(a[1]) * w_limit
 
         # Smooth
@@ -1109,6 +1146,12 @@ class StretchExploreEnv(gym.Env):
         nav_state = self.navigator.analyze_scan(self.ros.last_scan)
         self.last_nav_state = nav_state
         self.last_safety_state = nav_state
+
+        # Update frontier direction cache for observation (not used in rewards)
+        if self.step_count % FRONTIER_CACHE_INTERVAL == 0:
+            self._cached_frontier_angle = self.occ_grid.get_frontier_direction(
+                st["x"], st["y"], st["yaw"]
+            )
 
         obs = self._build_observation()
 
@@ -1173,73 +1216,94 @@ class StretchExploreEnv(gym.Env):
             reward_terms["timeout"] = R_TIMEOUT
 
         # ============================================================
-        # SHAPING REWARDS — simplified to 4-5 terms max
+        # SHAPING REWARDS — anti-gaming v2
+        #
+        # 1. ONE positive reward per mode (progress OR discovery)
+        # 2. Step cost = time pressure
+        # 3. Heading efficiency = continuous anti-spin (no dead zones)
+        # 4. Displacement = tiny nudge to keep moving
+        # 5. Stagnation = penalty for going nowhere
         # ============================================================
 
         if not terminated and not truncated:
+            # --- Track displacement and heading change ---
+            dx_step = st["x"] - self._last_pos[0]
+            dy_step = st["y"] - self._last_pos[1]
+            step_displacement = math.hypot(dx_step, dy_step)
+
+            # Heading change (wrapped to [-pi, pi])
+            heading_delta = abs(wrap_to_pi(st["yaw"] - self._last_yaw))
+
+            self._pos_history.append((st["x"], st["y"]))
+            self._heading_changes.append(heading_delta)
+            self._step_displacements.append(step_displacement)
+            self._last_pos = (st["x"], st["y"])
+            self._last_yaw = st["yaw"]
+
+            # Rolling displacement (straight-line from oldest to newest position)
+            if len(self._pos_history) >= 2:
+                oldest = self._pos_history[0]
+                rolling_displacement = math.hypot(
+                    st["x"] - oldest[0], st["y"] - oldest[1]
+                )
+            else:
+                rolling_displacement = step_displacement
+
+            # Displacement gate
+            warmup = len(self._pos_history) < DISPLACEMENT_WINDOW
+            gate_open = rolling_displacement >= DISPLACEMENT_GATE_M or warmup
+
+            # ---- MODE-SPECIFIC REWARD (one positive signal) ----
+
             if has_goal:
-                # GOAL MODE: 3 terms — progress, alignment, step cost
-                progress = self.prev_goal_dist - d_goal
-                r_progress = PROGRESS_SCALE * progress
+                # GOAL MODE: ratchet progress + step cost
+                # Only reward NEW closest distance — no oscillation farming
+                if d_goal < self._best_goal_dist:
+                    ratchet_progress = self._best_goal_dist - d_goal
+                    r_progress = PROGRESS_SCALE * ratchet_progress
+                    self._best_goal_dist = d_goal
+                else:
+                    r_progress = 0.0
+
                 reward_terms["progress"] = r_progress
                 reward += r_progress
-
-                if rl_v > 0.15:
-                    ang = self._goal_angle()
-                    r_align = ALIGN_SCALE * math.cos(ang)
-                    reward_terms["alignment"] = r_align
-                    reward += r_align
-
                 reward += STEP_COST
                 reward_terms["step"] = STEP_COST
             else:
-                # EXPLORE MODE: 4 terms — discovery, frontier, revisit, step cost
+                # EXPLORE MODE: discovery + step cost
+                # Each cell only counts once — inherently anti-gaming
                 r_discovery = R_NEW_CELL * self._cached_new_cells
                 reward_terms["discovery"] = r_discovery
                 reward += r_discovery
-
-                # Frontier steering: non-negative [0, R_FRONTIER_BONUS]
-                # 0.5*(1+cos) → heading toward = bonus, away = 0 (not negative)
-                # Cached — recomputed every FRONTIER_CACHE_INTERVAL steps
-                if self.step_count % FRONTIER_CACHE_INTERVAL == 0:
-                    self._cached_frontier_angle = self.occ_grid.get_frontier_direction(
-                        st["x"], st["y"], st["yaw"]
-                    )
-                if self._cached_frontier_angle != 0.0:
-                    r_frontier = R_FRONTIER_BONUS * 0.5 * (1.0 + math.cos(self._cached_frontier_angle))
-                    reward_terms["frontier"] = r_frontier
-                    reward += r_frontier
-
-                # Revisit penalty
-                robot_key = self.occ_grid.world_to_grid_key(st["x"], st["y"])
-                visit_count = self.occ_grid.visit_counts.get(robot_key, 0)
-                if visit_count > 2:
-                    r_revisit = -R_REVISIT_SCALE * min(visit_count - 2, 10)
-                    reward_terms["revisit"] = r_revisit
-                    reward += r_revisit
-
                 reward += R_STEP_EXPLORE
                 reward_terms["step"] = R_STEP_EXPLORE
 
-            # ALWAYS: 1 movement shaping term — speed bonus OR stop penalty
-            actual_v = max(0.0, st["v_lin"])
-            if actual_v < 0.1:
-                # Stopped or near-stopped: small penalty (agent CAN stop, just costs)
-                reward += R_STOP_PENALTY
-                reward_terms["stop_penalty"] = R_STOP_PENALTY
+            # ---- MOVEMENT REWARDS (always active) ----
+
+            # Small displacement nudge (not large enough to farm)
+            if gate_open:
+                r_displacement = R_DISPLACEMENT * step_displacement
+                reward += r_displacement
+                reward_terms["displacement"] = r_displacement
             else:
-                # Moving: speed bonus scales with velocity
-                speed_ratio = actual_v / V_MAX  # 0 to 1
-                r_speed = R_FORWARD_SCALE * speed_ratio
-                reward += r_speed
-                reward_terms["speed"] = r_speed
+                # Stagnation: you're not going anywhere useful
+                reward += R_STAGNATION
+                reward_terms["stagnation"] = R_STAGNATION
 
-            # Spin penalty: high angular, low linear
-            if abs(st["v_ang"]) > 1.5 and actual_v < 0.15:
-                reward += R_SPIN_PENALTY
-                reward_terms["spin"] = R_SPIN_PENALTY
+            # ---- HEADING EFFICIENCY (continuous anti-spin) ----
+            # Ratio of cumulative heading change to cumulative displacement
+            # High ratio = wasting time turning instead of making progress
+            if len(self._heading_changes) >= 5:  # Need minimum data
+                cum_heading = sum(self._heading_changes)
+                cum_disp = max(sum(self._step_displacements), 0.01)
+                heading_ratio = cum_heading / cum_disp
 
-            self._last_pos = (st["x"], st["y"])
+                if heading_ratio > HEADING_RATIO_THRESHOLD:
+                    # Penalty scales with how bad the ratio is
+                    excess = heading_ratio - HEADING_RATIO_THRESHOLD
+                    r_heading = R_HEADING_WASTE * min(excess / HEADING_RATIO_THRESHOLD, 2.0)
+                    reward += r_heading
+                    reward_terms["heading_waste"] = r_heading
 
         # ============================================================
         # BOOKKEEPING

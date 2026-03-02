@@ -2,12 +2,11 @@
 """
 Multi-Domain RL Training Monitor + Camera Streaming
 
-Updated for no-safety-override learner:
+Updated for anti-gaming v2 reward system:
 - Episode outcomes: COLLISION / GOAL_REACHED / TIMEOUT
-- Min distance to obstacle tracking
-- New reward components: progress, alignment, discovery, novelty,
-  frontier, rnd, forward, stuck, spin, step, collision, goal, timeout
-- No more intervention/safety blend charts
+- Reward components: progress (ratchet), discovery, displacement,
+  heading_waste, stagnation, step, collision, goal, timeout
+- EMA smoothing on all time-series charts
 """
 
 import argparse
@@ -192,6 +191,16 @@ class DomainStats:
             "goal_status": self.goal_status if goal_status_fresh else {},
         }
 
+    @staticmethod
+    def _ema_smooth(values: list, alpha: float = 0.15) -> list:
+        """Exponential moving average for smoother charts. alpha=0.15 is gentle."""
+        if not values:
+            return values
+        smoothed = [values[0]]
+        for v in values[1:]:
+            smoothed.append(alpha * v + (1 - alpha) * smoothed[-1])
+        return smoothed
+
     def get_plot_data(self, max_points: int = 300) -> Dict:
         step = max(1, len(self.rewards) // max_points)
 
@@ -199,6 +208,9 @@ class DomainStats:
         timestamps = list(self.timestamps)[::step]
         t0 = timestamps[0] if timestamps else 0
         rel_times = [(t - t0) for t in timestamps]
+
+        # Smooth rewards for display
+        smoothed_rewards = self._ema_smooth(rewards, alpha=0.1)
 
         episode_returns = list(self.episode_returns)
         episode_indices = list(range(1, len(episode_returns) + 1))
@@ -208,26 +220,27 @@ class DomainStats:
             vals = list(values)[::step]
             if vals:
                 t0_comp = vals[0][0]
+                raw_values = [v[1] for v in vals]
                 components_data[key] = {
                     "times": [(v[0] - t0_comp) for v in vals],
-                    "values": [v[1] for v in vals]
+                    "values": self._ema_smooth(raw_values, alpha=0.2)
                 }
 
-        # Min distance plot
+        # Min distance plot (smoothed)
         md_list = list(self.min_distances)[::step]
         if md_list:
             t0_md = md_list[0][0]
             md_times = [(v[0] - t0_md) for v in md_list]
-            md_values = [v[1] for v in md_list]
+            md_values = self._ema_smooth([v[1] for v in md_list], alpha=0.15)
         else:
             md_times, md_values = [], []
 
-        # Velocity plot
+        # Velocity plot (smoothed)
         vel_list = list(self.velocities)[::step]
         if vel_list:
             t0_vel = vel_list[0][0]
             vel_times = [(v[0] - t0_vel) for v in vel_list]
-            vel_values = [v[1] for v in vel_list]
+            vel_values = self._ema_smooth([v[1] for v in vel_list], alpha=0.15)
         else:
             vel_times, vel_values = [], []
 
@@ -247,7 +260,7 @@ class DomainStats:
         return {
             "domain_id": self.domain_id,
             "display_name": self.display_name,
-            "rewards": {"times": rel_times, "values": rewards},
+            "rewards": {"times": rel_times, "values": smoothed_rewards},
             "episode_returns": {"episodes": episode_indices, "values": episode_returns},
             "components": components_data,
             "min_distance": {"times": md_times, "values": md_values},
@@ -632,7 +645,7 @@ DASHBOARD_HTML = r"""
 </head>
 <body>
   <div class="header">
-    <h1>RL Training Monitor<span class="subtitle">No Safety Override &mdash; RL Learns From Consequences</span></h1>
+    <h1>RL Training Monitor<span class="subtitle">Anti-Gaming v2 &mdash; Heading Efficiency, Ratchet Progress, Discovery Only</span></h1>
     <span class="badge" id="badge">Scanning...</span>
   </div>
   <div class="container">
@@ -652,25 +665,21 @@ const C = {
   lime:'#68d391', pink:'#f687b3'
 };
 
-// Reward component -> color mapping
+// Reward component -> color mapping (anti-gaming v2)
 const compColors = {
   // Goal-seeking
-  progress:  C.green,
-  alignment: C.blue,
-  goal:      C.darkyellow,
+  progress:       C.green,
+  goal:           C.darkyellow,
   // Exploration
-  discovery: C.purple,
-  novelty:   C.cyan,
-  frontier:  C.teal,
-  rnd:       '#63b3ed',
-  // Movement shaping
-  forward:   C.lime,
-  stuck:     C.orange,
-  spin:      C.pink,
-  step:      C.gray,
+  discovery:      C.purple,
+  // Movement
+  displacement:   C.lime,
+  stagnation:     '#e53e3e',
+  heading_waste:  C.orange,
+  step:           C.gray,
   // Terminal
-  collision: C.darkred,
-  timeout:   '#b7791f',
+  collision:      C.darkred,
+  timeout:        '#b7791f',
 };
 
 const layoutBase = {
@@ -748,7 +757,7 @@ function drawAllChart() {
   Object.values(domains).forEach(d => {
     const p = d.plot_data;
     if (p.episode_returns.values.length) {
-      traces.push({x:p.episode_returns.episodes, y:p.episode_returns.values, type:'scatter', mode:'lines', name:p.display_name, line:{color:cls[ci++%cls.length],width:2}});
+      traces.push({x:p.episode_returns.episodes, y:p.episode_returns.values, type:'scatter', mode:'lines', name:p.display_name, line:{color:cls[ci++%cls.length],width:2,shape:'spline',smoothing:0.8}});
     }
   });
   if (traces.length) Plotly.react('allChart', traces, {...layoutBase, showlegend:true, legend:{bgcolor:'rgba(0,0,0,0)',font:{size:10}}, xaxis:{...layoutBase.xaxis,title:'Episode'}, yaxis:{...layoutBase.yaxis,title:'Return'}}, cfg);
@@ -832,16 +841,16 @@ function updateDomainView(k) {
     Plotly.react('rewChart', [{x:p.rewards.times, y:p.rewards.values, type:'scatter', mode:'lines', line:{color:C.blue,width:2}, fill:'tozeroy', fillcolor:'rgba(102,126,234,0.1)'}], {...layoutBase, xaxis:{...layoutBase.xaxis,title:'Time (s)'}}, cfg);
   }
 
-  // Episode returns + rolling average
+  // Episode returns + rolling average (20-ep window for smooth curve)
   if (p.episode_returns.values.length) {
     const ra = [];
     for (let i=0; i<p.episode_returns.values.length; i++) {
-      const w = p.episode_returns.values.slice(Math.max(0,i-9), i+1);
+      const w = p.episode_returns.values.slice(Math.max(0,i-19), i+1);
       ra.push(w.reduce((a,b)=>a+b,0)/w.length);
     }
     Plotly.react('epChart', [
-      {x:p.episode_returns.episodes, y:p.episode_returns.values, type:'scatter', mode:'lines+markers', name:'Return', line:{color:C.green,width:2}, marker:{size:4}},
-      {x:p.episode_returns.episodes, y:ra, type:'scatter', mode:'lines', name:'10-ep avg', line:{color:C.yellow,width:2.5}}
+      {x:p.episode_returns.episodes, y:p.episode_returns.values, type:'scatter', mode:'lines', name:'Return', line:{color:C.green,width:1}, opacity:0.4},
+      {x:p.episode_returns.episodes, y:ra, type:'scatter', mode:'lines', name:'20-ep avg', line:{color:C.yellow,width:2.5}}
     ], {...layoutBase, showlegend:true, legend:{bgcolor:'rgba(0,0,0,0)',x:0.02,y:0.98}, xaxis:{...layoutBase.xaxis,title:'Episode'}}, cfg);
   }
 
@@ -868,7 +877,7 @@ function updateDomainView(k) {
   // Reward components time series
   const traces = [];
   const legendItems = [];
-  const compOrder = ['progress','alignment','goal','discovery','novelty','frontier','rnd','forward','stuck','spin','step','collision','timeout'];
+  const compOrder = ['progress','goal','discovery','displacement','stagnation','heading_waste','step','collision','timeout'];
   compOrder.forEach(n => {
     const cd = p.components[n];
     if (cd && cd.values.length) {
@@ -1001,16 +1010,17 @@ def main():
     args = parser.parse_args()
 
     print(f"""
-    RL Training Monitor (No Safety Override)
-    =========================================
+    RL Training Monitor (Anti-Gaming v2)
+    =====================================
     http://localhost:{args.port}
     Scanning domains {args.scan_start}-{args.scan_end}
 
     REWARD SYSTEM:
-      Terminal:  collision=-500, goal_reached=+2000, timeout=-50
-      Goal:     progress (closer=+), alignment (facing goal=+), step cost (-)
-      Explore:  discovery, novelty, frontier, rnd, step cost (-)
-      Shaping:  forward (+1), stuck (-1), spin (-3)
+      Terminal:  collision (curriculum), goal=+2000, timeout=-50
+      Goal:     ratchet progress (only new-best distance pays)
+      Explore:  discovery (new cells only, inherently ungameable)
+      Movement: displacement (small nudge, 2.0/m)
+      Guards:   heading efficiency ratio, displacement gate, stagnation penalty
       Collision threshold: 0.30m (LIDAR min distance)
     """)
 
