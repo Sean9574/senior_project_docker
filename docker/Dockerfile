@@ -270,7 +270,7 @@ RUN pip3 install --no-deps -e .
 # Create directories for checkpoints and data
 # =============================================================================
 
-RUN mkdir -p /home/stretch/rl_checkpoints && chown stretch:stretch /home/stretch/rl_checkpoints
+RUN mkdir -p /home/stretch/parallel_training && chown stretch:stretch /home/stretch/parallel_training
 RUN mkdir -p /home/stretch/models && chown stretch:stretch /home/stretch/models
 RUN mkdir -p /home/stretch/logs && chown stretch:stretch /home/stretch/logs
 
@@ -406,7 +406,7 @@ RUN echo "export CUDNN_BENCHMARK=1" >> /home/$USERNAME/.bashrc
 # Create directories for checkpoints and data
 # =============================================================================
 
-RUN mkdir -p /home/stretch/rl_checkpoints && chown stretch:stretch /home/stretch/rl_checkpoints
+RUN mkdir -p /home/stretch/parallel_training && chown stretch:stretch /home/stretch/parallel_training
 RUN mkdir -p /home/stretch/models && chown stretch:stretch /home/stretch/models
 RUN mkdir -p /home/stretch/logs && chown stretch:stretch /home/stretch/logs
 

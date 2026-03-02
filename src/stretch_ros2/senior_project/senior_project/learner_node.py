@@ -1702,7 +1702,7 @@ def main():
     parser.add_argument("--save-every", type=int, default=DEFAULT_SAVE_EVERY)
 
     # Checkpoint
-    parser.add_argument("--ckpt-dir", type=str, default=os.path.expanduser("~/rl_checkpoints"))
+    parser.add_argument("--ckpt-dir", type=str, default=os.path.expanduser("~/parallel_training"))
     parser.add_argument("--seed", type=int, default=42)
 
     # Mode
