@@ -90,9 +90,13 @@ ZONE_EMERGENCY = 0.30   # Hard override - last resort
 CURRICULUM_PHASE1_END = 30_000    # Steps: collisions don't end episode
 CURRICULUM_PHASE2_END = 80_000    # Steps: moderate collision penalty
 
-R_COLLISION_PHASE1 = -3.0         # Bump penalty (episode continues) — must be < forward bonus so agent still wants to move
+R_COLLISION_PHASE1 = -5.0         # ONE-TIME bump penalty (episode continues) — applied once per collision event, NOT per step
 R_COLLISION_PHASE2 = -50.0        # Moderate (episode ends)
 R_COLLISION_PHASE3 = -100.0       # Full penalty (episode ends)
+
+# Collision cooldown: after a bump, ignore collisions for this many steps
+# This gives the robot time to escape without accumulating penalties
+COLLISION_COOLDOWN_STEPS = 15
 
 R_GOAL = 2000.0                   # Reaching goal -> episode ends
 R_TIMEOUT = -50.0                 # Episode timeout -> episode ends
@@ -121,10 +125,13 @@ R_STEP_EXPLORE = -0.3          # Step cost during exploration (was -0.1 — no u
 # SHAPING REWARDS (always active)
 # =============================================================================
 
-R_FORWARD_SCALE = 6.0          # Forward bonus scales with speed — MUST dominate collision penalty
-                                # At v=0.3:  +1.44/step
-                                # At v=0.7:  +3.36/step
-                                # At v=1.25: +6.0/step (full bonus)
+R_FORWARD_SCALE = 5.0          # Bonus for going FASTER than minimum (scales with speed above min)
+R_FORWARD_BASE = 2.0           # Base reward for ANY forward motion (even at minimum speed)
+                                # This ensures forward > stationary is ALWAYS rewarded
+                                # Total forward reward = BASE + SCALE * speed_ratio
+                                # At v=0.25 (min):  +2.0/step
+                                # At v=1.0:         +2.0 + 2.14 = +4.14/step
+                                # At v=2.0 (max):   +2.0 + 5.0  = +7.0/step
 R_STUCK_PENALTY = -5.0         # Penalty for not covering ground (displacement-based, not velocity)
 R_SPIN_PENALTY = -4.0          # Penalty for spinning in place (high ω, low v)
 R_PROXIMITY_BONUS = 0.0        # DISABLED — was rewarding wall-hugging
@@ -1407,6 +1414,9 @@ class StretchExploreEnv(gym.Env):
         self._displacement_window = 0.0  # Rolling displacement over last N steps
         self._displacement_steps = 0
         
+        # Collision cooldown — prevents per-step penalty stacking
+        self._collision_cooldown = 0
+        
         # Occupancy grid — full reset since robot is back at start
         self.occ_grid.reset()
         if not sim_was_reset:
@@ -1527,16 +1537,24 @@ class StretchExploreEnv(gym.Env):
         else:
             phase = 3
         
-        # --- COLLISION CHECK ---
+        # --- COLLISION CHECK (with cooldown to prevent per-step penalty stacking) ---
+        # Decrement cooldown
+        if self._collision_cooldown > 0:
+            self._collision_cooldown -= 1
+        
         if min_dist < ZONE_EMERGENCY and self.step_count > 10:
             collision = True
             
             if phase == 1:
-                # Phase 1: Bump penalty, episode CONTINUES
-                # Agent learns "that hurt" but keeps exploring
-                # Builds positive experience without collision trauma
-                reward += R_COLLISION_PHASE1
-                reward_terms["collision"] = R_COLLISION_PHASE1
+                # Phase 1: ONE-TIME bump penalty, then cooldown
+                # Without cooldown, robot gets -3 EVERY STEP while near wall,
+                # which teaches it that ANY forward motion → wall → massive accumulated penalty.
+                # Fix: penalize ONCE per collision event, then grace period to escape.
+                if self._collision_cooldown <= 0:
+                    reward += R_COLLISION_PHASE1
+                    reward_terms["collision"] = R_COLLISION_PHASE1
+                    self._collision_cooldown = COLLISION_COOLDOWN_STEPS
+                # else: in cooldown, no penalty (agent is trying to escape)
                 # NOT terminated — episode continues
             elif phase == 2:
                 # Phase 2: Moderate penalty, episode ends
@@ -1643,14 +1661,25 @@ class StretchExploreEnv(gym.Env):
             
             # Movement shaping — SPEED BONUS
             # Robot is always moving forward (min 0.25 m/s), so reward going faster
-            # No need for stuck/spin penalties since zero velocity is impossible
+            # BASE reward ensures even minimum speed is net-positive vs. doing nothing
+            # SCALE reward encourages going faster when safe
             
-            # Speed bonus — scales with velocity, encourages not just crawling at minimum
+            # Base forward reward — ALWAYS positive when moving forward
+            # This is the critical signal: "moving forward is GOOD, even slowly"
+            actual_v = max(0.0, st["v_lin"])
+            if actual_v > 0.05:  # Actually moving (not stuck against wall)
+                r_forward_base = R_FORWARD_BASE
+            else:
+                r_forward_base = 0.0  # Truly stuck (wall contact), no base reward
+            reward += r_forward_base
+            reward_terms["forward_base"] = r_forward_base
+            
+            # Speed bonus — scales with velocity above minimum
             speed_ratio = (st["v_lin"] - 0.25) / (V_MAX - 0.25)  # 0 at min, 1 at max
             speed_ratio = max(0.0, speed_ratio)  # Clamp in case physics lags
             r_forward = R_FORWARD_SCALE * speed_ratio
             reward += r_forward
-            reward_terms["forward"] = r_forward
+            reward_terms["forward_speed"] = r_forward
             
             # Track displacement for info (no longer used for penalty)
             dx_disp = st["x"] - self._last_pos[0]
@@ -1710,10 +1739,13 @@ class StretchExploreEnv(gym.Env):
             self.episode_index += 1
         elif collision:
             # Phase 1: collision didn't end episode — log the bump
-            self.ros.get_logger().info(
-                f"\033[93m[BUMP]\033[0m step={self.step_count} min_d={min_dist:.2f}m "
-                f"penalty={R_COLLISION_PHASE1} (Phase 1 — episode continues)"
-            )
+            if self._collision_cooldown == COLLISION_COOLDOWN_STEPS:
+                # Just penalized
+                self.ros.get_logger().info(
+                    f"\033[93m[BUMP]\033[0m step={self.step_count} min_d={min_dist:.2f}m "
+                    f"penalty={R_COLLISION_PHASE1} (Phase 1 — cooldown started, {COLLISION_COOLDOWN_STEPS} steps)"
+                )
+            # else: in cooldown, no spam logging
         
         # Debug logging
         if self.step_count % DEBUG_EVERY_N == 0:
