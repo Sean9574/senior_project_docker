@@ -1795,8 +1795,11 @@ def main():
     else:
         ros.get_logger().info(f"[CKPT] {Y}No checkpoint found — starting fresh{RST}")
 
-    # Save helper
-    def save_full_checkpoint(step: int, label: str = "periodic"):
+    # Save helpers — weights every episode (fast), replay buffer less often (slow)
+    last_replay_save_step = resume_step
+
+    def save_weights_only(step: int, label: str = "episode"):
+        """Save agent weights + training state. Fast (~50ms)."""
         training_state = {
             "step": step,
             "episode_index": env.episode_index,
@@ -1811,7 +1814,9 @@ def main():
             os.replace(ckpt_path + ".tmp", ckpt_path)
         except Exception as e:
             ros.get_logger().error(f"[CKPT] {R}Agent save failed: {e}{RST}")
-            return
+
+    def save_replay_buffer():
+        """Save replay buffer to disk. Slow (~seconds for large buffers)."""
         try:
             replay_tmp = replay_path.replace(".npz", "_tmp.npz")
             replay.save(replay_tmp)
@@ -1820,8 +1825,15 @@ def main():
             os.replace(replay_tmp, replay_path)
         except Exception as e:
             ros.get_logger().warn(f"[CKPT] {Y}Replay save failed: {e}{RST}")
+
+    def save_full_checkpoint(step: int, label: str = "periodic"):
+        """Save everything — weights + replay buffer."""
+        nonlocal last_replay_save_step
+        save_weights_only(step, label)
+        save_replay_buffer()
+        last_replay_save_step = step
         ros.get_logger().info(
-            f"[CKPT] {G}✓ {label} save{RST} step={step} ep={env.episode_index} replay={replay.count}"
+            f"[CKPT] {G}✓ {label} full save{RST} step={step} ep={env.episode_index} replay={replay.count}"
         )
 
     # Shutdown handler
@@ -1864,7 +1876,6 @@ def main():
     )
 
     obs, _ = env.reset()
-    last_save = resume_step
     last_phase = env.curriculum.phase
 
     for t in range(start_step, args.total_steps + 1):
@@ -1906,16 +1917,20 @@ def main():
 
         if done:
             obs, _ = env.reset()
+            # Weights save every episode (fast) — federated sync needs fresh checkpoints
+            save_weights_only(t, label="episode")
+            # Replay buffer saves less often (slow I/O)
+            if t - last_replay_save_step >= args.save_every:
+                save_replay_buffer()
+                last_replay_save_step = t
+                ros.get_logger().info(
+                    f"[CKPT] {G}✓ replay buffer saved{RST} step={t} count={replay.count}"
+                )
 
         # Update (every N steps instead of every step)
         if t >= args.update_after and t % args.update_every == 0 and replay.count >= args.batch_size:
             beta = PER_BETA_START + (PER_BETA_END - PER_BETA_START) * (t / args.total_steps)
             critic_loss, actor_loss = agent.update(replay, args.batch_size, beta)
-
-        # Save
-        if t - last_save >= args.save_every:
-            last_save = t
-            save_full_checkpoint(t, label="periodic")
 
     shutdown_and_save()
 
