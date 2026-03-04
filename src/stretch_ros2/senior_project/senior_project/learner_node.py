@@ -1,20 +1,29 @@
 #!/usr/bin/env python3
 """
-Stretch Robot RL Environment + Learner (OPTIMIZED)
+Stretch Robot RL Environment + Learner — v4 (MINIMUM VELOCITY)
 
-Changes from original:
-- Observation space: 664 → ~305 dims (grid 16x16, 36 LIDAR bins, no safety obs)
-- Reward v3: velocity penalty (anti-slowdown), heading efficiency (anti-spin),
-  ratchet progress, discovery only. No displacement/stagnation/alignment.
-- Compute: cached frontier, occ grid updates every 3 steps, update-every=4
-- Curriculum: performance-based transitions instead of fixed step counts
-- Agent can stop (no forced min velocity), penalized for it via velocity penalty
-- PER: smaller replay buffer, smaller batch size
+KEY DESIGN CHANGE: spinning is eliminated through the ACTION SPACE, not rewards.
+- a[0] maps V_MIN_FORWARD → V_MAX. Robot ALWAYS moves forward.
+- Turn radius constraint limits angular velocity proportional to speed.
+- At V_MIN_FORWARD=0.15 m/s, max angular = 0.375 rad/s → full spin takes 17 seconds.
+- Step cost makes 17-second spins deeply unprofitable.
+- No anti-spin penalties needed. No heading efficiency. No displacement gates.
+
+REWARDS (prioritized for 3 behaviors):
+1. EXPLORE: discovery(+) + revisit_penalty(-) + step_cost(-)  → go to new areas, avoid old
+2. AVOID:   proximity_cost(-)                                  → maintain clearance always
+3. GOAL:    ratchet_progress(+) + step_cost_high(-)            → shortest path to target
+- Terminal:  collision / goal / timeout                         (1 term)
+- Max active: 4 terms. Clean, behavior-aligned signals.
+
+CURRICULUM (2 phases):
+- Phase 1: collisions = small bump penalty, no termination (learn to explore)
+- Phase 2: collisions = terminate + heavy penalty (learn to avoid)
 
 EPISODE TERMINATION:
-- COLLISION: min LIDAR distance < 0.30m → negative reward, reset
-- GOAL REACHED: within 0.45m of goal → positive reward, reset
-- TIMEOUT: max steps exceeded → small negative, reset
+- COLLISION (phase 2+): min LIDAR < 0.30m → terminate + penalty
+- GOAL REACHED: within 0.45m → terminate + big reward
+- TIMEOUT: max steps → terminate + small penalty
 """
 
 import argparse
@@ -67,38 +76,34 @@ ZONE_DANGER = 0.45
 ZONE_EMERGENCY = 0.30
 
 # =============================================================================
-# REWARD SHAPING — v3
+# REWARD SYSTEM — v4 (BEHAVIOR-ALIGNED)
 #
-# Core insight: once discovery dries up mid-episode, the reward landscape goes
-# flat. Every action has roughly equal Q-value, so the policy collapses into
-# spinning (the network's default "confused" output). The displacement reward
-# (2.0/m) was too small to create a gradient, and identical whether driving
-# straight or in circles.
+# Three behaviors, three reward clusters:
 #
-# Fix: make going slow ACTIVELY painful. A velocity penalty creates a permanent
-# gradient: "drive forward at decent speed" is ALWAYS better than "slow down"
-# regardless of what other rewards are available.
+# 1. EXPLORE: discovery + revisit penalty + step cost
+#    - discovery: +3.0 per new cell (only fires once per cell, ever)
+#    - revisit:   -1.5 * (1 - novelty) — active repulsion from visited areas
+#    - step cost: -0.5/step — time pressure to keep exploring efficiently
+#    - world_grid + visit_counts persist across episodes → forces new routes
 #
-# Goal mode:  progress (ratchet) + step cost                      = 2 terms
-# Explore:    discovery          + step cost                      = 2 terms
-# Always:     velocity penalty + heading waste                    = 0-2 terms
-# Terminal:   collision / goal / timeout                          = 1 term
-# Max active: 4 terms. Clean signal.
+# 2. AVOID: proximity cost (always active, both modes)
+#    - Continuous penalty when min_distance < 0.65m
+#    - Scales linearly: closer = worse
+#    - Teaches clearance maintenance BEFORE collision threshold
+#
+# 3. GOAL: ratchet progress + higher step cost
+#    - progress: +400 * (distance_improved) — only new-best distances count
+#    - step cost: -2.5/step — strong pressure for shortest path
+#
+# Terminal: collision / goal / timeout
+# Max active: 4 terms.
 # =============================================================================
 
-# --- Curriculum (performance-based, these are fallback step limits) ---
-CURRICULUM_PHASE1_FALLBACK = 50_000
-CURRICULUM_PHASE2_FALLBACK = 120_000
+# --- Curriculum (2 phases — simple) ---
+CURRICULUM_PHASE1_STEPS = 30_000      # Phase 1 duration (bump penalty, no termination)
 
-# Performance thresholds for curriculum transitions
-PHASE1_TO_2_AVG_EP_LEN = 200
-PHASE1_TO_2_WINDOW = 50
-PHASE2_TO_3_COLLISION_RATE = 0.30
-PHASE2_TO_3_WINDOW = 50
-
-R_COLLISION_PHASE1 = -5.0
-R_COLLISION_PHASE2 = -50.0
-R_COLLISION_PHASE3 = -100.0
+R_COLLISION_PHASE1 = -10.0            # Bump penalty (no termination) — enough to learn "walls hurt"
+R_COLLISION_PHASE2 = -100.0           # Full penalty + termination
 
 COLLISION_COOLDOWN_STEPS = 8
 
@@ -108,28 +113,23 @@ GOAL_RADIUS = 0.45
 
 # --- Goal-seeking (2 terms: ratchet progress + step cost) ---
 PROGRESS_SCALE = 400.0
-STEP_COST = -1.5
+STEP_COST_GOAL = -2.5                 # Higher than explore — every step off shortest path costs
 
-# --- Exploration (2 terms: discovery + step cost) ---
+# --- Exploration (2-3 terms: discovery + revisit penalty + step cost) ---
 R_NEW_CELL = 3.0
-R_STEP_EXPLORE = -0.3
+R_STEP_EXPLORE = -0.5                 # Time pressure — explored areas are net negative
+R_REVISIT = -1.5                      # Active repulsion from visited cells
+                                      # novelty=1.0 (new area) → 0 penalty
+                                      # novelty≈0 (heavily visited) → -1.5/step
+                                      # Creates gradient: agent steered AWAY from known areas
 
-# --- Velocity penalty (replaces displacement reward + stagnation gate) ---
-# Makes going slow actively painful. Creates permanent gradient toward forward motion.
-# At v=0: full penalty. Scales linearly to 0 at V_COMFORT.
-# The agent ALWAYS has reason to maintain speed, even when discovery dries up.
-V_COMFORT = 0.3                  # m/s — penalty reaches 0 here (0.03m/step, crosses ~1 grid cell per 25 steps)
-R_SLOW_PENALTY = -2.0            # Penalty at v=0 per step. Over 450 steps = -900 total if always stopped.
-                                 # vs collision penalty -5 to -100. Agent learns: slow is worse than risking a bump.
-
-# --- Heading efficiency (anti-spin + anti-circle) ---
-# ratio = cumulative_heading_change / cumulative_displacement over window
-# Circle driving at any speed: ratio ≈ 1/radius_in_meters
-#   1.0m circle → ratio 1.0, 0.5m circle → ratio 2.0
-# Threshold 1.5 catches circles tighter than 0.67m but allows wide curves.
-HEADING_WINDOW = 25
-HEADING_RATIO_THRESHOLD = 1.5    # Was 4.0 — that was unreachable during circle driving
-R_HEADING_WASTE = -2.0           # Was -1.5 — stronger penalty, still scales with severity
+# --- Obstacle avoidance (always active) ---
+R_PROXIMITY = -3.0                    # Proximity cost scaling
+PROXIMITY_THRESHOLD = 0.65            # Start penalizing below this (= ZONE_CAUTION)
+                                      # At 0.65m: penalty = 0
+                                      # At 0.45m: penalty = -0.9/step
+                                      # At 0.30m: collision terminates before this matters
+                                      # Teaches clearance BEFORE crashing
 
 # =============================================================================
 # GENERAL CONFIG
@@ -138,22 +138,23 @@ R_HEADING_WASTE = -2.0           # Was -1.5 — stronger penalty, still scales w
 CHECKPOINT_FILENAME = "td3_safe_rl_agent.pt"
 AUTO_LOAD_CHECKPOINT = True
 
-EPISODE_SECONDS = 45.0                # Was 60 — shorter = more resets = faster learning
+EPISODE_SECONDS = 45.0
 
-# Occupancy Grid — SMALLER
-GRID_SIZE = 16                        # Was 24 — cuts grid obs from 576 to 256
-GRID_RESOLUTION = 0.75                # Was 0.5 — coarser = fewer cells = faster updates
+# Occupancy Grid
+GRID_SIZE = 16
+GRID_RESOLUTION = 0.75
 GRID_MAX_RANGE = 12.0
 
-# Movement Limits
-V_MAX = 2.00
+# Movement Limits — MINIMUM VELOCITY
+V_MAX = 1.0                           # Was 2.0 — more realistic for indoor robot
+V_MIN_FORWARD = 0.15                  # ALWAYS move forward at least this fast
 W_MAX = 3.0
 V_MIN_REVERSE = -0.05
-MIN_TURN_RADIUS = 0.40                    # Was 0.20 — more car-like, physically harder to spin
-W_STOPPED_LIMIT = 0.6                     # Max angular vel when nearly stopped (was W_MAX*0.5=1.5)
+MIN_TURN_RADIUS = 0.40                # At V_MIN=0.15, max_w = 0.15/0.4 = 0.375 rad/s
+                                      # Full rotation at min speed: 17 seconds. Not worth it.
 
 # Velocity smoothing
-CMD_SMOOTHING_ALPHA = 0.75            # Was 0.6 — more responsive
+CMD_SMOOTHING_ALPHA = 0.75
 
 # PER Config
 PER_ALPHA = 0.6
@@ -165,22 +166,22 @@ PER_EPSILON = 1e-6
 VISIT_DECAY = 0.995
 NOVELTY_RADIUS = 1.0
 
-# LiDAR — REDUCED
+# LiDAR
 LIDAR_FORWARD_OFFSET_RAD = math.pi
-NUM_LIDAR_BINS = 36                   # Was 60 — agent doesn't need sub-10° precision
+NUM_LIDAR_BINS = 36
 LIDAR_MAX_RANGE = 20.0
 
-# Training defaults — OPTIMIZED
-DEFAULT_START_STEPS = 5000            # Was 10000 — TD3 doesn't need that much random
+# Training defaults
+DEFAULT_START_STEPS = 5000
 DEFAULT_EXPL_NOISE = 0.3
-DEFAULT_UPDATE_EVERY = 4              # Was 1 — 75% less training compute
-DEFAULT_BATCH_SIZE = 256              # Was 512 — TD3 stable at smaller batches
-DEFAULT_REPLAY_SIZE = 150_000         # Was 300k — episodes are short
-DEFAULT_SAVE_EVERY = 25_000           # Was 10k — saving replay is expensive I/O
+DEFAULT_UPDATE_EVERY = 4
+DEFAULT_BATCH_SIZE = 256
+DEFAULT_REPLAY_SIZE = 150_000
+DEFAULT_SAVE_EVERY = 25_000
 
 # Compute caching intervals
-OCC_GRID_UPDATE_INTERVAL = 3          # Update occupancy grid every N steps
-FRONTIER_CACHE_INTERVAL = 15          # Recompute frontier direction every N steps
+OCC_GRID_UPDATE_INTERVAL = 1          # Every step — discovery + revisit need tight signal
+FRONTIER_CACHE_INTERVAL = 10          # Frontier direction updates more often too
 
 # Debug
 DEBUG_EVERY_N = 100
@@ -775,41 +776,25 @@ class EgoOccupancyGrid:
 
 
 # =============================================================================
-# Curriculum Tracker — performance-based phase transitions
+# Curriculum Tracker — simple 2-phase
 # =============================================================================
 
 class CurriculumTracker:
-    """Tracks episode metrics for performance-based curriculum transitions."""
+    """Phase 1: bumps hurt but don't end episode. Phase 2: collisions terminate."""
 
     def __init__(self):
         self.phase = 1
-        self.episode_lengths: deque = deque(maxlen=max(PHASE1_TO_2_WINDOW, PHASE2_TO_3_WINDOW))
-        self.collision_flags: deque = deque(maxlen=PHASE2_TO_3_WINDOW)
+        self.episode_lengths: deque = deque(maxlen=50)
+        self.collision_flags: deque = deque(maxlen=50)
 
     def record_episode(self, length: int, was_collision: bool):
         self.episode_lengths.append(length)
         self.collision_flags.append(1 if was_collision else 0)
 
     def check_transition(self, total_steps: int) -> int:
-        """Returns current phase (1, 2, or 3)."""
-        if self.phase == 1:
-            # Transition to phase 2: avg episode length > threshold OR fallback
-            if total_steps >= CURRICULUM_PHASE1_FALLBACK:
-                self.phase = 2
-            elif len(self.episode_lengths) >= PHASE1_TO_2_WINDOW:
-                avg_len = np.mean(list(self.episode_lengths)[-PHASE1_TO_2_WINDOW:])
-                if avg_len >= PHASE1_TO_2_AVG_EP_LEN:
-                    self.phase = 2
-
-        if self.phase == 2:
-            # Transition to phase 3: collision rate < threshold OR fallback
-            if total_steps >= CURRICULUM_PHASE2_FALLBACK:
-                self.phase = 3
-            elif len(self.collision_flags) >= PHASE2_TO_3_WINDOW:
-                collision_rate = np.mean(list(self.collision_flags)[-PHASE2_TO_3_WINDOW:])
-                if collision_rate < PHASE2_TO_3_COLLISION_RATE:
-                    self.phase = 3
-
+        """Returns current phase (1 or 2)."""
+        if self.phase == 1 and total_steps >= CURRICULUM_PHASE1_STEPS:
+            self.phase = 2
         return self.phase
 
 
@@ -1024,12 +1009,7 @@ class StretchExploreEnv(gym.Env):
         self._cached_frontier_angle = 0.0
         self._cached_new_cells = 0
 
-        # Anti-gaming: heading tracking for efficiency ratio
-        self._heading_changes = deque(maxlen=HEADING_WINDOW)
-        self._step_displacements = deque(maxlen=HEADING_WINDOW)
-        self._last_yaw = 0.0
-
-        # Anti-gaming: ratchet progress for goal-seeking
+        # Ratchet progress for goal-seeking
         self._best_goal_dist = float('inf')
 
         # Observation space: lidar(36) + goal(5) + vel(2) + prev_act(2) + has_goal(1) + grid(256) + frontier(2) + novelty(1)
@@ -1052,7 +1032,8 @@ class StretchExploreEnv(gym.Env):
         self.ros.get_logger().info("[ENV] Waiting for sensors...")
         self.ros.wait_for_sensors()
         self.ros.get_logger().info(f"[ENV] Observation dim: {obs_dim} (was 664)")
-        self.ros.get_logger().info(f"[ENV] NO SAFETY OVERRIDE — RL has full control")
+        self.ros.get_logger().info(f"[ENV] v4 MINIMUM VELOCITY — always forward {V_MIN_FORWARD}-{V_MAX} m/s")
+        self.ros.get_logger().info(f"[ENV] Rewards: discovery+revisit(explore), proximity(always), progress+step(goal)")
 
     def reset(self, *, seed=None, options=None):
         super().reset(seed=seed)
@@ -1073,12 +1054,9 @@ class StretchExploreEnv(gym.Env):
         self._cached_frontier_angle = 0.0
         self._cached_new_cells = 0
         self._best_goal_dist = float('inf')
-        self._heading_changes.clear()
-        self._step_displacements.clear()
 
         st = self._get_robot_state()
         self._last_pos = (st["x"], st["y"])
-        self._last_yaw = st["yaw"]
 
         self.occ_grid.reset()
         if not sim_was_reset:
@@ -1108,16 +1086,14 @@ class StretchExploreEnv(gym.Env):
     def step(self, action: np.ndarray):
         a = np.clip(action, -1.0, 1.0)
 
-        # Linear velocity: agent can choose 0 to V_MAX
-        # a[0] = -1 → 0 (stopped), a[0] = +1 → V_MAX
-        rl_v = (float(a[0]) + 1.0) * 0.5 * V_MAX
+        # Linear velocity: ALWAYS forward, V_MIN_FORWARD to V_MAX
+        # a[0] = -1 → V_MIN_FORWARD (slow crawl), a[0] = +1 → V_MAX (full speed)
+        rl_v = V_MIN_FORWARD + (float(a[0]) + 1.0) * 0.5 * (V_MAX - V_MIN_FORWARD)
 
-        # Angular velocity: turn radius couples steering to speed
-        if rl_v > 0.05:
-            w_limit = min(rl_v / MIN_TURN_RADIUS, W_MAX)
-        else:
-            # When nearly stopped, only allow slow rotation
-            w_limit = W_STOPPED_LIMIT
+        # Angular velocity: coupled to speed via turn radius
+        # At V_MIN_FORWARD=0.15: max_w = 0.15/0.40 = 0.375 rad/s (17s per full rotation)
+        # At V_MAX=1.0: max_w = min(1.0/0.40, 3.0) = 2.5 rad/s (responsive steering)
+        w_limit = min(rl_v / MIN_TURN_RADIUS, W_MAX)
         rl_w = float(a[1]) * w_limit
 
         # Smooth
@@ -1177,18 +1153,16 @@ class StretchExploreEnv(gym.Env):
             self._episode_had_collision = True
 
             if phase == 1:
+                # Phase 1: bump penalty, no termination — learn to explore
                 if self._collision_cooldown <= 0:
                     reward += R_COLLISION_PHASE1
                     reward_terms["collision"] = R_COLLISION_PHASE1
                     self._collision_cooldown = COLLISION_COOLDOWN_STEPS
-            elif phase == 2:
+            else:
+                # Phase 2: full penalty + termination — learn to avoid
                 terminated = True
                 reward += R_COLLISION_PHASE2
                 reward_terms["collision"] = R_COLLISION_PHASE2
-            else:
-                terminated = True
-                reward += R_COLLISION_PHASE3
-                reward_terms["collision"] = R_COLLISION_PHASE3
 
         # Goal reached
         has_goal = self.ros.last_goal is not None
@@ -1216,30 +1190,27 @@ class StretchExploreEnv(gym.Env):
             reward_terms["timeout"] = R_TIMEOUT
 
         # ============================================================
-        # SHAPING REWARDS — v3
+        # REWARDS — v4 (behavior-aligned)
         #
-        # 1. ONE positive reward per mode (progress OR discovery)
-        # 2. Step cost = time pressure
-        # 3. Velocity penalty = makes slow driving painful (solves mid-ep collapse)
-        # 4. Heading efficiency = anti-spin and anti-circle (lowered threshold)
+        # 1. EXPLORE: discovery + revisit penalty + step cost
+        # 2. AVOID:   proximity cost (always active)
+        # 3. GOAL:    ratchet progress + high step cost
         # ============================================================
 
         if not terminated and not truncated:
-            # --- Track heading change for efficiency ratio ---
-            heading_delta = abs(wrap_to_pi(st["yaw"] - self._last_yaw))
-            dx_step = st["x"] - self._last_pos[0]
-            dy_step = st["y"] - self._last_pos[1]
-            step_displacement = math.hypot(dx_step, dy_step)
-
-            self._heading_changes.append(heading_delta)
-            self._step_displacements.append(step_displacement)
             self._last_pos = (st["x"], st["y"])
-            self._last_yaw = st["yaw"]
 
-            # ---- MODE-SPECIFIC REWARD (one positive signal) ----
+            # --- PROXIMITY COST (always active, both modes) ---
+            # Continuous gradient teaching obstacle clearance
+            if min_dist < PROXIMITY_THRESHOLD:
+                proximity_ratio = 1.0 - (min_dist / PROXIMITY_THRESHOLD)
+                r_proximity = R_PROXIMITY * proximity_ratio
+                reward += r_proximity
+                reward_terms["proximity"] = r_proximity
 
             if has_goal:
-                # GOAL MODE: ratchet progress + step cost
+                # --- GOAL MODE: ratchet progress + high step cost ---
+                # Priority #3: shortest path to target
                 if d_goal < self._best_goal_dist:
                     ratchet_progress = self._best_goal_dist - d_goal
                     r_progress = PROGRESS_SCALE * ratchet_progress
@@ -1249,42 +1220,28 @@ class StretchExploreEnv(gym.Env):
 
                 reward_terms["progress"] = r_progress
                 reward += r_progress
-                reward += STEP_COST
-                reward_terms["step"] = STEP_COST
+                reward += STEP_COST_GOAL
+                reward_terms["step"] = STEP_COST_GOAL
             else:
-                # EXPLORE MODE: discovery + step cost
+                # --- EXPLORE MODE: discovery + revisit penalty + step cost ---
+                # Priority #1: go to new areas, avoid revisiting old ones
+
+                # Discovery: fires once per cell, persists across episodes
                 r_discovery = R_NEW_CELL * self._cached_new_cells
                 reward_terms["discovery"] = r_discovery
                 reward += r_discovery
+
+                # Revisit penalty: active repulsion from visited areas
+                # novelty=1.0 (never visited) → 0 penalty
+                # novelty≈0 (heavily visited) → -R_REVISIT per step
+                # visit_counts persist across episodes → forces new routes
+                novelty = self.occ_grid.get_novelty(st["x"], st["y"])
+                r_revisit = R_REVISIT * (1.0 - novelty)
+                reward += r_revisit
+                reward_terms["revisit"] = r_revisit
+
                 reward += R_STEP_EXPLORE
                 reward_terms["step"] = R_STEP_EXPLORE
-
-            # ---- VELOCITY PENALTY (always active) ----
-            # Uses COMMANDED velocity (rl_v), not actual.
-            # The agent chose to go slow — that's what we penalize.
-            # Scales linearly: full penalty at v=0, zero at V_COMFORT+
-            speed_ratio = min(rl_v / V_COMFORT, 1.0)  # 0.0 (stopped) to 1.0 (comfortable)
-            r_slow = R_SLOW_PENALTY * (1.0 - speed_ratio)
-            if r_slow < -0.01:  # Only log when meaningful
-                reward += r_slow
-                reward_terms["slow"] = r_slow
-
-            # ---- HEADING EFFICIENCY (anti-spin + anti-circle) ----
-            # ratio = total_radians_turned / total_meters_moved over window
-            # For circular motion: ratio = 1/radius_meters
-            #   0.67m circle → 1.5 (at threshold)
-            #   1.0m circle → 1.0 (below threshold, OK)
-            #   Spinning in place → ∞ (heavy penalty)
-            if len(self._heading_changes) >= 5:
-                cum_heading = sum(self._heading_changes)
-                cum_disp = max(sum(self._step_displacements), 0.01)
-                heading_ratio = cum_heading / cum_disp
-
-                if heading_ratio > HEADING_RATIO_THRESHOLD:
-                    excess = heading_ratio - HEADING_RATIO_THRESHOLD
-                    r_heading = R_HEADING_WASTE * min(excess / HEADING_RATIO_THRESHOLD, 3.0)
-                    reward += r_heading
-                    reward_terms["heading_waste"] = r_heading
 
         # ============================================================
         # BOOKKEEPING
@@ -1786,8 +1743,10 @@ def main():
     env = StretchExploreEnv(ros)
 
     ros.get_logger().info(f"[AGENT] device={device} obs_dim={obs_dim} act_dim={act_dim}")
-    ros.get_logger().info(f"[AGENT] NO SAFETY OVERRIDE — RL learns from raw consequences")
-    ros.get_logger().info(f"[AGENT] Optimized: no RND, smaller obs, cached frontier, update-every={args.update_every}")
+    ros.get_logger().info(f"[AGENT] v4: min_velocity={V_MIN_FORWARD}, turn_radius={MIN_TURN_RADIUS}")
+    ros.get_logger().info(f"[AGENT] 2-phase curriculum: P1=bump({CURRICULUM_PHASE1_STEPS} steps), P2=terminate")
+    ros.get_logger().info(f"[AGENT] Explore: discovery({R_NEW_CELL}) + revisit({R_REVISIT}) + step({R_STEP_EXPLORE})")
+    ros.get_logger().info(f"[AGENT] Goal: progress({PROGRESS_SCALE}) + step({STEP_COST_GOAL}) | Proximity: {R_PROXIMITY} below {PROXIMITY_THRESHOLD}m")
 
     agent = TD3AgentCNN(obs_dim, act_dim, device=device)
     replay = PrioritizedReplayBuffer(obs_dim, act_dim, size=args.replay_size, device=device)
@@ -1930,9 +1889,8 @@ def main():
         current_phase = env.curriculum.check_transition(env.total_steps)
         if current_phase != last_phase:
             phase_names = {
-                1: f"{G}Phase 1: LEARN TO EXPLORE{RST} (collisions = bump)",
-                2: f"{Y}Phase 2: LEARN TO AVOID{RST} (collisions end episode)",
-                3: f"{W}Phase 3: FULL DIFFICULTY{RST} (full collision penalty)",
+                1: f"{G}Phase 1: EXPLORE{RST} (collisions = bump, no termination)",
+                2: f"{W}Phase 2: FULL DIFFICULTY{RST} (collisions terminate, -100 penalty)",
             }
             ros.get_logger().info(
                 f"\n{W}{'='*50}\n  CURRICULUM → {phase_names[current_phase]}\n"
@@ -1943,8 +1901,8 @@ def main():
         # Action selection
         if t < args.start_steps:
             act = np.array([
-                np.random.uniform(-1.0, 1.0),  # Full range: stopped to full speed
-                np.random.uniform(-0.8, 0.8),
+                np.random.uniform(-1.0, 1.0),  # V_MIN_FORWARD to V_MAX (always forward)
+                np.random.uniform(-0.8, 0.8),   # Steering
             ], dtype=np.float32)
         else:
             act = agent.act(obs, noise_std=args.expl_noise)
