@@ -3,6 +3,7 @@ import os
 from pathlib import Path
 
 from ament_index_python.packages import get_package_share_directory
+from launch import LaunchDescription
 from launch.actions import (
     DeclareLaunchArgument,
     ExecuteProcess,
@@ -12,8 +13,6 @@ from launch.actions import (
 from launch.conditions import IfCondition
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
-
-from launch import LaunchDescription
 
 
 def generate_launch_description():
@@ -104,7 +103,7 @@ def generate_launch_description():
     ld.add_action(DeclareLaunchArgument("rollout_steps", default_value="2048"))
     ld.add_action(
         DeclareLaunchArgument(
-            "ckpt_dir", default_value=os.path.expanduser("~/rl_checkpoints")
+            "ckpt_dir", default_value=os.path.expanduser("~/parallel_training")
         )
     )
     ld.add_action(DeclareLaunchArgument("load_ckpt", default_value=""))

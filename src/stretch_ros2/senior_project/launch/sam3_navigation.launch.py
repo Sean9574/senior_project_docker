@@ -114,7 +114,7 @@ def generate_launch_description():
     ld.add_action(DeclareLaunchArgument("total_steps", default_value="200000"))
     ld.add_action(DeclareLaunchArgument("rollout_steps", default_value="2048"))
     ld.add_action(DeclareLaunchArgument(
-        "ckpt_dir", default_value=os.path.expanduser("~/rl_checkpoints")
+        "ckpt_dir", default_value=os.path.expanduser("~/parallel_training"),
     ))
     ld.add_action(DeclareLaunchArgument("load_ckpt", default_value=""))
     ld.add_action(DeclareLaunchArgument("headless", default_value="false"))
