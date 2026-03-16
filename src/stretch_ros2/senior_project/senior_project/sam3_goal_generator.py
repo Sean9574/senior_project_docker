@@ -257,6 +257,13 @@ class SAM3GoalGeneratorV2(Node):
         self.goal_sent = False
         self._goal_published_this_detection = False  # Only publish goal once per detection
 
+        # --- Goal locking: compute once, hold until reached/lost ---
+        self._locked_goal: Optional[Tuple[float, float]] = None  # (x, y) in odom frame
+        self._locked_goal_object_pos: Optional[Tuple[float, float]] = None
+        self._locked_goal_time: float = 0.0
+        self._locked_goal_sam3_id: Optional[int] = None  # track which SAM3 result produced the lock
+        self._sam3_result_counter: int = 0  # increments on each new SAM3 result
+
         self.depth_camera_available = False
         self._last_depth_msg_time = 0.0
         self.depth_stale_sec = 1.0
@@ -523,13 +530,17 @@ class SAM3GoalGeneratorV2(Node):
     def target_callback(self, msg: String):
         self.target = msg.data
         self.goal_sent = False
-        self._goal_published_this_detection = False  # Reset so new target gets a goal
+        self._goal_published_this_detection = False
+        self._locked_goal = None  # Clear locked goal for new target
+        self._locked_goal_object_pos = None
         self.set_sam3_prompt(self.target)
         self.get_logger().info(f'Target changed to: "{self.target}"')
     
     def goal_reached_callback(self, msg: PointStamped):
         """Called when learner node reports goal reached - cycle to next target."""
-        self._goal_published_this_detection = False  # Reset for next detection
+        self._goal_published_this_detection = False
+        self._locked_goal = None  # Clear locked goal on reach
+        self._locked_goal_object_pos = None
         if self.target_cycle_on_reach and len(self.target_list) > 1:
             self.cycle_target()
     
@@ -543,7 +554,9 @@ class SAM3GoalGeneratorV2(Node):
         
         self.target = new_target
         self.goal_sent = False
-        self._goal_published_this_detection = False  # Reset so new target gets a goal
+        self._goal_published_this_detection = False
+        self._locked_goal = None  # Clear locked goal for new target
+        self._locked_goal_object_pos = None
         self.set_sam3_prompt(self.target)
         self.get_logger().info(f'[CYCLE] Target cycled to: "{self.target}" ({self.current_target_index + 1}/{len(self.target_list)})')
 
@@ -863,8 +876,6 @@ class SAM3GoalGeneratorV2(Node):
         marker.color.a = 0.8
         self.marker_pub.publish(marker)
 
-        self.get_logger().info(f'Goal published: ({x:.2f}, {y:.2f})')
-
     # ==================== Main loop ====================
 
     def viz_callback(self):
@@ -927,6 +938,7 @@ class SAM3GoalGeneratorV2(Node):
                 result['_scale_factor'] = scale_factor
                 with self._sam3_lock:
                     self._last_sam3_result = result
+                    self._sam3_result_counter += 1
             except Exception as e:
                 self.get_logger().warn(f'SAM3 request failed: {e}')
             finally:
@@ -940,6 +952,7 @@ class SAM3GoalGeneratorV2(Node):
         
         with self._sam3_lock:
             result = getattr(self, '_last_sam3_result', None)
+            current_sam3_id = self._sam3_result_counter
         
         # Initialize visualization with current frame
         viz_base = rgb.copy()
@@ -1052,17 +1065,41 @@ class SAM3GoalGeneratorV2(Node):
             self._last_detect_log_time = now
 
         if best_detection:
-            dx = best_detection['odom_x'] - self.robot_x
-            dy = best_detection['odom_y'] - self.robot_y
-            dist_to_obj = math.sqrt(dx * dx + dy * dy)
+            # Only compute a NEW goal position when this is a NEW SAM3 result
+            # (not a stale result being re-rendered on a viz frame)
+            is_new_sam3 = (current_sam3_id != self._locked_goal_sam3_id)
 
-            if dist_to_obj > self.goal_offset:
-                scale = (dist_to_obj - self.goal_offset) / dist_to_obj
-                goal_x = self.robot_x + dx * scale
-                goal_y = self.robot_y + dy * scale
-            else:
-                goal_x = best_detection['odom_x']
-                goal_y = best_detection['odom_y']
+            if is_new_sam3:
+                dx = best_detection['odom_x'] - self.robot_x
+                dy = best_detection['odom_y'] - self.robot_y
+                dist_to_obj = math.sqrt(dx * dx + dy * dy)
+
+                if dist_to_obj > self.goal_offset:
+                    scale = (dist_to_obj - self.goal_offset) / dist_to_obj
+                    goal_x = self.robot_x + dx * scale
+                    goal_y = self.robot_y + dy * scale
+                else:
+                    goal_x = best_detection['odom_x']
+                    goal_y = best_detection['odom_y']
+
+                # Validate and lock the goal
+                if not (math.isnan(goal_x) or math.isnan(goal_y) or
+                        math.isinf(goal_x) or math.isinf(goal_y)):
+                    self._locked_goal = (goal_x, goal_y)
+                    self._locked_goal_object_pos = (best_detection['odom_x'], best_detection['odom_y'])
+                    self._locked_goal_time = time.time()
+                    self._locked_goal_sam3_id = current_sam3_id
+
+                    self.get_logger().info(
+                        f'[GOAL] Locked goal at ({goal_x:.2f}, {goal_y:.2f}), '
+                        f'dist={best_detection["distance"]:.2f}m, conf={best_detection["score"]:.2f}'
+                    )
+                else:
+                    self.get_logger().warn(f'[GOAL] Invalid goal coordinates: ({goal_x}, {goal_y})')
+
+            # Publish the LOCKED goal (same position every frame, no drift)
+            if self.auto_publish and self._locked_goal is not None:
+                self.publish_goal(self._locked_goal[0], self._locked_goal[1])
 
             status = {
                 'found': True,
@@ -1071,36 +1108,20 @@ class SAM3GoalGeneratorV2(Node):
                 'confidence': best_detection['score'],
                 'depth_method': best_detection['method'],
                 'available_methods': depth_status,
-                'object_position': [best_detection['odom_x'], best_detection['odom_y']],
-                'goal_position': [float(goal_x), float(goal_y)]
+                'object_position': list(self._locked_goal_object_pos) if self._locked_goal_object_pos else [0, 0],
+                'goal_position': list(self._locked_goal) if self._locked_goal else [0, 0],
             }
-
-            # CONTINUOUSLY publish goal while target is visible
-            # The learner uses this to track the goal position
-            if self.auto_publish:
-                # Validate goal coordinates
-                if not (math.isnan(goal_x) or math.isnan(goal_y) or 
-                        math.isinf(goal_x) or math.isinf(goal_y)):
-                    self.publish_goal(goal_x, goal_y)
-                    
-                    # Log periodically (not every frame)
-                    if not hasattr(self, '_last_goal_log_time'):
-                        self._last_goal_log_time = 0.0
-                    now = time.time()
-                    if now - self._last_goal_log_time > 2.0:  # Log every 2 seconds
-                        self.get_logger().info(
-                            f'[GOAL] Publishing goal at ({goal_x:.2f}, {goal_y:.2f}), '
-                            f'dist={best_detection["distance"]:.2f}m, conf={best_detection["score"]:.2f}'
-                        )
-                        self._last_goal_log_time = now
-                else:
-                    self.get_logger().warn(f'[GOAL] Invalid goal coordinates: ({goal_x}, {goal_y})')
         else:
+            # No detection — keep publishing locked goal if we have one (object temporarily occluded)
+            if self.auto_publish and self._locked_goal is not None:
+                self.publish_goal(self._locked_goal[0], self._locked_goal[1])
+
             status = {
                 'found': False,
                 'target': prompt,
                 'available_methods': depth_status,
-                'message': 'Object not found in valid range'
+                'message': 'Object not found in valid range',
+                'locked_goal': list(self._locked_goal) if self._locked_goal else None,
             }
 
         self.status_pub.publish(String(data=json.dumps(status)))

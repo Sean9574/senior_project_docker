@@ -38,6 +38,7 @@ import sys
 import time
 from collections import deque
 from dataclasses import dataclass
+from enum import Enum
 from typing import Dict, List, Optional, Tuple
 
 import gymnasium as gym
@@ -148,6 +149,9 @@ DEFAULT_UPDATE_EVERY = 4
 DEFAULT_BATCH_SIZE = 256
 DEFAULT_REPLAY_SIZE = 150_000
 DEFAULT_SAVE_EVERY = 25_000
+
+# Expert demonstration phase
+DEFAULT_DEMO_STEPS = 10_000  # State machine drives for this many steps first
 
 # Compute caching intervals
 OCC_GRID_UPDATE_INTERVAL = 1
@@ -302,6 +306,154 @@ class DynamicNavigator:
         elif min_distance >= ZONE_DANGER: return "DANGER"
         elif min_distance >= ZONE_EMERGENCY: return "EMERGENCY"
         else: return "CRITICAL"
+
+
+# =============================================================================
+# Expert State Machine — reactive controller for demonstration phase
+# =============================================================================
+
+class ExpertStateMachine:
+    """
+    Simple reactive controller that uses lidar to navigate.
+    Produces actions in the same [-1, 1] action space as the RL agent.
+    
+    States:
+      DRIVE_FORWARD  — open space ahead, go straight
+      TURN_TO_GOAL   — goal visible, steer toward it
+      AVOID_LEFT     — obstacle on right or ahead, turn left
+      AVOID_RIGHT    — obstacle on left or ahead, turn right
+      BACK_UP        — too close everywhere, reverse briefly
+    
+    The state machine's rewards are tracked separately so you can compare
+    when the RL agent surpasses the expert baseline.
+    """
+
+    class State(Enum):
+        DRIVE_FORWARD = "DRIVE_FORWARD"
+        TURN_TO_GOAL = "TURN_TO_GOAL"
+        AVOID_LEFT = "AVOID_LEFT"
+        AVOID_RIGHT = "AVOID_RIGHT"
+        BACK_UP = "BACK_UP"
+
+    def __init__(self):
+        self.state = self.State.DRIVE_FORWARD
+        self._backup_steps = 0
+        self._backup_duration = 8  # steps to back up
+        
+        # Performance tracking (for baseline comparison)
+        self.episode_return = 0.0
+        self.episode_steps = 0
+        self.total_episodes = 0
+        self.episode_returns: deque = deque(maxlen=100)
+        self.total_goals_reached = 0
+
+    def reset_episode(self):
+        """Call at episode boundary to track per-episode stats."""
+        if self.episode_steps > 0:
+            self.episode_returns.append(self.episode_return)
+            self.total_episodes += 1
+        self.episode_return = 0.0
+        self.episode_steps = 0
+        self.state = self.State.DRIVE_FORWARD
+        self._backup_steps = 0
+
+    def track_reward(self, reward: float, success: bool = False):
+        self.episode_return += reward
+        self.episode_steps += 1
+        if success:
+            self.total_goals_reached += 1
+
+    def get_avg_return(self) -> float:
+        if len(self.episode_returns) == 0:
+            return 0.0
+        return float(sum(self.episode_returns) / len(self.episode_returns))
+
+    def act(self, nav_state: Optional[NavigationState],
+            goal_angle: float, goal_dist: float,
+            has_goal: bool) -> np.ndarray:
+        """
+        Produce an action in [-1, 1] x [-1, 1] space matching the RL agent.
+        
+        a[0]: velocity  — maps to V_MIN_FORWARD..V_MAX (explore) or 0..V_MAX (goal)
+        a[1]: steering  — maps to -w_limit..+w_limit
+        
+        Returns normalized action in [-1, 1].
+        """
+        if nav_state is None:
+            # No sensor data — stop
+            return np.array([-1.0, 0.0], dtype=np.float32)
+
+        min_d = nav_state.min_distance
+        front = nav_state.front_clearance
+        left = nav_state.left_clearance
+        right = nav_state.right_clearance
+
+        # --- State transitions ---
+        if self.state == self.State.BACK_UP:
+            self._backup_steps += 1
+            if self._backup_steps >= self._backup_duration:
+                self._backup_steps = 0
+                # After backing up, turn toward the more open side
+                if left > right:
+                    self.state = self.State.AVOID_LEFT
+                else:
+                    self.state = self.State.AVOID_RIGHT
+        elif min_d < ZONE_EMERGENCY:
+            # Too close — back up
+            self.state = self.State.BACK_UP
+            self._backup_steps = 0
+        elif front < ZONE_CAUTION:
+            # Something ahead — avoid
+            if left > right:
+                self.state = self.State.AVOID_LEFT
+            else:
+                self.state = self.State.AVOID_RIGHT
+        elif has_goal and goal_dist > GOAL_RADIUS:
+            self.state = self.State.TURN_TO_GOAL
+        elif front < ZONE_AWARE:
+            # Getting close, gentle avoidance
+            if left > right:
+                self.state = self.State.AVOID_LEFT
+            else:
+                self.state = self.State.AVOID_RIGHT
+        else:
+            self.state = self.State.DRIVE_FORWARD
+
+        # --- Action generation ---
+        if self.state == self.State.BACK_UP:
+            # Reverse slowly, turn toward open space
+            a_vel = -1.0  # maps to minimum/reverse velocity
+            turn = 0.5 if left > right else -0.5
+            a_steer = np.clip(turn, -1.0, 1.0)
+
+        elif self.state == self.State.AVOID_LEFT:
+            # Slow down, turn left (positive steering)
+            danger_factor = np.clip(1.0 - (front / ZONE_FREE), 0.0, 1.0)
+            a_vel = np.clip(0.3 - danger_factor * 0.6, -1.0, 1.0)
+            a_steer = np.clip(0.4 + danger_factor * 0.5, 0.0, 1.0)
+
+        elif self.state == self.State.AVOID_RIGHT:
+            # Slow down, turn right (negative steering)
+            danger_factor = np.clip(1.0 - (front / ZONE_FREE), 0.0, 1.0)
+            a_vel = np.clip(0.3 - danger_factor * 0.6, -1.0, 1.0)
+            a_steer = np.clip(-0.4 - danger_factor * 0.5, -1.0, 0.0)
+
+        elif self.state == self.State.TURN_TO_GOAL:
+            # Proportional steering toward goal, speed based on alignment
+            steer = np.clip(goal_angle / (math.pi / 2), -1.0, 1.0)
+            alignment = 1.0 - abs(steer)  # 1.0 when facing goal, 0.0 when perpendicular
+            # Go faster when well-aligned, slower when turning hard
+            a_vel = np.clip(0.2 + 0.7 * alignment, -1.0, 1.0)
+            a_steer = steer
+
+        else:  # DRIVE_FORWARD
+            a_vel = 0.8  # Cruise speed
+            # Gentle bias toward more open side for exploration
+            side_bias = (left - right) / max(left + right, 0.1)
+            a_steer = np.clip(side_bias * 0.15, -0.3, 0.3)
+
+        action = np.array([float(a_vel), float(a_steer)], dtype=np.float32)
+        return np.clip(action, -1.0, 1.0)
 
 
 # =============================================================================
@@ -1661,6 +1813,7 @@ def main():
     parser.add_argument("--replay-size", type=int, default=DEFAULT_REPLAY_SIZE)
     parser.add_argument("--expl-noise", type=float, default=DEFAULT_EXPL_NOISE)
     parser.add_argument("--save-every", type=int, default=DEFAULT_SAVE_EVERY)
+    parser.add_argument("--demo-steps", type=int, default=DEFAULT_DEMO_STEPS)
 
     parser.add_argument("--ckpt-dir", type=str, default=os.path.expanduser("~/parallel_training"))
     parser.add_argument("--seed", type=int, default=42)
@@ -1699,7 +1852,8 @@ def main():
 
     ros.get_logger().info(f"[AGENT] device={device} obs_dim={obs_dim} act_dim={act_dim}")
     ros.get_logger().info(f"[AGENT] v5: explore_velocity={V_MIN_FORWARD}-{V_MAX}, goal_velocity=0-{V_MAX}")
-    ros.get_logger().info(f"[AGENT] NO CURRICULUM — collisions never terminate (bump={R_COLLISION}, cooldown={COLLISION_COOLDOWN_STEPS})")
+    ros.get_logger().info(f"[AGENT] Expert demo phase: {args.demo_steps} steps, then RL takes over")
+    ros.get_logger().info(f"[AGENT] Collisions never terminate (bump={R_COLLISION}, cooldown={COLLISION_COOLDOWN_STEPS})")
     ros.get_logger().info(f"[AGENT] Explore: discovery({R_NEW_CELL}) + revisit({R_REVISIT}) + step({R_STEP_EXPLORE})")
     ros.get_logger().info(f"[AGENT] Goal: progress({PROGRESS_SCALE}) + step({STEP_COST_GOAL}) | Proximity: {R_PROXIMITY} below {PROXIMITY_THRESHOLD}m")
 
@@ -1812,31 +1966,59 @@ def main():
                 done = term or trunc
 
     start_step = resume_step + 1
+    demo_steps = args.demo_steps
+    expert = ExpertStateMachine()
+
+    # Determine if we're resuming past the demo phase
+    demo_already_done = (start_step > demo_steps)
+
     ros.get_logger().info(
         f"\n{G}{'='*50}\n  TRAINING STARTED\n{'='*50}{RST}\n"
         f"  Resume from: step {start_step}\n"
         f"  Replay: {replay.count} transitions\n"
         f"  Target: {args.total_steps} steps\n"
+        f"  Expert demo: {'SKIPPED (already done)' if demo_already_done else f'first {demo_steps} steps'}\n"
+        f"  RL random exploration: steps {demo_steps+1}–{demo_steps + args.start_steps}\n"
+        f"  RL policy active from: step {demo_steps + args.start_steps}\n"
         f"  Update every: {args.update_every} steps\n"
         f"  Batch size: {args.batch_size}\n"
         f"{G}{'='*50}{RST}"
     )
 
     obs, _ = env.reset()
+    if not demo_already_done:
+        expert.reset_episode()
 
     for t in range(start_step, args.total_steps + 1):
         shutdown_and_save._current_step = t
 
-        if t < args.start_steps:
+        # === Phase 1: Expert state machine drives (first demo_steps steps) ===
+        if t <= demo_steps:
+            # Get nav state and goal info for the expert
+            nav_state = env.last_nav_state
+            has_goal = env.ros.last_goal is not None
+            goal_angle = env._goal_angle() if has_goal else 0.0
+            goal_dist = env._goal_distance() if has_goal else 0.0
+
+            act = expert.act(nav_state, goal_angle, goal_dist, has_goal)
+
+        # === Phase 2: Random exploration (demo_steps < t < demo_steps + start_steps) ===
+        elif t < demo_steps + args.start_steps:
             act = np.array([
                 np.random.uniform(-1.0, 1.0),
                 np.random.uniform(-0.8, 0.8),
             ], dtype=np.float32)
+
+        # === Phase 3: RL policy ===
         else:
             act = agent.act(obs, noise_std=args.expl_noise)
 
         next_obs, reward, terminated, truncated, info = env.step(act)
         done = terminated or truncated
+
+        # Track expert rewards for baseline comparison
+        if t <= demo_steps:
+            expert.track_reward(reward, success=info.get("success", False))
 
         replay.add(
             obs, act,
@@ -1847,7 +2029,32 @@ def main():
         obs = next_obs
 
         if done:
+            # Log expert vs RL comparison
+            if t <= demo_steps:
+                expert_avg = expert.get_avg_return()
+                ros.get_logger().info(
+                    f"[EXPERT] ep={expert.total_episodes} "
+                    f"return={expert.episode_return:+.1f} "
+                    f"avg_return={expert_avg:+.1f} "
+                    f"goals={expert.total_goals_reached} "
+                    f"state={expert.state.value}"
+                )
+                expert.reset_episode()
+            elif t > demo_steps and expert.total_episodes > 0:
+                # After expert phase, log RL vs expert baseline periodically
+                if env.episode_index % 10 == 0:
+                    expert_avg = expert.get_avg_return()
+                    rl_avg = env.episode_return  # current episode return
+                    ros.get_logger().info(
+                        f"{B}[COMPARE]{RST} Expert baseline avg: {Y}{expert_avg:+.1f}{RST} | "
+                        f"RL episode return: {G if rl_avg > expert_avg else R}{rl_avg:+.1f}{RST} | "
+                        f"{'RL WINNING' if rl_avg > expert_avg else 'Expert still better'}"
+                    )
+
             obs, _ = env.reset()
+            if t <= demo_steps:
+                expert.reset_episode()
+
             save_weights_only(t, label="episode")
             if t - last_replay_save_step >= args.save_every:
                 save_replay_buffer()
@@ -1856,7 +2063,30 @@ def main():
                     f"[CKPT] {G}✓ replay buffer saved{RST} step={t} count={replay.count}"
                 )
 
-        if t >= args.update_after and t % args.update_every == 0 and replay.count >= args.batch_size:
+        # Log phase transition
+        if t == demo_steps:
+            expert_avg = expert.get_avg_return()
+            ros.get_logger().info(
+                f"\n{G}{'='*50}\n  EXPERT DEMO PHASE COMPLETE\n{'='*50}{RST}\n"
+                f"  Expert episodes: {expert.total_episodes}\n"
+                f"  Expert avg return: {expert_avg:+.1f}\n"
+                f"  Expert goals reached: {expert.total_goals_reached}\n"
+                f"  Replay buffer: {replay.count} transitions (all expert)\n"
+                f"  Switching to: random exploration for {args.start_steps} steps\n"
+                f"{G}{'='*50}{RST}"
+            )
+        elif t == demo_steps + args.start_steps:
+            ros.get_logger().info(
+                f"\n{G}{'='*50}\n  RL POLICY NOW ACTIVE\n{'='*50}{RST}\n"
+                f"  Expert baseline avg return: {expert.get_avg_return():+.1f}\n"
+                f"  Replay buffer: {replay.count} transitions\n"
+                f"  RL policy taking over with noise={args.expl_noise}\n"
+                f"{G}{'='*50}{RST}"
+            )
+
+        # Don't start updating until we have enough data (expert demos count!)
+        update_after_step = min(args.update_after, demo_steps)
+        if t >= update_after_step and t % args.update_every == 0 and replay.count >= args.batch_size:
             beta = PER_BETA_START + (PER_BETA_END - PER_BETA_START) * (t / args.total_steps)
             critic_loss, actor_loss = agent.update(replay, args.batch_size, beta)
 
