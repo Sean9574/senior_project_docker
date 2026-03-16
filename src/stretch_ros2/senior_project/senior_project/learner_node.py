@@ -1,29 +1,31 @@
 #!/usr/bin/env python3
 """
-Stretch Robot RL Environment + Learner — v4 (MINIMUM VELOCITY)
+Stretch Robot RL Environment + Learner — v5 (NEVER TERMINATE ON COLLISION)
 
-KEY DESIGN CHANGE: spinning is eliminated through the ACTION SPACE, not rewards.
-- a[0] maps V_MIN_FORWARD → V_MAX. Robot ALWAYS moves forward.
-- Turn radius constraint limits angular velocity proportional to speed.
-- At V_MIN_FORWARD=0.15 m/s, max angular = 0.375 rad/s → full spin takes 17 seconds.
-- Step cost makes 17-second spins deeply unprofitable.
-- No anti-spin penalties needed. No heading efficiency. No displacement gates.
+KEY INSIGHT: termination on collision teaches the agent that NOT MOVING is safest.
+The expected value of spinning (no collision risk) exceeds the expected value of
+exploring (collision risk → episode ends → lose all future reward).
 
-REWARDS (prioritized for 3 behaviors):
-1. EXPLORE: discovery(+) + revisit_penalty(-) + step_cost(-)  → go to new areas, avoid old
-2. AVOID:   proximity_cost(-)                                  → maintain clearance always
-3. GOAL:    ratchet_progress(+) + step_cost_high(-)            → shortest path to target
-- Terminal:  collision / goal / timeout                         (1 term)
-- Max active: 4 terms. Clean, behavior-aligned signals.
+FIX: collisions NEVER terminate. They're just a -5 bump + cooldown. The agent
+bumps a wall, eats -5, and keeps exploring. Proximity penalty teaches gradual
+avoidance. Discovery reward (+5/cell) massively dominates all penalties.
 
-CURRICULUM (2 phases):
-- Phase 1: collisions = small bump penalty, no termination (learn to explore)
-- Phase 2: collisions = terminate + heavy penalty (learn to avoid)
+ACTION SPACE (context-aware):
+- Explore mode: a[0] maps V_MIN_FORWARD → V_MAX (always moving, can't spin)
+- Goal mode:    a[0] maps 0 → V_MAX (can stop at target)
+- a[1] = steering, coupled to speed via turn radius
 
-EPISODE TERMINATION:
-- COLLISION (phase 2+): min LIDAR < 0.30m → terminate + penalty
-- GOAL REACHED: within 0.45m → terminate + big reward
-- TIMEOUT: max steps → terminate + small penalty
+REWARDS (exploration-dominant):
+- Explore: discovery(+5/cell) + revisit(-2.0) + step(-0.3)  → exploring >> spinning
+- Avoid:   proximity(-3.0) + bump(-5.0 with cooldown)       → learn to steer away
+- Goal:    ratchet_progress(+400) + step(-2.5)               → shortest path
+- NEVER terminate on collision. Only goal_reached and timeout end episodes.
+
+MATH (per step):
+- Spinning:              -0.3 - 2.0           = -2.3/step
+- Exploring (5 cells):   -0.3 + 0 + 25.0      = +24.7/step
+- Wall-stuck:            -0.3 - 2.0 - 3.0 - 0.6 = -5.9/step
+- Explore w/ 20% crash:  0.8*(+24.7)+0.2*(-5) = +18.8/step >> spinning
 """
 
 import argparse
@@ -76,60 +78,29 @@ ZONE_DANGER = 0.45
 ZONE_EMERGENCY = 0.30
 
 # =============================================================================
-# REWARD SYSTEM — v4 (BEHAVIOR-ALIGNED)
-#
-# Three behaviors, three reward clusters:
-#
-# 1. EXPLORE: discovery + revisit penalty + step cost
-#    - discovery: +3.0 per new cell (only fires once per cell, ever)
-#    - revisit:   -1.5 * (1 - novelty) — active repulsion from visited areas
-#    - step cost: -0.5/step — time pressure to keep exploring efficiently
-#    - world_grid + visit_counts persist across episodes → forces new routes
-#
-# 2. AVOID: proximity cost (always active, both modes)
-#    - Continuous penalty when min_distance < 0.65m
-#    - Scales linearly: closer = worse
-#    - Teaches clearance maintenance BEFORE collision threshold
-#
-# 3. GOAL: ratchet progress + higher step cost
-#    - progress: +400 * (distance_improved) — only new-best distances count
-#    - step cost: -2.5/step — strong pressure for shortest path
-#
-# Terminal: collision / goal / timeout
-# Max active: 4 terms.
+# REWARD SYSTEM — v5 (NEVER TERMINATE ON COLLISION)
 # =============================================================================
 
-# --- Curriculum (2 phases — simple) ---
-CURRICULUM_PHASE1_STEPS = 30_000      # Phase 1 duration (bump penalty, no termination)
-
-R_COLLISION_PHASE1 = -10.0            # Bump penalty (no termination) — enough to learn "walls hurt"
-R_COLLISION_PHASE2 = -100.0           # Full penalty + termination
-
+# --- Collision (NEVER terminates) ---
+R_COLLISION = -5.0
 COLLISION_COOLDOWN_STEPS = 8
 
 R_GOAL = 2000.0
 R_TIMEOUT = -50.0
 GOAL_RADIUS = 0.45
 
-# --- Goal-seeking (2 terms: ratchet progress + step cost) ---
+# --- Goal-seeking ---
 PROGRESS_SCALE = 400.0
-STEP_COST_GOAL = -2.5                 # Higher than explore — every step off shortest path costs
+STEP_COST_GOAL = -2.5
 
-# --- Exploration (2-3 terms: discovery + revisit penalty + step cost) ---
-R_NEW_CELL = 3.0
-R_STEP_EXPLORE = -0.5                 # Time pressure — explored areas are net negative
-R_REVISIT = -1.5                      # Active repulsion from visited cells
-                                      # novelty=1.0 (new area) → 0 penalty
-                                      # novelty≈0 (heavily visited) → -1.5/step
-                                      # Creates gradient: agent steered AWAY from known areas
+# --- Exploration (discovery-dominant) ---
+R_NEW_CELL = 5.0
+R_STEP_EXPLORE = -0.3
+R_REVISIT = -2.0
 
-# --- Obstacle avoidance (always active) ---
-R_PROXIMITY = -3.0                    # Proximity cost scaling
-PROXIMITY_THRESHOLD = 0.65            # Start penalizing below this (= ZONE_CAUTION)
-                                      # At 0.65m: penalty = 0
-                                      # At 0.45m: penalty = -0.9/step
-                                      # At 0.30m: collision terminates before this matters
-                                      # Teaches clearance BEFORE crashing
+# --- Obstacle avoidance (continuous, never terminates) ---
+R_PROXIMITY = -3.0
+PROXIMITY_THRESHOLD = 0.65
 
 # =============================================================================
 # GENERAL CONFIG
@@ -146,12 +117,11 @@ GRID_RESOLUTION = 0.75
 GRID_MAX_RANGE = 12.0
 
 # Movement Limits — MINIMUM VELOCITY
-V_MAX = 1.0                           # Was 2.0 — more realistic for indoor robot
-V_MIN_FORWARD = 0.15                  # ALWAYS move forward at least this fast
+V_MAX = 1.0
+V_MIN_FORWARD = 0.15
 W_MAX = 3.0
 V_MIN_REVERSE = -0.05
-MIN_TURN_RADIUS = 0.40                # At V_MIN=0.15, max_w = 0.15/0.4 = 0.375 rad/s
-                                      # Full rotation at min speed: 17 seconds. Not worth it.
+MIN_TURN_RADIUS = 0.40
 
 # Velocity smoothing
 CMD_SMOOTHING_ALPHA = 0.75
@@ -180,8 +150,8 @@ DEFAULT_REPLAY_SIZE = 150_000
 DEFAULT_SAVE_EVERY = 25_000
 
 # Compute caching intervals
-OCC_GRID_UPDATE_INTERVAL = 1          # Every step — discovery + revisit need tight signal
-FRONTIER_CACHE_INTERVAL = 10          # Frontier direction updates more often too
+OCC_GRID_UPDATE_INTERVAL = 1
+FRONTIER_CACHE_INTERVAL = 10
 
 # Debug
 DEBUG_EVERY_N = 100
@@ -392,13 +362,30 @@ class SumTree:
         self.capacity = capacity
         self.tree = np.zeros(2 * capacity - 1, dtype=np.float64)
         self.data_pointer = 0
+        self._update_count = 0
 
     def update(self, tree_idx: int, priority: float):
+        if np.isnan(priority) or np.isinf(priority) or priority < 0:
+            priority = 1e-8
         change = priority - self.tree[tree_idx]
         self.tree[tree_idx] = priority
         while tree_idx != 0:
             tree_idx = (tree_idx - 1) // 2
             self.tree[tree_idx] += change
+        self._update_count += 1
+        # Periodically rebuild parent nodes from leaves to correct float drift
+        if self._update_count % 10000 == 0:
+            self._rebuild_parents()
+
+    def _rebuild_parents(self):
+        """Recompute all internal nodes from leaf values to fix accumulated
+        floating-point drift in parent sums."""
+        for i in range(self.capacity - 2, -1, -1):
+            left = 2 * i + 1
+            right = left + 1
+            left_val = self.tree[left] if left < len(self.tree) else 0.0
+            right_val = self.tree[right] if right < len(self.tree) else 0.0
+            self.tree[i] = left_val + right_val
 
     def add(self, priority: float) -> int:
         tree_idx = self.data_pointer + self.capacity - 1
@@ -446,31 +433,81 @@ class PrioritizedReplayBuffer:
         self.tree = SumTree(self.size)
         self.max_priority = 1.0
 
+    def _uniform_fallback(self, batch_size: int):
+        """Fall back to uniform sampling and rebuild the tree."""
+        indices = np.random.randint(0, self.count, size=batch_size).astype(np.int32)
+        weights = np.ones(batch_size, dtype=np.float32)
+        self.max_priority = 1.0
+        self.tree = SumTree(self.size)
+        for _ in range(self.count):
+            self.tree.add(1.0)
+        return (
+            torch.as_tensor(self.obs[indices], device=self.device),
+            torch.as_tensor(self.acts[indices], device=self.device),
+            torch.as_tensor(self.rews[indices], device=self.device),
+            torch.as_tensor(self.next_obs[indices], device=self.device),
+            torch.as_tensor(self.done[indices], device=self.device),
+            torch.as_tensor(weights, device=self.device, dtype=torch.float32),
+            indices,
+        )
+
     def add(self, obs, act, rew, next_obs, done):
         self.obs[self.ptr] = obs
         self.acts[self.ptr] = act
         self.rews[self.ptr] = rew
         self.next_obs[self.ptr] = next_obs
         self.done[self.ptr] = done
+        if np.isnan(self.max_priority) or np.isinf(self.max_priority) or self.max_priority <= 0:
+            self.max_priority = 1.0
         priority = self.max_priority ** self.alpha
         self.tree.add(priority)
         self.ptr = (self.ptr + 1) % self.size
         self.count = min(self.count + 1, self.size)
 
     def sample(self, batch_size: int, beta: float = PER_BETA_START) -> Tuple:
+        if self.count < batch_size:
+            batch_size = self.count
+        if self.count == 0:
+            raise ValueError("Cannot sample from empty replay buffer")
+
         indices = np.zeros(batch_size, dtype=np.int32)
         priorities = np.zeros(batch_size, dtype=np.float32)
-        segment = self.tree.total_priority / batch_size
+        total = float(self.tree.total_priority)
+
+        # If tree is corrupted OR numerically dangerous, fall back to uniform sampling
+        # Keep TOTAL_MAX low enough that total/batch_size * batch_size stays well under
+        # float64 max (~1.8e308). With batch_size up to ~4096, 1e100 is very safe.
+        TOTAL_MAX = 1e100
+        use_uniform = (
+            not np.isfinite(total)
+            or total <= 0.0
+            or total > TOTAL_MAX
+        )
+
+        if use_uniform:
+            return self._uniform_fallback(batch_size)
+
+        segment = total / batch_size
+        if not np.isfinite(segment) or segment <= 0.0:
+            return self._uniform_fallback(batch_size)
+
         for i in range(batch_size):
             low = segment * i
             high = segment * (i + 1)
+
+            # Extra guard: if low/high overflow mid-loop, bail out safely
+            if not (np.isfinite(low) and np.isfinite(high) and high > low):
+                return self._uniform_fallback(batch_size)
+
             value = np.random.uniform(low, high)
             tree_idx, data_idx, priority = self.tree.get(value)
-            indices[i] = data_idx
-            priorities[i] = priority
-        probs = priorities / self.tree.total_priority
+            indices[i] = data_idx % self.count
+            priorities[i] = max(priority, 1e-8)
+
+        probs = priorities / max(self.tree.total_priority, 1e-8)
         weights = (self.count * probs) ** (-beta)
-        weights = weights / weights.max()
+        weights = weights / max(weights.max(), 1e-8)
+
         return (
             torch.as_tensor(self.obs[indices], device=self.device),
             torch.as_tensor(self.acts[indices], device=self.device),
@@ -482,11 +519,19 @@ class PrioritizedReplayBuffer:
         )
 
     def update_priorities(self, indices: np.ndarray, td_errors: np.ndarray):
+        PRIORITY_MAX = 1e6  # cap to keep SumTree totals sane
         for idx, td_error in zip(indices, td_errors):
+            if np.isnan(td_error) or np.isinf(td_error):
+                td_error = 0.0
             priority = (abs(td_error) + PER_EPSILON) ** self.alpha
+            if np.isnan(priority) or np.isinf(priority):
+                priority = PRIORITY_MAX
+            priority = float(min(priority, PRIORITY_MAX))
+
             tree_idx = idx + self.tree.capacity - 1
             self.tree.update(tree_idx, priority)
-            self.max_priority = max(self.max_priority, abs(td_error) + PER_EPSILON)
+            # FIX: cap max_priority so add() never inserts astronomical priorities
+            self.max_priority = min(max(self.max_priority, abs(td_error) + PER_EPSILON), PRIORITY_MAX)
 
     def save(self, path: str):
         np.savez_compressed(
@@ -505,7 +550,6 @@ class PrioritizedReplayBuffer:
             if count == 0:
                 return False
             n = min(count, self.size)
-            # Handle obs_dim mismatch (architecture changed)
             if data["obs"].shape[1] != self.obs.shape[1]:
                 return False
             self.obs[:n] = data["obs"][:n]
@@ -516,8 +560,9 @@ class PrioritizedReplayBuffer:
             self.ptr = int(data["ptr"]) % self.size
             self.count = n
             self.tree = SumTree(self.size)
-            for i in range(n):
-                self.tree.add(self.max_priority ** self.alpha)
+            for _ in range(n):
+                self.tree.add(1.0)
+            self.max_priority = 1.0
             return True
         except Exception:
             return False
@@ -563,7 +608,6 @@ class EgoOccupancyGrid:
         FREE_DECREMENT = 0.1
         OBS_INCREMENT = 0.35
 
-        # Process every 4th ray (was every 3rd, with coarser grid we need less)
         for i in range(0, n_rays, 4):
             original_r = ranges[i]
             if np.isnan(original_r) or np.isinf(original_r) or original_r < range_min:
@@ -637,7 +681,7 @@ class EgoOccupancyGrid:
         robot_key = self.world_to_grid_key(robot_x, robot_y)
         best_frontier = None
         best_dist = float('inf')
-        search_radius = 16  # Reduced from 20 — coarser grid covers same area
+        search_radius = 16
 
         for dx in range(-search_radius, search_radius + 1):
             for dy in range(-search_radius, search_radius + 1):
@@ -773,29 +817,6 @@ class EgoOccupancyGrid:
         msg.info.origin.orientation.w = 1.0
         msg.data = data
         return msg
-
-
-# =============================================================================
-# Curriculum Tracker — simple 2-phase
-# =============================================================================
-
-class CurriculumTracker:
-    """Phase 1: bumps hurt but don't end episode. Phase 2: collisions terminate."""
-
-    def __init__(self):
-        self.phase = 1
-        self.episode_lengths: deque = deque(maxlen=50)
-        self.collision_flags: deque = deque(maxlen=50)
-
-    def record_episode(self, length: int, was_collision: bool):
-        self.episode_lengths.append(length)
-        self.collision_flags.append(1 if was_collision else 0)
-
-    def check_transition(self, total_steps: int) -> int:
-        """Returns current phase (1 or 2)."""
-        if self.phase == 1 and total_steps >= CURRICULUM_PHASE1_STEPS:
-            self.phase = 2
-        return self.phase
 
 
 # =============================================================================
@@ -986,7 +1007,6 @@ class StretchExploreEnv(gym.Env):
 
         self.navigator = DynamicNavigator(num_sectors=36)
         self.occ_grid = EgoOccupancyGrid()
-        self.curriculum = CurriculumTracker()
         self.obs_rms = None
         self.reward_normalizer = RewardNormalizer()
 
@@ -1003,7 +1023,6 @@ class StretchExploreEnv(gym.Env):
         self._last_pos = (0.0, 0.0)
         self._goals_reached_this_episode = 0
         self._collision_cooldown = 0
-        self._episode_had_collision = False
 
         # Cached computation results
         self._cached_frontier_angle = 0.0
@@ -1032,15 +1051,12 @@ class StretchExploreEnv(gym.Env):
         self.ros.get_logger().info("[ENV] Waiting for sensors...")
         self.ros.wait_for_sensors()
         self.ros.get_logger().info(f"[ENV] Observation dim: {obs_dim} (was 664)")
-        self.ros.get_logger().info(f"[ENV] v4 MINIMUM VELOCITY — always forward {V_MIN_FORWARD}-{V_MAX} m/s")
-        self.ros.get_logger().info(f"[ENV] Rewards: discovery+revisit(explore), proximity(always), progress+step(goal)")
+        self.ros.get_logger().info(f"[ENV] v5 NEVER TERMINATE — context-aware velocity")
+        self.ros.get_logger().info(f"[ENV] Explore: always forward {V_MIN_FORWARD}-{V_MAX} m/s | Goal: can stop 0-{V_MAX} m/s")
+        self.ros.get_logger().info(f"[ENV] Rewards: discovery(+{R_NEW_CELL}) + revisit({R_REVISIT}) + bump({R_COLLISION}) — no termination")
 
     def reset(self, *, seed=None, options=None):
         super().reset(seed=seed)
-
-        # Record episode stats for curriculum (skip first episode)
-        if self.step_count > 0:
-            self.curriculum.record_episode(self.step_count, self._episode_had_collision)
 
         sim_was_reset = self.ros.reset_simulation()
 
@@ -1050,7 +1066,6 @@ class StretchExploreEnv(gym.Env):
         self._smooth_v = 0.0
         self._smooth_w = 0.0
         self._collision_cooldown = 0
-        self._episode_had_collision = False
         self._cached_frontier_angle = 0.0
         self._cached_new_cells = 0
         self._best_goal_dist = float('inf')
@@ -1086,23 +1101,23 @@ class StretchExploreEnv(gym.Env):
     def step(self, action: np.ndarray):
         a = np.clip(action, -1.0, 1.0)
 
-        # Linear velocity: ALWAYS forward, V_MIN_FORWARD to V_MAX
-        # a[0] = -1 → V_MIN_FORWARD (slow crawl), a[0] = +1 → V_MAX (full speed)
-        rl_v = V_MIN_FORWARD + (float(a[0]) + 1.0) * 0.5 * (V_MAX - V_MIN_FORWARD)
+        has_goal_for_velocity = self.ros.last_goal is not None
+        if has_goal_for_velocity:
+            rl_v = (float(a[0]) + 1.0) * 0.5 * V_MAX
+        else:
+            rl_v = V_MIN_FORWARD + (float(a[0]) + 1.0) * 0.5 * (V_MAX - V_MIN_FORWARD)
 
-        # Angular velocity: coupled to speed via turn radius
-        # At V_MIN_FORWARD=0.15: max_w = 0.15/0.40 = 0.375 rad/s (17s per full rotation)
-        # At V_MAX=1.0: max_w = min(1.0/0.40, 3.0) = 2.5 rad/s (responsive steering)
-        w_limit = min(rl_v / MIN_TURN_RADIUS, W_MAX)
+        if rl_v > 0.05:
+            w_limit = min(rl_v / MIN_TURN_RADIUS, W_MAX)
+        else:
+            w_limit = 0.5
         rl_w = float(a[1]) * w_limit
 
-        # Smooth
         self._smooth_v = CMD_SMOOTHING_ALPHA * rl_v + (1.0 - CMD_SMOOTHING_ALPHA) * self._smooth_v
         self._smooth_w = CMD_SMOOTHING_ALPHA * rl_w + (1.0 - CMD_SMOOTHING_ALPHA) * self._smooth_w
 
         self.ros.send_cmd(self._smooth_v, self._smooth_w)
 
-        # Wait for control period
         t_end = time.time() + self.control_dt
         while time.time() < t_end:
             rclpy.spin_once(self.ros, timeout_sec=0.01)
@@ -1110,30 +1125,23 @@ class StretchExploreEnv(gym.Env):
         st = self._get_robot_state()
         scan = self.ros.last_scan
 
-        # Update occupancy grid every N steps (expensive)
         new_cells = 0
         if scan is not None and self.step_count % OCC_GRID_UPDATE_INTERVAL == 0:
             new_cells = self.occ_grid.update_from_scan(st["x"], st["y"], st["yaw"], scan)
             self._cached_new_cells = new_cells
         else:
-            new_cells = 0  # Don't double-count
+            new_cells = 0
 
-        # Analyze scan for observation
         nav_state = self.navigator.analyze_scan(self.ros.last_scan)
         self.last_nav_state = nav_state
         self.last_safety_state = nav_state
 
-        # Update frontier direction cache for observation (not used in rewards)
         if self.step_count % FRONTIER_CACHE_INTERVAL == 0:
             self._cached_frontier_angle = self.occ_grid.get_frontier_direction(
                 st["x"], st["y"], st["yaw"]
             )
 
         obs = self._build_observation()
-
-        # ============================================================
-        # TERMINATION & REWARDS
-        # ============================================================
 
         terminated = False
         collision = False
@@ -1142,29 +1150,17 @@ class StretchExploreEnv(gym.Env):
         reward_terms = {}
 
         min_dist = nav_state.min_distance if nav_state else LIDAR_MAX_RANGE
-        phase = self.curriculum.check_transition(self.total_steps)
 
-        # Collision cooldown
         if self._collision_cooldown > 0:
             self._collision_cooldown -= 1
 
         if min_dist < ZONE_EMERGENCY and self.step_count > 10:
             collision = True
-            self._episode_had_collision = True
+            if self._collision_cooldown <= 0:
+                reward += R_COLLISION
+                reward_terms["collision"] = R_COLLISION
+                self._collision_cooldown = COLLISION_COOLDOWN_STEPS
 
-            if phase == 1:
-                # Phase 1: bump penalty, no termination — learn to explore
-                if self._collision_cooldown <= 0:
-                    reward += R_COLLISION_PHASE1
-                    reward_terms["collision"] = R_COLLISION_PHASE1
-                    self._collision_cooldown = COLLISION_COOLDOWN_STEPS
-            else:
-                # Phase 2: full penalty + termination — learn to avoid
-                terminated = True
-                reward += R_COLLISION_PHASE2
-                reward_terms["collision"] = R_COLLISION_PHASE2
-
-        # Goal reached
         has_goal = self.ros.last_goal is not None
         d_goal = self._goal_distance()
 
@@ -1183,25 +1179,14 @@ class StretchExploreEnv(gym.Env):
             reached_msg.point.z = 0.0
             self.ros.goal_reached_pub.publish(reached_msg)
 
-        # Timeout
         truncated = self.step_count >= self.max_steps
         if truncated and not terminated:
             reward += R_TIMEOUT
             reward_terms["timeout"] = R_TIMEOUT
 
-        # ============================================================
-        # REWARDS — v4 (behavior-aligned)
-        #
-        # 1. EXPLORE: discovery + revisit penalty + step cost
-        # 2. AVOID:   proximity cost (always active)
-        # 3. GOAL:    ratchet progress + high step cost
-        # ============================================================
-
         if not terminated and not truncated:
             self._last_pos = (st["x"], st["y"])
 
-            # --- PROXIMITY COST (always active, both modes) ---
-            # Continuous gradient teaching obstacle clearance
             if min_dist < PROXIMITY_THRESHOLD:
                 proximity_ratio = 1.0 - (min_dist / PROXIMITY_THRESHOLD)
                 r_proximity = R_PROXIMITY * proximity_ratio
@@ -1209,8 +1194,6 @@ class StretchExploreEnv(gym.Env):
                 reward_terms["proximity"] = r_proximity
 
             if has_goal:
-                # --- GOAL MODE: ratchet progress + high step cost ---
-                # Priority #3: shortest path to target
                 if d_goal < self._best_goal_dist:
                     ratchet_progress = self._best_goal_dist - d_goal
                     r_progress = PROGRESS_SCALE * ratchet_progress
@@ -1223,18 +1206,10 @@ class StretchExploreEnv(gym.Env):
                 reward += STEP_COST_GOAL
                 reward_terms["step"] = STEP_COST_GOAL
             else:
-                # --- EXPLORE MODE: discovery + revisit penalty + step cost ---
-                # Priority #1: go to new areas, avoid revisiting old ones
-
-                # Discovery: fires once per cell, persists across episodes
                 r_discovery = R_NEW_CELL * self._cached_new_cells
                 reward_terms["discovery"] = r_discovery
                 reward += r_discovery
 
-                # Revisit penalty: active repulsion from visited areas
-                # novelty=1.0 (never visited) → 0 penalty
-                # novelty≈0 (heavily visited) → -R_REVISIT per step
-                # visit_counts persist across episodes → forces new routes
                 novelty = self.occ_grid.get_novelty(st["x"], st["y"])
                 r_revisit = R_REVISIT * (1.0 - novelty)
                 reward += r_revisit
@@ -1242,10 +1217,6 @@ class StretchExploreEnv(gym.Env):
 
                 reward += R_STEP_EXPLORE
                 reward_terms["step"] = R_STEP_EXPLORE
-
-        # ============================================================
-        # BOOKKEEPING
-        # ============================================================
 
         self.prev_goal_dist = d_goal
         self.total_steps += 1
@@ -1267,7 +1238,6 @@ class StretchExploreEnv(gym.Env):
             "executed_w": self._smooth_w,
             "raw_v": rl_v,
             "raw_w": rl_w,
-            "curriculum_phase": phase,
         }
 
         if done:
@@ -1278,7 +1248,7 @@ class StretchExploreEnv(gym.Env):
             mode = "GOAL" if has_goal else "EXPLORE"
             ret_color = "\033[92m" if self.episode_return >= 0 else "\033[91m"
             self.ros.get_logger().info(
-                f"[EP {self.episode_index:04d}] \033[94mP{phase}\033[0m {mode} {status} | "
+                f"[EP {self.episode_index:04d}] {mode} {status} | "
                 f"Return {ret_color}{self.episode_return:+.1f}\033[0m | Steps {self.step_count} | "
                 f"Cells {stats['total_discovered']} | Goals {self._goals_reached_this_episode} | "
                 f"MinDist {min_dist:.2f}m"
@@ -1287,7 +1257,7 @@ class StretchExploreEnv(gym.Env):
         elif collision and self._collision_cooldown == COLLISION_COOLDOWN_STEPS:
             self.ros.get_logger().info(
                 f"\033[93m[BUMP]\033[0m step={self.step_count} min_d={min_dist:.2f}m "
-                f"penalty={R_COLLISION_PHASE1} (Phase 1 — cooldown {COLLISION_COOLDOWN_STEPS} steps)"
+                f"penalty={R_COLLISION} (cooldown {COLLISION_COOLDOWN_STEPS} steps)"
             )
 
         if self.step_count % DEBUG_EVERY_N == 0:
@@ -1351,11 +1321,9 @@ class StretchExploreEnv(gym.Env):
         st = self._get_robot_state()
         goal = self.ros.last_goal
 
-        # LiDAR (36 bins)
         lidar_bins = self._get_lidar_bins()
         lidar_norm = np.clip(lidar_bins / LIDAR_MAX_RANGE, 0.0, 1.0)
 
-        # Goal info (5)
         if goal is not None:
             dx = goal.point.x - st["x"]
             dy = goal.point.y - st["y"]
@@ -1369,29 +1337,23 @@ class StretchExploreEnv(gym.Env):
         else:
             goal_info = np.zeros(5, dtype=np.float32)
 
-        # Velocity (2)
         vel = np.array([
             np.clip(st["v_lin"] / V_MAX, -1, 1),
             np.clip(st["v_ang"] / W_MAX, -1, 1),
         ], dtype=np.float32)
 
-        # Previous action (2)
         prev_act = self.prev_action.copy()
 
-        # Has goal flag (1)
         has_goal = np.array([1.0 if goal is not None else 0.0], dtype=np.float32)
 
-        # Occupancy grid (256 = 16x16)
         grid_flat = self.occ_grid.get_flat_grid()
         grid_norm = (grid_flat - 0.5) * 2.0
 
-        # Frontier direction (2) — uses cached value
         frontier_dir = np.array([
             math.sin(self._cached_frontier_angle),
             math.cos(self._cached_frontier_angle),
         ], dtype=np.float32)
 
-        # Novelty (1)
         novelty = np.array([self.occ_grid.get_novelty(st["x"], st["y"])], dtype=np.float32)
 
         obs = np.concatenate([
@@ -1469,7 +1431,6 @@ class StretchExploreEnv(gym.Env):
                 "goal_dist": self._goal_distance(),
             },
             "explore_stats": stats,
-            "curriculum_phase": info.get("curriculum_phase", 0),
             "episode": self.episode_index,
             "step": self.step_count,
         }
@@ -1685,7 +1646,6 @@ class TD3AgentCNN:
 def main():
     parser = argparse.ArgumentParser()
 
-    # Topics
     parser.add_argument("--ns", type=str, default="")
     parser.add_argument("--odom-topic", type=str, default="/stretch/odom")
     parser.add_argument("--lidar-topic", type=str, default="/stretch/scan")
@@ -1693,7 +1653,6 @@ def main():
     parser.add_argument("--goal-topic", type=str, default="goal")
     parser.add_argument("--cmd-topic", type=str, default="/stretch/cmd_vel")
 
-    # Training — optimized defaults
     parser.add_argument("--total-steps", type=int, default=500_000)
     parser.add_argument("--start-steps", type=int, default=DEFAULT_START_STEPS)
     parser.add_argument("--update-after", type=int, default=2000)
@@ -1703,14 +1662,11 @@ def main():
     parser.add_argument("--expl-noise", type=float, default=DEFAULT_EXPL_NOISE)
     parser.add_argument("--save-every", type=int, default=DEFAULT_SAVE_EVERY)
 
-    # Checkpoint
     parser.add_argument("--ckpt-dir", type=str, default=os.path.expanduser("~/parallel_training"))
     parser.add_argument("--seed", type=int, default=42)
 
-    # Mode
     parser.add_argument("--inference", action="store_true")
 
-    # Compat
     parser.add_argument("--rollout-steps", type=int, default=2048)
     parser.add_argument("--load-ckpt", type=str, default="")
     parser.add_argument("--use-obstacle", type=int, default=1)
@@ -1735,23 +1691,21 @@ def main():
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # Observation dimension (NO safety obs, NO RND)
-    grid_flat_size = GRID_SIZE * GRID_SIZE  # 256
-    obs_dim = NUM_LIDAR_BINS + 5 + 2 + 2 + 1 + grid_flat_size + 2 + 1  # 305
+    grid_flat_size = GRID_SIZE * GRID_SIZE
+    obs_dim = NUM_LIDAR_BINS + 5 + 2 + 2 + 1 + grid_flat_size + 2 + 1
     act_dim = 2
 
     env = StretchExploreEnv(ros)
 
     ros.get_logger().info(f"[AGENT] device={device} obs_dim={obs_dim} act_dim={act_dim}")
-    ros.get_logger().info(f"[AGENT] v4: min_velocity={V_MIN_FORWARD}, turn_radius={MIN_TURN_RADIUS}")
-    ros.get_logger().info(f"[AGENT] 2-phase curriculum: P1=bump({CURRICULUM_PHASE1_STEPS} steps), P2=terminate")
+    ros.get_logger().info(f"[AGENT] v5: explore_velocity={V_MIN_FORWARD}-{V_MAX}, goal_velocity=0-{V_MAX}")
+    ros.get_logger().info(f"[AGENT] NO CURRICULUM — collisions never terminate (bump={R_COLLISION}, cooldown={COLLISION_COOLDOWN_STEPS})")
     ros.get_logger().info(f"[AGENT] Explore: discovery({R_NEW_CELL}) + revisit({R_REVISIT}) + step({R_STEP_EXPLORE})")
     ros.get_logger().info(f"[AGENT] Goal: progress({PROGRESS_SCALE}) + step({STEP_COST_GOAL}) | Proximity: {R_PROXIMITY} below {PROXIMITY_THRESHOLD}m")
 
     agent = TD3AgentCNN(obs_dim, act_dim, device=device)
     replay = PrioritizedReplayBuffer(obs_dim, act_dim, size=args.replay_size, device=device)
 
-    # ANSI colors
     G = "\033[92m"; R = "\033[91m"; Y = "\033[93m"; B = "\033[94m"; W = "\033[97m"; RST = "\033[0m"
 
     resume_step = 0
@@ -1768,20 +1722,17 @@ def main():
                 resume_step = training_state.get("step", 0)
                 env.episode_index = training_state.get("episode_index", 1)
                 env.total_steps = training_state.get("total_steps", 0)
-                # Restore curriculum phase
-                env.curriculum.phase = training_state.get("curriculum_phase", 1)
                 if "obs_rms_mean" in training_state:
                     env.obs_rms.mean = training_state["obs_rms_mean"]
                     env.obs_rms.var = training_state["obs_rms_var"]
                     env.obs_rms.count = training_state["obs_rms_count"]
                 ros.get_logger().info(
                     f"[CKPT] {G}✓ Restored:{RST} step={resume_step}, "
-                    f"episode={env.episode_index}, phase={env.curriculum.phase}"
+                    f"episode={env.episode_index}"
                 )
             else:
                 ros.get_logger().warn(f"[CKPT] {Y}No training state — starting counters from 0{RST}")
 
-            # Load replay buffer
             replay_loaded = False
             for rp in [replay_path, replay_path + ".tmp.npz"]:
                 if os.path.exists(rp) and replay.load(rp):
@@ -1799,16 +1750,13 @@ def main():
     else:
         ros.get_logger().info(f"[CKPT] {Y}No checkpoint found — starting fresh{RST}")
 
-    # Save helpers — weights every episode (fast), replay buffer less often (slow)
     last_replay_save_step = resume_step
 
     def save_weights_only(step: int, label: str = "episode"):
-        """Save agent weights + training state. Fast (~50ms)."""
         training_state = {
             "step": step,
             "episode_index": env.episode_index,
             "total_steps": env.total_steps,
-            "curriculum_phase": env.curriculum.phase,
             "obs_rms_mean": env.obs_rms.mean,
             "obs_rms_var": env.obs_rms.var,
             "obs_rms_count": env.obs_rms.count,
@@ -1820,7 +1768,6 @@ def main():
             ros.get_logger().error(f"[CKPT] {R}Agent save failed: {e}{RST}")
 
     def save_replay_buffer():
-        """Save replay buffer to disk. Slow (~seconds for large buffers)."""
         try:
             replay_tmp = replay_path.replace(".npz", "_tmp.npz")
             replay.save(replay_tmp)
@@ -1831,7 +1778,6 @@ def main():
             ros.get_logger().warn(f"[CKPT] {Y}Replay save failed: {e}{RST}")
 
     def save_full_checkpoint(step: int, label: str = "periodic"):
-        """Save everything — weights + replay buffer."""
         nonlocal last_replay_save_step
         save_weights_only(step, label)
         save_replay_buffer()
@@ -1840,7 +1786,6 @@ def main():
             f"[CKPT] {G}✓ {label} full save{RST} step={step} ep={env.episode_index} replay={replay.count}"
         )
 
-    # Shutdown handler
     def shutdown_and_save(signum=None, frame=None):
         try: ros.send_cmd(0.0, 0.0)
         except: pass
@@ -1856,7 +1801,6 @@ def main():
     signal.signal(signal.SIGINT, shutdown_and_save)
     signal.signal(signal.SIGTERM, shutdown_and_save)
 
-    # Inference mode
     if args.inference:
         ros.get_logger().info("[MODE] INFERENCE")
         while True:
@@ -1867,7 +1811,6 @@ def main():
                 obs, r, term, trunc, info = env.step(act)
                 done = term or trunc
 
-    # Training loop
     start_step = resume_step + 1
     ros.get_logger().info(
         f"\n{G}{'='*50}\n  TRAINING STARTED\n{'='*50}{RST}\n"
@@ -1880,29 +1823,14 @@ def main():
     )
 
     obs, _ = env.reset()
-    last_phase = env.curriculum.phase
 
     for t in range(start_step, args.total_steps + 1):
         shutdown_and_save._current_step = t
 
-        # Curriculum phase transition logging
-        current_phase = env.curriculum.check_transition(env.total_steps)
-        if current_phase != last_phase:
-            phase_names = {
-                1: f"{G}Phase 1: EXPLORE{RST} (collisions = bump, no termination)",
-                2: f"{W}Phase 2: FULL DIFFICULTY{RST} (collisions terminate, -100 penalty)",
-            }
-            ros.get_logger().info(
-                f"\n{W}{'='*50}\n  CURRICULUM → {phase_names[current_phase]}\n"
-                f"  Total steps: {env.total_steps}\n{'='*50}{RST}"
-            )
-            last_phase = current_phase
-
-        # Action selection
         if t < args.start_steps:
             act = np.array([
-                np.random.uniform(-1.0, 1.0),  # V_MIN_FORWARD to V_MAX (always forward)
-                np.random.uniform(-0.8, 0.8),   # Steering
+                np.random.uniform(-1.0, 1.0),
+                np.random.uniform(-0.8, 0.8),
             ], dtype=np.float32)
         else:
             act = agent.act(obs, noise_std=args.expl_noise)
@@ -1920,9 +1848,7 @@ def main():
 
         if done:
             obs, _ = env.reset()
-            # Weights save every episode (fast) — federated sync needs fresh checkpoints
             save_weights_only(t, label="episode")
-            # Replay buffer saves less often (slow I/O)
             if t - last_replay_save_step >= args.save_every:
                 save_replay_buffer()
                 last_replay_save_step = t
@@ -1930,7 +1856,6 @@ def main():
                     f"[CKPT] {G}✓ replay buffer saved{RST} step={t} count={replay.count}"
                 )
 
-        # Update (every N steps instead of every step)
         if t >= args.update_after and t % args.update_every == 0 and replay.count >= args.batch_size:
             beta = PER_BETA_START + (PER_BETA_END - PER_BETA_START) * (t / args.total_steps)
             critic_loss, actor_loss = agent.update(replay, args.batch_size, beta)

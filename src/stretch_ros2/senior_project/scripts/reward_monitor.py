@@ -2,10 +2,11 @@
 """
 Multi-Domain RL Training Monitor + Camera Streaming
 
-Updated for reward v3:
-- Reward components: progress (ratchet), discovery, slow (velocity penalty),
-  heading_waste, step, collision, goal, timeout
-- EMA smoothing on all time-series charts
+Updated for v5 (never-terminate) learner:
+- Episode outcomes: GOAL_REACHED / TIMEOUT only (collisions never terminate)
+- Bumps tracked as mid-episode events, not outcomes
+- Reward components: discovery, revisit, proximity, progress, step, collision, goal, timeout
+- Proximity threshold line on min-distance chart
 """
 
 import argparse
@@ -71,11 +72,11 @@ class DomainStats:
     frontiers: int = 0
     cells_discovered: int = 0
 
-    # Episode outcome tracking
-    collisions: int = 0
+    # Episode outcome tracking (v5: only goal or timeout end episodes)
+    collisions: int = 0       # Legacy — kept for backward compat but always 0 in v5
     successes: int = 0
     timeouts: int = 0
-    _last_collision: bool = False
+    bumps: int = 0            # Mid-episode collision bumps (never terminate)
     _last_success: bool = False
 
     # Min distance tracking
@@ -132,18 +133,21 @@ class DomainStats:
         self.frontiers = explore_stats.get("frontier_count", self.frontiers)
 
         # Episode boundary detection — track outcomes
+        # v5: collisions never terminate. Only goal/timeout end episodes.
         collision = breakdown.get("collision", False)
         success = breakdown.get("success", False)
+
+        # Count mid-episode bumps
+        if collision:
+            self.bumps += 1
 
         episode_num = breakdown.get("episode", 0)
         if episode_num > self.last_episode_num and self.last_episode_num > 0:
             if self.current_episode_steps > 0:
                 self.episode_returns.append(self.current_episode_return)
                 self.episode_count += 1
-                # Record how the PREVIOUS episode ended
-                if self._last_collision:
-                    self.collisions += 1
-                elif self._last_success:
+                # Record how the PREVIOUS episode ended (only goal or timeout in v5)
+                if self._last_success:
                     self.successes += 1
                 else:
                     self.timeouts += 1
@@ -153,7 +157,6 @@ class DomainStats:
         self.last_episode_num = episode_num
 
         # Remember flags for next episode boundary
-        self._last_collision = collision
         self._last_success = success
 
     def update_goal_status(self, status: Dict):
@@ -164,7 +167,7 @@ class DomainStats:
         recent_rewards = list(self.rewards)[-100:] if self.rewards else [0]
         recent_min_dists = [x[1] for x in list(self.min_distances)[-100:]] if self.min_distances else [0]
         goal_status_fresh = (time.time() - self.goal_status_time) < 2.0
-        total_outcomes = self.collisions + self.successes + self.timeouts
+        total_outcomes = self.successes + self.timeouts
 
         return {
             "domain_id": self.domain_id,
@@ -181,24 +184,15 @@ class DomainStats:
             "avg_episode_return": sum(self.episode_returns) / len(self.episode_returns) if self.episode_returns else 0,
             "avg_min_distance": sum(recent_min_dists) / len(recent_min_dists) if recent_min_dists else 0,
             "min_min_distance": min(recent_min_dists) if recent_min_dists else 0,
+            "bumps": self.bumps,
             "collisions": self.collisions,
             "successes": self.successes,
             "timeouts": self.timeouts,
-            "collision_rate": self.collisions / total_outcomes if total_outcomes > 0 else 0,
+            "collision_rate": 0,  # v5: collisions don't end episodes
             "success_rate": self.successes / total_outcomes if total_outcomes > 0 else 0,
             "active": time.time() - self.last_update < 5.0,
             "goal_status": self.goal_status if goal_status_fresh else {},
         }
-
-    @staticmethod
-    def _ema_smooth(values: list, alpha: float = 0.15) -> list:
-        """Exponential moving average for smoother charts. alpha=0.15 is gentle."""
-        if not values:
-            return values
-        smoothed = [values[0]]
-        for v in values[1:]:
-            smoothed.append(alpha * v + (1 - alpha) * smoothed[-1])
-        return smoothed
 
     def get_plot_data(self, max_points: int = 300) -> Dict:
         step = max(1, len(self.rewards) // max_points)
@@ -208,9 +202,6 @@ class DomainStats:
         t0 = timestamps[0] if timestamps else 0
         rel_times = [(t - t0) for t in timestamps]
 
-        # Smooth rewards for display
-        smoothed_rewards = self._ema_smooth(rewards, alpha=0.1)
-
         episode_returns = list(self.episode_returns)
         episode_indices = list(range(1, len(episode_returns) + 1))
 
@@ -219,27 +210,26 @@ class DomainStats:
             vals = list(values)[::step]
             if vals:
                 t0_comp = vals[0][0]
-                raw_values = [v[1] for v in vals]
                 components_data[key] = {
                     "times": [(v[0] - t0_comp) for v in vals],
-                    "values": self._ema_smooth(raw_values, alpha=0.2)
+                    "values": [v[1] for v in vals]
                 }
 
-        # Min distance plot (smoothed)
+        # Min distance plot
         md_list = list(self.min_distances)[::step]
         if md_list:
             t0_md = md_list[0][0]
             md_times = [(v[0] - t0_md) for v in md_list]
-            md_values = self._ema_smooth([v[1] for v in md_list], alpha=0.15)
+            md_values = [v[1] for v in md_list]
         else:
             md_times, md_values = [], []
 
-        # Velocity plot (smoothed)
+        # Velocity plot
         vel_list = list(self.velocities)[::step]
         if vel_list:
             t0_vel = vel_list[0][0]
             vel_times = [(v[0] - t0_vel) for v in vel_list]
-            vel_values = self._ema_smooth([v[1] for v in vel_list], alpha=0.15)
+            vel_values = [v[1] for v in vel_list]
         else:
             vel_times, vel_values = [], []
 
@@ -259,7 +249,7 @@ class DomainStats:
         return {
             "domain_id": self.domain_id,
             "display_name": self.display_name,
-            "rewards": {"times": rel_times, "values": smoothed_rewards},
+            "rewards": {"times": rel_times, "values": rewards},
             "episode_returns": {"episodes": episode_indices, "values": episode_returns},
             "components": components_data,
             "min_distance": {"times": md_times, "values": md_values},
@@ -644,7 +634,7 @@ DASHBOARD_HTML = r"""
 </head>
 <body>
   <div class="header">
-    <h1>RL Training Monitor<span class="subtitle">Reward v3 &mdash; Velocity Penalty, Heading Efficiency, Ratchet Progress</span></h1>
+    <h1>RL Training Monitor<span class="subtitle">v5 &mdash; Never Terminate on Collision</span></h1>
     <span class="badge" id="badge">Scanning...</span>
   </div>
   <div class="container">
@@ -664,20 +654,20 @@ const C = {
   lime:'#68d391', pink:'#f687b3'
 };
 
-// Reward component -> color mapping (v3)
+// Reward component -> color mapping (v5)
 const compColors = {
-  // Goal-seeking
-  progress:       C.green,
-  goal:           C.darkyellow,
   // Exploration
-  discovery:      C.purple,
-  // Movement
-  slow:           C.orange,
-  heading_waste:  '#e53e3e',
-  step:           C.gray,
-  // Terminal
-  collision:      C.darkred,
-  timeout:        '#b7791f',
+  discovery: C.purple,
+  revisit:   C.pink,
+  // Obstacle avoidance
+  proximity: C.orange,
+  collision: C.darkred,
+  // Goal-seeking
+  progress:  C.green,
+  goal:      C.darkyellow,
+  // Costs
+  step:      C.gray,
+  timeout:   '#b7791f',
 };
 
 const layoutBase = {
@@ -722,7 +712,7 @@ function renderAllView() {
   if (!vals.length) { document.getElementById('content').innerHTML = '<div class="empty">No domains found yet...</div>'; return; }
   const totSteps = vals.reduce((a,d) => a+d.summary.total_steps, 0);
   const totEp = vals.reduce((a,d) => a+d.summary.episode_count, 0);
-  const totCol = vals.reduce((a,d) => a+d.summary.collisions, 0);
+  const totBumps = vals.reduce((a,d) => a+d.summary.bumps, 0);
   const totSuc = vals.reduce((a,d) => a+d.summary.successes, 0);
   const totTo = vals.reduce((a,d) => a+d.summary.timeouts, 0);
   const active = vals.filter(d => d.summary.active).length;
@@ -732,7 +722,7 @@ function renderAllView() {
   let h = '<div class="summary-box"><h3>Cross-Domain Summary</h3><div class="summary-grid">' +
     ss('Total Steps', totSteps.toLocaleString()) +
     ss('Episodes', totEp) +
-    ss('Collisions', totCol, C.darkred) +
+    ss('Bumps', totBumps, C.orange) +
     ss('Goals Reached', totSuc, C.darkgreen) +
     ss('Timeouts', totTo, C.darkyellow) +
     ss('Avg Return', avgRet.toFixed(1), avgRet>=0?C.green:C.red) +
@@ -755,7 +745,7 @@ function drawAllChart() {
   Object.values(domains).forEach(d => {
     const p = d.plot_data;
     if (p.episode_returns.values.length) {
-      traces.push({x:p.episode_returns.episodes, y:p.episode_returns.values, type:'scatter', mode:'lines', name:p.display_name, line:{color:cls[ci++%cls.length],width:2,shape:'spline',smoothing:0.8}});
+      traces.push({x:p.episode_returns.episodes, y:p.episode_returns.values, type:'scatter', mode:'lines', name:p.display_name, line:{color:cls[ci++%cls.length],width:2}});
     }
   });
   if (traces.length) Plotly.react('allChart', traces, {...layoutBase, showlegend:true, legend:{bgcolor:'rgba(0,0,0,0)',font:{size:10}}, xaxis:{...layoutBase.xaxis,title:'Episode'}, yaxis:{...layoutBase.yaxis,title:'Return'}}, cfg);
@@ -771,15 +761,14 @@ function renderDomainView(k) {
   const d = domains[k]; if (!d) return;
   const s = d.summary;
   const defaultTopic = '/sam3_goal_generator/visualization';
-  const total = s.collisions + s.successes + s.timeouts;
-  const colPct = total>0 ? (s.collisions/total*100).toFixed(0) : 0;
+  const total = s.successes + s.timeouts;
   const sucPct = total>0 ? (s.successes/total*100).toFixed(0) : 0;
   const toPct  = total>0 ? (s.timeouts/total*100).toFixed(0) : 0;
 
   let h = '<div class="stats-row">' +
     statBox('Steps', s.total_steps.toLocaleString(), '', '') +
     statBox('Episodes', s.episode_count, '', '') +
-    statBox('Collisions', s.collisions, 'red', colPct+'% of eps') +
+    statBox('Bumps', s.bumps, 'orange', 'no termination') +
     statBox('Goals', s.successes, 'green', sucPct+'% of eps') +
     statBox('Timeouts', s.timeouts, 'orange', toPct+'% of eps') +
     statBox('Cells', s.cells_discovered, 'blue', '') +
@@ -788,12 +777,11 @@ function renderDomainView(k) {
     statBox('Avg Min Dist', s.avg_min_distance.toFixed(2)+'m', s.avg_min_distance>0.4?'green':'orange', 'closest: '+s.min_min_distance.toFixed(2)+'m') +
   '</div>';
 
-  // Outcome bar
+  // Outcome bar (v5: only goal or timeout)
   if (total > 0) {
     h += '<div class="outcome-bar">';
-    if (s.collisions>0) h += '<div class="segment seg-collision" style="width:'+colPct+'%">'+s.collisions+'</div>';
-    if (s.successes>0) h += '<div class="segment seg-success" style="width:'+sucPct+'%">'+s.successes+'</div>';
-    if (s.timeouts>0) h += '<div class="segment seg-timeout" style="width:'+toPct+'%">'+s.timeouts+'</div>';
+    if (s.successes>0) h += '<div class="segment seg-success" style="width:'+sucPct+'%">'+s.successes+' goals</div>';
+    if (s.timeouts>0) h += '<div class="segment seg-timeout" style="width:'+toPct+'%">'+s.timeouts+' timeouts</div>';
     h += '</div>';
   }
 
@@ -839,33 +827,33 @@ function updateDomainView(k) {
     Plotly.react('rewChart', [{x:p.rewards.times, y:p.rewards.values, type:'scatter', mode:'lines', line:{color:C.blue,width:2}, fill:'tozeroy', fillcolor:'rgba(102,126,234,0.1)'}], {...layoutBase, xaxis:{...layoutBase.xaxis,title:'Time (s)'}}, cfg);
   }
 
-  // Episode returns + rolling average (20-ep window for smooth curve)
+  // Episode returns + rolling average
   if (p.episode_returns.values.length) {
     const ra = [];
     for (let i=0; i<p.episode_returns.values.length; i++) {
-      const w = p.episode_returns.values.slice(Math.max(0,i-19), i+1);
+      const w = p.episode_returns.values.slice(Math.max(0,i-9), i+1);
       ra.push(w.reduce((a,b)=>a+b,0)/w.length);
     }
     Plotly.react('epChart', [
-      {x:p.episode_returns.episodes, y:p.episode_returns.values, type:'scatter', mode:'lines', name:'Return', line:{color:C.green,width:1}, opacity:0.4},
-      {x:p.episode_returns.episodes, y:ra, type:'scatter', mode:'lines', name:'20-ep avg', line:{color:C.yellow,width:2.5}}
+      {x:p.episode_returns.episodes, y:p.episode_returns.values, type:'scatter', mode:'lines+markers', name:'Return', line:{color:C.green,width:2}, marker:{size:4}},
+      {x:p.episode_returns.episodes, y:ra, type:'scatter', mode:'lines', name:'10-ep avg', line:{color:C.yellow,width:2.5}}
     ], {...layoutBase, showlegend:true, legend:{bgcolor:'rgba(0,0,0,0)',x:0.02,y:0.98}, xaxis:{...layoutBase.xaxis,title:'Episode'}}, cfg);
   }
 
-  // Min distance chart with collision threshold line
+  // Min distance chart with collision + proximity threshold lines
   if (p.min_distance.values.length) {
     const t0 = p.min_distance.times[0];
     const tEnd = p.min_distance.times[p.min_distance.times.length-1];
     Plotly.react('minDistChart', [
       {x:p.min_distance.times, y:p.min_distance.values, type:'scatter', mode:'lines', name:'Min Dist', line:{color:C.orange,width:2}, fill:'tozeroy', fillcolor:'rgba(237,137,54,0.08)'},
+      {x:[t0, tEnd], y:[0.65, 0.65], type:'scatter', mode:'lines', name:'Proximity (0.65m)', line:{color:C.yellow,width:1.5,dash:'dot'}, hoverinfo:'name'},
       {x:[t0, tEnd], y:[0.30, 0.30], type:'scatter', mode:'lines', name:'Collision (0.30m)', line:{color:C.darkred,width:1.5,dash:'dash'}, hoverinfo:'name'}
     ], {...layoutBase, showlegend:true, legend:{bgcolor:'rgba(0,0,0,0)',font:{size:9}}, xaxis:{...layoutBase.xaxis,title:'Time (s)'}, yaxis:{...layoutBase.yaxis,title:'meters',rangemode:'tozero'}}, cfg);
   }
 
-  // Outcomes pie chart
+  // Outcomes pie chart (v5: only goal or timeout)
   const oc = p.outcomes;
   const ovals = [], olabels = [], ocolors = [];
-  if (oc.collisions>0) { ovals.push(oc.collisions); olabels.push('Collision ('+oc.collisions+')'); ocolors.push(C.darkred); }
   if (oc.successes>0)  { ovals.push(oc.successes);  olabels.push('Goal ('+oc.successes+')');       ocolors.push(C.darkgreen); }
   if (oc.timeouts>0)   { ovals.push(oc.timeouts);   olabels.push('Timeout ('+oc.timeouts+')');     ocolors.push(C.darkyellow); }
   if (ovals.length) {
@@ -875,7 +863,7 @@ function updateDomainView(k) {
   // Reward components time series
   const traces = [];
   const legendItems = [];
-  const compOrder = ['progress','goal','discovery','slow','heading_waste','step','collision','timeout'];
+  const compOrder = ['discovery','revisit','proximity','progress','goal','step','collision','timeout'];
   compOrder.forEach(n => {
     const cd = p.components[n];
     if (cd && cd.values.length) {
@@ -1008,17 +996,17 @@ def main():
     args = parser.parse_args()
 
     print(f"""
-    RL Training Monitor (Reward v3)
+    RL Training Monitor (Reward v5)
     ================================
     http://localhost:{args.port}
     Scanning domains {args.scan_start}-{args.scan_end}
 
     REWARD SYSTEM:
-      Terminal:  collision (curriculum), goal=+2000, timeout=-50
+      Terminal:  goal=+2000, timeout=-50 (collision NEVER terminates)
       Goal:     ratchet progress (only new-best distance pays)
       Explore:  discovery (new cells only)
-      Movement: velocity penalty (going slow costs -2.0/step)
-      Guards:   heading efficiency ratio (threshold 1.5 rad/m)
+      Revisit:  penalty for returning to explored areas
+      Obstacle: proximity cost + bump penalty (-5, no termination)
       Collision threshold: 0.30m (LIDAR min distance)
     """)
 
