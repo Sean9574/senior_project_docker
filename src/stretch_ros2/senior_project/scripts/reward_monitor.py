@@ -90,6 +90,12 @@ class DomainStats:
     goal_status: Dict = field(default_factory=dict)
     goal_status_time: float = 0.0
 
+    # Expert baseline tracking
+    expert_avg_return: float = 0.0
+    training_phase: str = "UNKNOWN"  # EXPERT_DEMO / RANDOM_EXPLORE / RL_POLICY
+    expert_episode_returns: deque = field(default_factory=lambda: deque(maxlen=100))
+    rl_episode_returns: deque = field(default_factory=lambda: deque(maxlen=100))
+
     def add_reward(self, reward: float, timestamp: float):
         self.rewards.append(reward)
         self.timestamps.append(timestamp)
@@ -159,6 +165,10 @@ class DomainStats:
         # Remember flags for next episode boundary
         self._last_success = success
 
+        # Training phase and expert baseline
+        self.training_phase = breakdown.get("training_phase", self.training_phase)
+        self.expert_avg_return = breakdown.get("expert_avg_return", self.expert_avg_return)
+
     def update_goal_status(self, status: Dict):
         self.goal_status = status
         self.goal_status_time = time.time()
@@ -192,6 +202,8 @@ class DomainStats:
             "success_rate": self.successes / total_outcomes if total_outcomes > 0 else 0,
             "active": time.time() - self.last_update < 5.0,
             "goal_status": self.goal_status if goal_status_fresh else {},
+            "training_phase": self.training_phase,
+            "expert_avg_return": self.expert_avg_return,
         }
 
     def get_plot_data(self, max_points: int = 300) -> Dict:
@@ -549,93 +561,182 @@ DASHBOARD_HTML = r"""
   <title>RL Training Monitor</title>
   <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.5.4/socket.io.min.js"></script>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=DM+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
   <style>
     :root {
-      --bg: #f4f7fa; --card: #ffffff; --border: #e8ecf1;
-      --text: #2d3748; --text-light: #718096; --text-muted: #a0aec0;
-      --blue: #667eea; --green: #48bb78; --red: #fc8181;
-      --yellow: #f6e05e; --purple: #9f7aea; --cyan: #4fd1c5;
-      --orange: #ed8936;
-      --radius: 16px; --shadow: 0 2px 8px rgba(0,0,0,0.04);
+      --bg: #0f1117; --bg-raised: #161920; --bg-card: #1c1f2b;
+      --bg-card-hover: #222636; --border: #2a2e3d; --border-light: #353a4d;
+      --text: #e2e8f0; --text-dim: #94a3b8; --text-muted: #64748b;
+      --accent: #6366f1; --accent-glow: rgba(99,102,241,0.15);
+      --green: #22c55e; --green-dim: rgba(34,197,94,0.15);
+      --red: #ef4444; --red-dim: rgba(239,68,68,0.12);
+      --amber: #f59e0b; --amber-dim: rgba(245,158,11,0.12);
+      --cyan: #06b6d4; --purple: #a855f7; --orange: #f97316;
+      --pink: #ec4899; --lime: #84cc16; --teal: #14b8a6;
+      --radius: 12px; --radius-sm: 8px;
+      --shadow: 0 1px 3px rgba(0,0,0,0.3), 0 1px 2px rgba(0,0,0,0.2);
+      --shadow-lg: 0 4px 16px rgba(0,0,0,0.4);
+      --mono: 'JetBrains Mono', 'Fira Code', monospace;
+      --sans: 'DM Sans', -apple-system, sans-serif;
     }
-    * { margin: 0; padding: 0; box-sizing: border-box; }
-    body { font-family: 'Inter', -apple-system, sans-serif; background: var(--bg); color: var(--text); line-height: 1.5; }
+    * { margin:0; padding:0; box-sizing:border-box; }
+    body { font-family:var(--sans); background:var(--bg); color:var(--text); line-height:1.5; min-height:100vh; }
 
-    .header { background: var(--card); padding: 16px 24px; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center; box-shadow: var(--shadow); }
-    .header h1 { font-size: 18px; font-weight: 700; }
-    .header .subtitle { font-size: 12px; color: var(--text-muted); font-weight: 400; margin-left: 8px; }
-    .badge { background: linear-gradient(135deg, #eef2ff 0%, #f5f3ff 100%); border: 1px solid #c7d2fe; padding: 6px 14px; border-radius: 20px; font-size: 12px; font-weight: 600; color: var(--blue); }
+    /* ── Header ── */
+    .header {
+      background:var(--bg-raised); border-bottom:1px solid var(--border);
+      padding:14px 28px; display:flex; justify-content:space-between; align-items:center;
+      position:sticky; top:0; z-index:100; backdrop-filter:blur(12px);
+    }
+    .header-left { display:flex; align-items:center; gap:14px; }
+    .header h1 { font-family:var(--mono); font-size:15px; font-weight:700; letter-spacing:-0.3px; }
+    .header h1 span { color:var(--accent); }
+    .version-tag {
+      font-family:var(--mono); font-size:10px; font-weight:600; letter-spacing:0.5px;
+      background:var(--accent-glow); color:var(--accent); padding:3px 10px; border-radius:20px;
+      border:1px solid rgba(99,102,241,0.25);
+    }
+    .phase-badge {
+      font-family:var(--mono); font-size:11px; font-weight:600; padding:5px 14px;
+      border-radius:20px; letter-spacing:0.3px; transition:all 0.3s;
+    }
+    .phase-badge.expert { background:var(--amber-dim); color:var(--amber); border:1px solid rgba(245,158,11,0.3); }
+    .phase-badge.random { background:rgba(168,85,247,0.12); color:var(--purple); border:1px solid rgba(168,85,247,0.3); }
+    .phase-badge.rl { background:var(--green-dim); color:var(--green); border:1px solid rgba(34,197,94,0.3); }
+    .phase-badge.unknown { background:rgba(100,116,139,0.12); color:var(--text-muted); border:1px solid var(--border); }
+    .conn-badge {
+      font-family:var(--mono); font-size:10px; padding:4px 12px; border-radius:20px;
+      background:var(--bg-card); border:1px solid var(--border); color:var(--text-muted);
+    }
+    .conn-badge.live { color:var(--green); border-color:rgba(34,197,94,0.3); background:var(--green-dim); }
 
-    .container { padding: 20px 24px; max-width: 1400px; margin: 0 auto; }
+    /* ── Layout ── */
+    .container { padding:20px 28px; max-width:1600px; margin:0 auto; }
 
-    .tabs { display: flex; gap: 10px; margin-bottom: 20px; flex-wrap: wrap; }
-    .tab { padding: 10px 18px; background: var(--card); border: 1px solid var(--border); border-radius: 12px; cursor: pointer; font-size: 13px; font-weight: 500; color: var(--text-light); transition: all 0.2s; display: flex; align-items: center; gap: 8px; box-shadow: var(--shadow); }
-    .tab:hover { border-color: var(--blue); color: var(--blue); }
-    .tab.active { background: linear-gradient(135deg, var(--blue) 0%, #7c3aed 100%); border-color: transparent; color: white; box-shadow: 0 4px 12px rgba(102,126,234,0.3); }
-    .tab .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--text-muted); }
-    .tab.live .dot { background: var(--green); animation: pulse 2s infinite; }
-    .tab.active .dot { background: rgba(255,255,255,0.6); }
-    .tab.active.live .dot { background: white; }
-    @keyframes pulse { 0%,100% { opacity:1; } 50% { opacity:0.5; } }
+    /* ── Tabs ── */
+    .tabs { display:flex; gap:8px; margin-bottom:20px; flex-wrap:wrap; }
+    .tab {
+      font-family:var(--mono); font-size:12px; font-weight:500; padding:8px 16px;
+      background:var(--bg-card); border:1px solid var(--border); border-radius:var(--radius-sm);
+      cursor:pointer; color:var(--text-muted); transition:all 0.2s; display:flex; align-items:center; gap:8px;
+    }
+    .tab:hover { border-color:var(--accent); color:var(--text-dim); }
+    .tab.active { background:var(--accent); border-color:var(--accent); color:#fff; box-shadow:0 0 20px var(--accent-glow); }
+    .tab .dot { width:7px; height:7px; border-radius:50%; background:var(--text-muted); flex-shrink:0; }
+    .tab.live .dot { background:var(--green); box-shadow:0 0 6px var(--green); animation:pulse 2s infinite; }
+    .tab.active .dot { background:rgba(255,255,255,0.5); box-shadow:none; }
+    .tab.active.live .dot { background:#fff; box-shadow:0 0 6px #fff; }
+    @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.4} }
 
-    .card { background: var(--card); border: 1px solid var(--border); border-radius: var(--radius); padding: 20px; box-shadow: var(--shadow); margin-bottom: 16px; }
-    .card h3 { font-size: 13px; font-weight: 600; color: var(--text-light); text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 16px; }
+    /* ── Cards ── */
+    .card {
+      background:var(--bg-card); border:1px solid var(--border); border-radius:var(--radius);
+      padding:20px; box-shadow:var(--shadow); margin-bottom:16px; transition:border-color 0.2s;
+    }
+    .card:hover { border-color:var(--border-light); }
+    .card h3 {
+      font-family:var(--mono); font-size:11px; font-weight:600; color:var(--text-muted);
+      text-transform:uppercase; letter-spacing:1px; margin-bottom:16px;
+      display:flex; align-items:center; gap:8px;
+    }
+    .card h3::before { content:''; width:3px; height:14px; background:var(--accent); border-radius:2px; }
 
-    .stats-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 12px; margin-bottom: 20px; }
-    .stat { background: var(--card); border: 1px solid var(--border); border-radius: var(--radius); padding: 16px; box-shadow: var(--shadow); }
-    .stat .label { font-size: 11px; font-weight: 600; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.3px; }
-    .stat .value { font-size: 22px; font-weight: 700; margin-top: 4px; }
-    .stat .sub { font-size: 11px; color: var(--text-muted); margin-top: 2px; }
-    .green { color: var(--green) !important; }
-    .red { color: var(--red) !important; }
-    .blue { color: var(--blue) !important; }
-    .orange { color: var(--orange) !important; }
-    .purple { color: var(--purple) !important; }
+    /* ── Stats Row ── */
+    .stats-row { display:grid; grid-template-columns:repeat(auto-fit,minmax(140px,1fr)); gap:10px; margin-bottom:20px; }
+    .stat {
+      background:var(--bg-card); border:1px solid var(--border); border-radius:var(--radius-sm);
+      padding:14px 16px; transition:border-color 0.2s;
+    }
+    .stat:hover { border-color:var(--border-light); }
+    .stat .label { font-family:var(--mono); font-size:10px; font-weight:600; color:var(--text-muted); text-transform:uppercase; letter-spacing:0.5px; }
+    .stat .value { font-family:var(--mono); font-size:20px; font-weight:700; margin-top:4px; line-height:1.2; }
+    .stat .sub { font-family:var(--mono); font-size:10px; color:var(--text-muted); margin-top:3px; }
+    .green { color:var(--green)!important; }
+    .red { color:var(--red)!important; }
+    .blue { color:var(--accent)!important; }
+    .amber { color:var(--amber)!important; }
+    .purple { color:var(--purple)!important; }
+    .cyan { color:var(--cyan)!important; }
 
-    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
-    @media (max-width: 1000px) { .grid { grid-template-columns: 1fr; } }
-    .chart { height: 240px; }
+    /* ── Grid Layouts ── */
+    .grid-2 { display:grid; grid-template-columns:1fr 1fr; gap:16px; }
+    .grid-3 { display:grid; grid-template-columns:1fr 1fr 1fr; gap:16px; }
+    .grid-2-1 { display:grid; grid-template-columns:2fr 1fr; gap:16px; }
+    .grid-1-2 { display:grid; grid-template-columns:1fr 2fr; gap:16px; }
+    @media(max-width:1200px) { .grid-3 { grid-template-columns:1fr 1fr; } }
+    @media(max-width:900px) { .grid-2,.grid-3,.grid-2-1,.grid-1-2 { grid-template-columns:1fr; } }
+    .chart { height:260px; }
+    .chart-tall { height:320px; }
 
-    .camera-container { position: relative; background: #1a202c; border-radius: 12px; overflow: hidden; }
-    .camera-img { width: 100%; height: 300px; object-fit: contain; display: block; }
-    .empty { text-align: center; padding: 60px; color: var(--text-muted); }
+    /* ── Camera ── */
+    .camera-container { position:relative; background:#000; border-radius:var(--radius-sm); overflow:hidden; }
+    .camera-img { width:100%; height:280px; object-fit:contain; display:block; }
 
-    .summary-box { background: linear-gradient(135deg, #eef2ff 0%, #faf5ff 100%); border: 1px solid #ddd6fe; border-radius: var(--radius); padding: 20px; margin-bottom: 20px; }
-    .summary-box h3 { color: var(--blue); margin-bottom: 16px; }
-    .summary-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 16px; }
-    .summary-stat { text-align: center; }
-    .summary-stat .label { font-size: 10px; color: var(--text-muted); text-transform: uppercase; }
-    .summary-stat .value { font-size: 20px; font-weight: 700; margin-top: 4px; }
+    /* ── Outcome Bar ── */
+    .outcome-bar { display:flex; height:6px; border-radius:3px; overflow:hidden; margin-bottom:16px; background:var(--border); }
+    .outcome-bar .seg { transition:width 0.5s ease; }
+    .outcome-bar .seg-success { background:var(--green); }
+    .outcome-bar .seg-timeout { background:var(--amber); }
 
-    .outcome-bar { display: flex; height: 28px; border-radius: 8px; overflow: hidden; margin-bottom: 12px; }
-    .outcome-bar .segment { display: flex; align-items: center; justify-content: center; font-size: 11px; font-weight: 600; color: white; min-width: 30px; transition: width 0.5s; }
-    .outcome-bar .seg-collision { background: #e53e3e; }
-    .outcome-bar .seg-success { background: #38a169; }
-    .outcome-bar .seg-timeout { background: #d69e2e; }
+    /* ── Goal Status ── */
+    .goal-status {
+      margin-top:12px; padding:12px 16px; background:var(--bg-raised);
+      border:1px solid var(--border); border-radius:var(--radius-sm); font-size:12px;
+    }
+    .goal-status.found { border-color:rgba(34,197,94,0.3); }
+    .goal-status.searching { border-color:rgba(245,158,11,0.3); }
+    .goal-status .status-row { display:flex; justify-content:space-between; padding:3px 0; border-bottom:1px solid var(--border); }
+    .goal-status .status-row:last-child { border-bottom:none; }
+    .goal-status .status-label { font-family:var(--mono); color:var(--text-muted); font-size:11px; }
+    .goal-status .status-value { font-family:var(--mono); font-weight:600; font-size:11px; }
+    .goal-status .status-value.found { color:var(--green); }
+    .goal-status .status-value.searching { color:var(--amber); }
 
-    .chip { padding: 4px 14px; border-radius: 16px; font-size: 12px; font-weight: 600; display: inline-block; margin: 2px; }
-    .chip.collision { background: #fed7d7; color: #c53030; }
-    .chip.success { background: #c6f6d5; color: #276749; }
-    .chip.timeout { background: #fefcbf; color: #975a16; }
+    /* ── Expert Comparison Box ── */
+    .expert-compare {
+      background:linear-gradient(135deg, rgba(99,102,241,0.06) 0%, rgba(168,85,247,0.06) 100%);
+      border:1px solid rgba(99,102,241,0.2); border-radius:var(--radius);
+      padding:16px 20px; margin-bottom:16px; display:flex; align-items:center; justify-content:space-between;
+      gap:24px;
+    }
+    .expert-compare .ec-item { text-align:center; }
+    .expert-compare .ec-label { font-family:var(--mono); font-size:10px; color:var(--text-muted); text-transform:uppercase; letter-spacing:0.5px; }
+    .expert-compare .ec-value { font-family:var(--mono); font-size:22px; font-weight:700; margin-top:2px; }
+    .expert-compare .ec-vs { font-family:var(--mono); font-size:12px; color:var(--text-muted); font-weight:600; }
+    .expert-compare .ec-verdict {
+      font-family:var(--mono); font-size:11px; font-weight:700; padding:4px 12px;
+      border-radius:20px; letter-spacing:0.3px;
+    }
+    .ec-verdict.winning { background:var(--green-dim); color:var(--green); }
+    .ec-verdict.losing { background:var(--amber-dim); color:var(--amber); }
 
-    .goal-status { margin-top: 12px; padding: 12px 16px; background: linear-gradient(135deg, #f0fdf4 0%, #ecfdf5 100%); border: 1px solid #bbf7d0; border-radius: 12px; font-size: 13px; }
-    .goal-status.searching { background: linear-gradient(135deg, #fefce8 0%, #fef9c3 100%); border-color: #fde047; }
-    .goal-status .status-row { display: flex; justify-content: space-between; padding: 4px 0; border-bottom: 1px solid rgba(0,0,0,0.05); }
-    .goal-status .status-row:last-child { border-bottom: none; }
-    .goal-status .status-label { color: var(--text-muted); font-weight: 500; }
-    .goal-status .status-value { font-weight: 600; color: var(--text); }
-    .goal-status .status-value.found { color: var(--green); }
-    .goal-status .status-value.searching { color: #ca8a04; }
+    /* ── Reward Legend ── */
+    .reward-legend { display:flex; flex-wrap:wrap; gap:8px; margin-top:10px; }
+    .reward-legend .item { display:flex; align-items:center; gap:5px; font-family:var(--mono); font-size:10px; color:var(--text-dim); }
+    .reward-legend .swatch { width:10px; height:3px; border-radius:2px; }
 
-    .reward-legend { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
-    .reward-legend .item { display: flex; align-items: center; gap: 4px; font-size: 10px; color: var(--text-light); }
-    .reward-legend .swatch { width: 10px; height: 10px; border-radius: 3px; }
+    /* ── Overview Summary ── */
+    .summary-box {
+      background:var(--bg-card); border:1px solid var(--border); border-radius:var(--radius);
+      padding:24px; margin-bottom:20px;
+    }
+    .summary-box h3 { font-family:var(--mono); font-size:12px; font-weight:600; color:var(--accent); text-transform:uppercase; letter-spacing:1px; margin-bottom:20px; }
+    .summary-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(120px,1fr)); gap:20px; }
+    .summary-stat { text-align:center; }
+    .summary-stat .label { font-family:var(--mono); font-size:10px; color:var(--text-muted); text-transform:uppercase; letter-spacing:0.5px; }
+    .summary-stat .value { font-family:var(--mono); font-size:22px; font-weight:700; margin-top:4px; }
+
+    .empty { text-align:center; padding:80px; color:var(--text-muted); font-family:var(--mono); font-size:13px; }
   </style>
 </head>
 <body>
   <div class="header">
-    <h1>RL Training Monitor<span class="subtitle">v5 &mdash; Never Terminate on Collision</span></h1>
-    <span class="badge" id="badge">Scanning...</span>
+    <div class="header-left">
+      <h1><span>//</span> RL Training Monitor</h1>
+      <span class="version-tag">v5 — NEVER TERMINATE</span>
+      <span class="phase-badge unknown" id="phaseBadge">—</span>
+    </div>
+    <span class="conn-badge" id="badge">Connecting...</span>
   </div>
   <div class="container">
     <div class="tabs" id="tabs"></div>
@@ -648,48 +749,63 @@ let domains = {};
 let selected = 'all';
 
 const C = {
-  blue:'#667eea', green:'#48bb78', red:'#fc8181', yellow:'#ecc94b',
-  purple:'#9f7aea', cyan:'#4fd1c5', orange:'#ed8936', gray:'#a0aec0',
-  darkred:'#e53e3e', darkgreen:'#38a169', darkyellow:'#d69e2e', teal:'#38b2ac',
-  lime:'#68d391', pink:'#f687b3'
+  accent:'#6366f1', green:'#22c55e', red:'#ef4444', amber:'#f59e0b',
+  purple:'#a855f7', cyan:'#06b6d4', orange:'#f97316', pink:'#ec4899',
+  lime:'#84cc16', teal:'#14b8a6', gray:'#64748b',
+  greenDim:'rgba(34,197,94,0.5)', redDim:'rgba(239,68,68,0.5)',
 };
 
-// Reward component -> color mapping (v5)
 const compColors = {
-  // Exploration
-  discovery: C.purple,
-  revisit:   C.pink,
-  // Obstacle avoidance
-  proximity: C.orange,
-  collision: C.darkred,
-  // Goal-seeking
-  progress:  C.green,
-  goal:      C.darkyellow,
-  // Costs
-  step:      C.gray,
-  timeout:   '#b7791f',
+  discovery:C.purple, revisit:C.pink,
+  proximity:C.orange, collision:C.red,
+  progress:C.green, goal:C.amber,
+  step:C.gray, timeout:'#92400e',
 };
 
+const plotBg = 'rgba(0,0,0,0)';
+const gridColor = 'rgba(255,255,255,0.04)';
+const zeroLine = 'rgba(255,255,255,0.08)';
 const layoutBase = {
-  paper_bgcolor:'rgba(0,0,0,0)', plot_bgcolor:'rgba(0,0,0,0)',
-  font:{color:'#718096',size:10}, margin:{l:45,r:16,t:24,b:32},
-  xaxis:{gridcolor:'#edf2f7',zerolinecolor:'#e2e8f0'},
-  yaxis:{gridcolor:'#edf2f7',zerolinecolor:'#e2e8f0'},
-  showlegend:false
+  paper_bgcolor:plotBg, plot_bgcolor:plotBg,
+  font:{family:'JetBrains Mono, monospace', color:'#94a3b8', size:10},
+  margin:{l:50, r:16, t:28, b:36},
+  xaxis:{gridcolor:gridColor, zerolinecolor:zeroLine, tickfont:{size:9}},
+  yaxis:{gridcolor:gridColor, zerolinecolor:zeroLine, tickfont:{size:9}, rangemode:'tozero'},
+  showlegend:false,
 };
 const cfg = {displayModeBar:false, responsive:true};
 
-socket.on('connect', () => document.getElementById('badge').textContent = 'Connected');
-socket.on('disconnect', () => document.getElementById('badge').textContent = 'Disconnected');
+socket.on('connect', () => { const b=document.getElementById('badge'); b.textContent='Connected'; b.className='conn-badge live'; });
+socket.on('disconnect', () => { const b=document.getElementById('badge'); b.textContent='Disconnected'; b.className='conn-badge'; });
 
 socket.on('update', data => {
   domains = data.domains || {};
   const n = Object.keys(domains).length;
-  document.getElementById('badge').textContent = n + ' Domain' + (n!==1?'s':'');
+  const b = document.getElementById('badge');
+  b.textContent = n + ' Domain' + (n!==1?'s':'');
+  b.className = 'conn-badge live';
+
+  // Update phase badge from first active domain
+  const firstActive = Object.values(domains).find(d => d.summary.active);
+  if (firstActive) updatePhaseBadge(firstActive.summary.training_phase);
+
   renderTabs();
   if (selected === 'all') updateAllView();
   else if (domains[selected]) updateDomainView(selected);
 });
+
+function updatePhaseBadge(phase) {
+  const el = document.getElementById('phaseBadge');
+  if (!el) return;
+  const map = {
+    'EXPERT_DEMO': ['EXPERT DEMO', 'expert'],
+    'RANDOM_EXPLORE': ['RANDOM EXPLORE', 'random'],
+    'RL_POLICY': ['RL POLICY', 'rl'],
+  };
+  const [text, cls] = map[phase] || [phase||'—', 'unknown'];
+  el.textContent = text;
+  el.className = 'phase-badge ' + cls;
+}
 
 function renderTabs() {
   const keys = Object.keys(domains);
@@ -705,57 +821,75 @@ function renderTabs() {
 function sel(k) { selected = k; render(); }
 function render() { renderTabs(); if (selected==='all') renderAllView(); else renderDomainView(selected); }
 
-// ========== ALL VIEW ==========
+// ═══════════ ALL VIEW ═══════════
 
 function renderAllView() {
   const vals = Object.values(domains);
-  if (!vals.length) { document.getElementById('content').innerHTML = '<div class="empty">No domains found yet...</div>'; return; }
-  const totSteps = vals.reduce((a,d) => a+d.summary.total_steps, 0);
-  const totEp = vals.reduce((a,d) => a+d.summary.episode_count, 0);
-  const totBumps = vals.reduce((a,d) => a+d.summary.bumps, 0);
-  const totSuc = vals.reduce((a,d) => a+d.summary.successes, 0);
-  const totTo = vals.reduce((a,d) => a+d.summary.timeouts, 0);
-  const active = vals.filter(d => d.summary.active).length;
-  const rets = vals.filter(d => d.summary.episode_count>0).map(d => d.summary.avg_episode_return);
+  if (!vals.length) { document.getElementById('content').innerHTML = '<div class="empty">Scanning for active ROS2 domains...</div>'; return; }
+  const totSteps = vals.reduce((a,d)=>a+d.summary.total_steps,0);
+  const totEp = vals.reduce((a,d)=>a+d.summary.episode_count,0);
+  const totBumps = vals.reduce((a,d)=>a+d.summary.bumps,0);
+  const totSuc = vals.reduce((a,d)=>a+d.summary.successes,0);
+  const totTo = vals.reduce((a,d)=>a+d.summary.timeouts,0);
+  const active = vals.filter(d=>d.summary.active).length;
+  const rets = vals.filter(d=>d.summary.episode_count>0).map(d=>d.summary.avg_episode_return);
   const avgRet = rets.length ? rets.reduce((a,b)=>a+b,0)/rets.length : 0;
+  const expertAvg = vals[0]?.summary?.expert_avg_return || 0;
 
   let h = '<div class="summary-box"><h3>Cross-Domain Summary</h3><div class="summary-grid">' +
     ss('Total Steps', totSteps.toLocaleString()) +
     ss('Episodes', totEp) +
     ss('Bumps', totBumps, C.orange) +
-    ss('Goals Reached', totSuc, C.darkgreen) +
-    ss('Timeouts', totTo, C.darkyellow) +
+    ss('Goals', totSuc, C.green) +
+    ss('Timeouts', totTo, C.amber) +
+    ss('Expert Avg', expertAvg.toFixed(1), C.purple) +
     ss('Avg Return', avgRet.toFixed(1), avgRet>=0?C.green:C.red) +
     ss('Active', active+'/'+vals.length, C.green) +
   '</div></div>';
-  h += '<div class="card"><h3>Episode Returns (All Domains)</h3><div id="allChart" class="chart" style="height:280px"></div></div>';
+  h += '<div class="card"><h3>Episode Returns — All Domains</h3><div id="allChart" class="chart-tall"></div></div>';
   document.getElementById('content').innerHTML = h;
   drawAllChart();
 }
 
 function updateAllView() {
   if (!document.getElementById('allChart')) { renderAllView(); return; }
+  // Update summary stats in place
+  const vals = Object.values(domains);
   drawAllChart();
 }
 
 function drawAllChart() {
   const traces = [];
-  const cls = [C.blue, C.green, C.purple, C.red, C.cyan, C.yellow];
+  const cls = [C.accent, C.green, C.purple, C.cyan, C.orange, C.pink];
   let ci = 0;
   Object.values(domains).forEach(d => {
     const p = d.plot_data;
     if (p.episode_returns.values.length) {
-      traces.push({x:p.episode_returns.episodes, y:p.episode_returns.values, type:'scatter', mode:'lines', name:p.display_name, line:{color:cls[ci++%cls.length],width:2}});
+      traces.push({x:p.episode_returns.episodes, y:p.episode_returns.values, type:'scatter', mode:'lines',
+        name:p.display_name, line:{color:cls[ci++%cls.length], width:2}});
     }
   });
-  if (traces.length) Plotly.react('allChart', traces, {...layoutBase, showlegend:true, legend:{bgcolor:'rgba(0,0,0,0)',font:{size:10}}, xaxis:{...layoutBase.xaxis,title:'Episode'}, yaxis:{...layoutBase.yaxis,title:'Return'}}, cfg);
+  // Add expert baseline
+  const expertAvg = Object.values(domains)[0]?.summary?.expert_avg_return;
+  if (expertAvg && traces.length) {
+    const maxEp = Math.max(...traces.map(t => Math.max(...t.x)));
+    traces.push({x:[1, maxEp], y:[expertAvg, expertAvg], type:'scatter', mode:'lines',
+      name:'Expert Baseline', line:{color:C.amber, width:2, dash:'dot'}});
+  }
+  if (traces.length) {
+    Plotly.react('allChart', traces, {
+      ...layoutBase, showlegend:true, legend:{bgcolor:'rgba(0,0,0,0)', font:{size:10, color:'#94a3b8'}},
+      xaxis:{...layoutBase.xaxis, title:{text:'Episode', font:{size:10}}},
+      yaxis:{...layoutBase.yaxis, title:{text:'Return', font:{size:10}}, rangemode:'tozero'}
+    }, cfg);
+  }
 }
 
 function ss(label, value, color) {
   return '<div class="summary-stat"><div class="label">'+label+'</div><div class="value" style="'+(color?'color:'+color:'')+'">' + value + '</div></div>';
 }
 
-// ========== DOMAIN VIEW ==========
+// ═══════════ DOMAIN VIEW ═══════════
 
 function renderDomainView(k) {
   const d = domains[k]; if (!d) return;
@@ -765,46 +899,67 @@ function renderDomainView(k) {
   const sucPct = total>0 ? (s.successes/total*100).toFixed(0) : 0;
   const toPct  = total>0 ? (s.timeouts/total*100).toFixed(0) : 0;
 
-  let h = '<div class="stats-row">' +
+  // Expert vs RL comparison bar
+  let expertCompare = '';
+  if (s.expert_avg_return !== 0 || s.training_phase === 'RL_POLICY') {
+    const rlAvg = s.avg_episode_return;
+    const expAvg = s.expert_avg_return;
+    const winning = rlAvg > expAvg;
+    expertCompare = '<div class="expert-compare">' +
+      '<div class="ec-item"><div class="ec-label">Expert Baseline</div><div class="ec-value" style="color:'+C.amber+'">'+expAvg.toFixed(1)+'</div></div>' +
+      '<div class="ec-vs">vs</div>' +
+      '<div class="ec-item"><div class="ec-label">RL Average</div><div class="ec-value" style="color:'+(winning?C.green:C.red)+'">'+rlAvg.toFixed(1)+'</div></div>' +
+      '<div class="ec-verdict '+(winning?'winning':'losing')+'">'+(winning?'RL SURPASSED':'EXPERT LEADS')+'</div>' +
+    '</div>';
+  }
+
+  let h = expertCompare;
+
+  // Stats row
+  h += '<div class="stats-row">' +
     statBox('Steps', s.total_steps.toLocaleString(), '', '') +
     statBox('Episodes', s.episode_count, '', '') +
-    statBox('Bumps', s.bumps, 'orange', 'no termination') +
+    statBox('Bumps', s.bumps, 'amber', 'no termination') +
     statBox('Goals', s.successes, 'green', sucPct+'% of eps') +
-    statBox('Timeouts', s.timeouts, 'orange', toPct+'% of eps') +
-    statBox('Cells', s.cells_discovered, 'blue', '') +
+    statBox('Timeouts', s.timeouts, 'amber', toPct+'% of eps') +
+    statBox('Cells', s.cells_discovered, 'cyan', s.frontiers+' frontiers') +
     statBox('Cur Return', s.current_episode_return.toFixed(1), s.current_episode_return>=0?'green':'red', 'step '+s.current_episode_steps) +
-    statBox('Avg Return', s.avg_episode_return.toFixed(1), s.avg_episode_return>=0?'green':'red', '') +
-    statBox('Avg Min Dist', s.avg_min_distance.toFixed(2)+'m', s.avg_min_distance>0.4?'green':'orange', 'closest: '+s.min_min_distance.toFixed(2)+'m') +
+    statBox('Avg Return', s.avg_episode_return.toFixed(1), s.avg_episode_return>=0?'green':'red', 'last '+Math.min(s.episode_count,100)+' eps') +
+    statBox('Avg Min Dist', s.avg_min_distance.toFixed(2)+'m', s.avg_min_distance>0.4?'green':'amber', 'closest '+s.min_min_distance.toFixed(2)+'m') +
   '</div>';
 
-  // Outcome bar (v5: only goal or timeout)
+  // Outcome bar
   if (total > 0) {
     h += '<div class="outcome-bar">';
-    if (s.successes>0) h += '<div class="segment seg-success" style="width:'+sucPct+'%">'+s.successes+' goals</div>';
-    if (s.timeouts>0) h += '<div class="segment seg-timeout" style="width:'+toPct+'%">'+s.timeouts+' timeouts</div>';
+    if (s.successes>0) h += '<div class="seg seg-success" style="width:'+sucPct+'%"></div>';
+    if (s.timeouts>0) h += '<div class="seg seg-timeout" style="width:'+toPct+'%"></div>';
     h += '</div>';
   }
 
-  h += '<div class="grid">' +
+  // Row 1: Camera + Episode Returns (hero chart)
+  h += '<div class="grid-2">' +
     '<div class="card"><h3>Camera Feed</h3>' +
     '<div class="camera-container"><img class="camera-img" id="camImg" src="/stream/'+s.domain_id+'?topic='+encodeURIComponent(defaultTopic)+'"/></div>' +
     '<div class="goal-status" id="goalStatus"></div></div>' +
+    '<div class="card"><h3>Episode Returns vs Expert</h3><div id="epChart" class="chart-tall"></div></div>' +
+  '</div>';
+
+  // Row 2: Reward timeseries + Components
+  h += '<div class="grid-2">' +
     '<div class="card"><h3>Real-Time Reward</h3><div id="rewChart" class="chart"></div></div>' +
-  '</div>';
-
-  h += '<div class="grid">' +
-    '<div class="card"><h3>Episode Returns</h3><div id="epChart" class="chart"></div></div>' +
-    '<div class="card"><h3>Min Distance to Obstacle</h3><div id="minDistChart" class="chart"></div></div>' +
-  '</div>';
-
-  h += '<div class="grid">' +
-    '<div class="card"><h3>Episode Outcomes</h3><div id="outcomeChart" class="chart"></div></div>' +
     '<div class="card"><h3>Reward Components</h3><div id="compChart" class="chart"></div>' +
     '<div class="reward-legend" id="compLegend"></div></div>' +
   '</div>';
 
-  h += '<div class="grid">' +
-    '<div class="card"><h3>Velocity (RL Output)</h3><div id="velChart" class="chart"></div></div>' +
+  // Row 3: Min distance + Velocity
+  h += '<div class="grid-2">' +
+    '<div class="card"><h3>Min Distance to Obstacle</h3><div id="minDistChart" class="chart"></div></div>' +
+    '<div class="card"><h3>Velocity Output</h3><div id="velChart" class="chart"></div></div>' +
+  '</div>';
+
+  // Row 4: Outcomes + Zone Distribution
+  h += '<div class="grid-2">' +
+    '<div class="card"><h3>Episode Outcomes</h3><div id="outcomeChart" class="chart"></div></div>' +
     '<div class="card"><h3>Nav Zone Distribution</h3><div id="zoneChart" class="chart"></div></div>' +
   '</div>';
 
@@ -822,84 +977,121 @@ function updateDomainView(k) {
 
   updateGoalStatus(s.goal_status);
 
-  // Reward chart
+  // Reward chart — fixed at zero
   if (p.rewards.values.length) {
-    Plotly.react('rewChart', [{x:p.rewards.times, y:p.rewards.values, type:'scatter', mode:'lines', line:{color:C.blue,width:2}, fill:'tozeroy', fillcolor:'rgba(102,126,234,0.1)'}], {...layoutBase, xaxis:{...layoutBase.xaxis,title:'Time (s)'}}, cfg);
+    Plotly.react('rewChart', [{x:p.rewards.times, y:p.rewards.values, type:'scatter', mode:'lines',
+      line:{color:C.accent, width:1.5}, fill:'tozeroy', fillcolor:'rgba(99,102,241,0.08)'}],
+    {...layoutBase, xaxis:{...layoutBase.xaxis, title:{text:'Time (s)', font:{size:9}}},
+     yaxis:{...layoutBase.yaxis, rangemode:'tozero'}}, cfg);
   }
 
-  // Episode returns + rolling average
+  // Episode returns + rolling avg + expert baseline
   if (p.episode_returns.values.length) {
     const ra = [];
     for (let i=0; i<p.episode_returns.values.length; i++) {
       const w = p.episode_returns.values.slice(Math.max(0,i-9), i+1);
       ra.push(w.reduce((a,b)=>a+b,0)/w.length);
     }
-    Plotly.react('epChart', [
-      {x:p.episode_returns.episodes, y:p.episode_returns.values, type:'scatter', mode:'lines+markers', name:'Return', line:{color:C.green,width:2}, marker:{size:4}},
-      {x:p.episode_returns.episodes, y:ra, type:'scatter', mode:'lines', name:'10-ep avg', line:{color:C.yellow,width:2.5}}
-    ], {...layoutBase, showlegend:true, legend:{bgcolor:'rgba(0,0,0,0)',x:0.02,y:0.98}, xaxis:{...layoutBase.xaxis,title:'Episode'}}, cfg);
+    const traces = [
+      {x:p.episode_returns.episodes, y:p.episode_returns.values, type:'scatter', mode:'lines',
+        name:'Return', line:{color:C.accent, width:1.5}, opacity:0.5},
+      {x:p.episode_returns.episodes, y:ra, type:'scatter', mode:'lines',
+        name:'10-ep Avg', line:{color:C.green, width:2.5}},
+    ];
+    // Expert baseline line
+    const expertAvg = s.expert_avg_return;
+    if (expertAvg !== 0) {
+      const maxEp = Math.max(...p.episode_returns.episodes);
+      traces.push({x:[1, maxEp], y:[expertAvg, expertAvg], type:'scatter', mode:'lines',
+        name:'Expert Baseline ('+expertAvg.toFixed(1)+')', line:{color:C.amber, width:2, dash:'dot'}});
+    }
+    // Zero line
+    const maxEp2 = Math.max(...p.episode_returns.episodes);
+    traces.push({x:[1, maxEp2], y:[0, 0], type:'scatter', mode:'lines',
+      name:'Zero', line:{color:'rgba(255,255,255,0.15)', width:1}, showlegend:false});
+
+    Plotly.react('epChart', traces, {
+      ...layoutBase, showlegend:true,
+      legend:{bgcolor:'rgba(0,0,0,0)', font:{size:9, color:'#94a3b8'}, x:0.02, y:0.98},
+      xaxis:{...layoutBase.xaxis, title:{text:'Episode', font:{size:9}}},
+      yaxis:{...layoutBase.yaxis, title:{text:'Return', font:{size:9}}, rangemode:'tozero'}
+    }, cfg);
   }
 
-  // Min distance chart with collision + proximity threshold lines
+  // Min distance with threshold lines
   if (p.min_distance.values.length) {
     const t0 = p.min_distance.times[0];
     const tEnd = p.min_distance.times[p.min_distance.times.length-1];
     Plotly.react('minDistChart', [
-      {x:p.min_distance.times, y:p.min_distance.values, type:'scatter', mode:'lines', name:'Min Dist', line:{color:C.orange,width:2}, fill:'tozeroy', fillcolor:'rgba(237,137,54,0.08)'},
-      {x:[t0, tEnd], y:[0.65, 0.65], type:'scatter', mode:'lines', name:'Proximity (0.65m)', line:{color:C.yellow,width:1.5,dash:'dot'}, hoverinfo:'name'},
-      {x:[t0, tEnd], y:[0.30, 0.30], type:'scatter', mode:'lines', name:'Collision (0.30m)', line:{color:C.darkred,width:1.5,dash:'dash'}, hoverinfo:'name'}
-    ], {...layoutBase, showlegend:true, legend:{bgcolor:'rgba(0,0,0,0)',font:{size:9}}, xaxis:{...layoutBase.xaxis,title:'Time (s)'}, yaxis:{...layoutBase.yaxis,title:'meters',rangemode:'tozero'}}, cfg);
+      {x:p.min_distance.times, y:p.min_distance.values, type:'scatter', mode:'lines',
+        name:'Min Dist', line:{color:C.orange, width:1.5}, fill:'tozeroy', fillcolor:'rgba(249,115,22,0.06)'},
+      {x:[t0,tEnd], y:[0.65,0.65], type:'scatter', mode:'lines', name:'Proximity',
+        line:{color:C.amber, width:1, dash:'dot'}, hoverinfo:'name'},
+      {x:[t0,tEnd], y:[0.30,0.30], type:'scatter', mode:'lines', name:'Collision',
+        line:{color:C.red, width:1, dash:'dash'}, hoverinfo:'name'}
+    ], {...layoutBase, showlegend:true, legend:{bgcolor:'rgba(0,0,0,0)', font:{size:9, color:'#94a3b8'}},
+      xaxis:{...layoutBase.xaxis, title:{text:'Time (s)', font:{size:9}}},
+      yaxis:{...layoutBase.yaxis, title:{text:'meters', font:{size:9}}, rangemode:'tozero'}}, cfg);
   }
 
-  // Outcomes pie chart (v5: only goal or timeout)
+  // Outcomes donut
   const oc = p.outcomes;
-  const ovals = [], olabels = [], ocolors = [];
-  if (oc.successes>0)  { ovals.push(oc.successes);  olabels.push('Goal ('+oc.successes+')');       ocolors.push(C.darkgreen); }
-  if (oc.timeouts>0)   { ovals.push(oc.timeouts);   olabels.push('Timeout ('+oc.timeouts+')');     ocolors.push(C.darkyellow); }
+  const ovals=[], olabels=[], ocolors=[];
+  if (oc.successes>0) { ovals.push(oc.successes); olabels.push('Goal ('+oc.successes+')'); ocolors.push(C.green); }
+  if (oc.timeouts>0)  { ovals.push(oc.timeouts);  olabels.push('Timeout ('+oc.timeouts+')'); ocolors.push(C.amber); }
   if (ovals.length) {
-    Plotly.react('outcomeChart', [{values:ovals, labels:olabels, type:'pie', marker:{colors:ocolors}, textinfo:'label+percent', textfont:{size:11}, hole:0.5}], {...layoutBase}, cfg);
+    Plotly.react('outcomeChart', [{values:ovals, labels:olabels, type:'pie',
+      marker:{colors:ocolors}, textinfo:'label+percent', textfont:{size:10, color:'#e2e8f0'},
+      hole:0.55, sort:false}],
+    {...layoutBase}, cfg);
   }
 
-  // Reward components time series
-  const traces = [];
-  const legendItems = [];
+  // Reward components
+  const traces = [], legendItems = [];
   const compOrder = ['discovery','revisit','proximity','progress','goal','step','collision','timeout'];
   compOrder.forEach(n => {
     const cd = p.components[n];
     if (cd && cd.values.length) {
       const color = compColors[n] || C.gray;
-      traces.push({x:cd.times, y:cd.values, type:'scatter', mode:'lines', name:n, line:{color:color, width:1.5}});
-      legendItems.push({name:n, color:color});
+      traces.push({x:cd.times, y:cd.values, type:'scatter', mode:'lines', name:n, line:{color, width:1.5}});
+      legendItems.push({name:n, color});
     }
   });
-  // Also show any unexpected components
   Object.keys(p.components).forEach(n => {
     if (!compOrder.includes(n)) {
       const cd = p.components[n];
       if (cd && cd.values.length) {
-        traces.push({x:cd.times, y:cd.values, type:'scatter', mode:'lines', name:n, line:{color:C.gray, width:1.5}});
+        traces.push({x:cd.times, y:cd.values, type:'scatter', mode:'lines', name:n, line:{color:C.gray, width:1}});
         legendItems.push({name:n, color:C.gray});
       }
     }
   });
   if (traces.length) {
-    Plotly.react('compChart', traces, {...layoutBase, showlegend:false, xaxis:{...layoutBase.xaxis,title:'Time (s)'}}, cfg);
-    const legendEl = document.getElementById('compLegend');
-    if (legendEl) legendEl.innerHTML = legendItems.map(i => '<div class="item"><div class="swatch" style="background:'+i.color+'"></div>'+i.name+'</div>').join('');
+    Plotly.react('compChart', traces, {...layoutBase, showlegend:false,
+      xaxis:{...layoutBase.xaxis, title:{text:'Time (s)', font:{size:9}}},
+      yaxis:{...layoutBase.yaxis, rangemode:'tozero'}}, cfg);
+    const el = document.getElementById('compLegend');
+    if (el) el.innerHTML = legendItems.map(i =>
+      '<div class="item"><div class="swatch" style="background:'+i.color+'"></div>'+i.name+'</div>'
+    ).join('');
   }
 
-  // Velocity chart
+  // Velocity — fixed zero
   if (p.velocity.values.length) {
-    Plotly.react('velChart', [{x:p.velocity.times, y:p.velocity.values, type:'scatter', mode:'lines', line:{color:C.cyan,width:2}, fill:'tozeroy', fillcolor:'rgba(79,209,197,0.1)'}], {...layoutBase, xaxis:{...layoutBase.xaxis,title:'Time (s)'}, yaxis:{...layoutBase.yaxis,title:'m/s'}}, cfg);
+    Plotly.react('velChart', [{x:p.velocity.times, y:p.velocity.values, type:'scatter', mode:'lines',
+      line:{color:C.cyan, width:1.5}, fill:'tozeroy', fillcolor:'rgba(6,182,212,0.06)'}],
+    {...layoutBase, xaxis:{...layoutBase.xaxis, title:{text:'Time (s)', font:{size:9}}},
+     yaxis:{...layoutBase.yaxis, title:{text:'m/s', font:{size:9}}, rangemode:'tozero'}}, cfg);
   }
 
-  // Nav zone distribution pie
-  const zc = {FREE:C.green, AWARE:'#9ae6b4', CAUTION:C.yellow, DANGER:'#feb2b2', EMERGENCY:C.red, CRITICAL:'#9b2c2c'};
-  const zones = Object.entries(p.nav_zones).filter(z => z[1] > 0);
+  // Nav zones donut
+  const zc = {FREE:C.green, AWARE:C.lime, CAUTION:C.amber, DANGER:C.orange, EMERGENCY:C.red, CRITICAL:'#991b1b'};
+  const zones = Object.entries(p.nav_zones).filter(z=>z[1]>0);
   if (zones.length) {
     Plotly.react('zoneChart', [{
       values:zones.map(z=>z[1]), labels:zones.map(z=>z[0]), type:'pie',
-      marker:{colors:zones.map(z=>zc[z[0]]||C.gray)}, textinfo:'label+percent', textfont:{size:10}, hole:0.5
+      marker:{colors:zones.map(z=>zc[z[0]]||C.gray)}, textinfo:'label+percent',
+      textfont:{size:10, color:'#e2e8f0'}, hole:0.55, sort:false
     }], {...layoutBase}, cfg);
   }
 }
@@ -908,21 +1100,27 @@ function updateGoalStatus(gs) {
   const el = document.getElementById('goalStatus');
   if (!el) return;
   if (!gs || Object.keys(gs).length===0) {
-    el.innerHTML = '<div style="color:var(--text-muted);text-align:center;padding:8px;">No goal generator data</div>';
+    el.innerHTML = '<div style="color:var(--text-muted);text-align:center;padding:6px;font-family:var(--mono);font-size:11px;">No goal generator data</div>';
     el.className = 'goal-status'; return;
   }
   const found = gs.found===true;
-  el.className = 'goal-status'+(found?'':' searching');
-  let html = '<div class="status-row"><span class="status-label">Target</span><span class="status-value">'+(gs.target||'\u2014')+'</span></div>';
-  html += '<div class="status-row"><span class="status-label">Status</span><span class="status-value '+(found?'found':'searching')+'">'+(found?'\u2713 Found':'\u25CB Searching...')+'</span></div>';
+  el.className = 'goal-status '+(found?'found':'searching');
+  let html = row('Target', gs.target||'\u2014');
+  html += row('Status', found?'\u2713 Found':'\u25CB Searching...', found?'found':'searching');
   if (found) {
-    html += '<div class="status-row"><span class="status-label">Distance</span><span class="status-value">'+(gs.distance?gs.distance.toFixed(2)+'m':'\u2014')+'</span></div>';
-    html += '<div class="status-row"><span class="status-label">Confidence</span><span class="status-value">'+(gs.confidence?(gs.confidence*100).toFixed(0)+'%':'\u2014')+'</span></div>';
-    if (gs.goal_position) html += '<div class="status-row"><span class="status-label">Goal Pos</span><span class="status-value">('+gs.goal_position[0].toFixed(2)+', '+gs.goal_position[1].toFixed(2)+')</span></div>';
+    html += row('Distance', gs.distance?gs.distance.toFixed(2)+'m':'\u2014');
+    html += row('Confidence', gs.confidence?(gs.confidence*100).toFixed(0)+'%':'\u2014');
+    if (gs.depth_method) html += row('Depth', gs.depth_method);
+    if (gs.goal_position) html += row('Goal', '('+gs.goal_position[0].toFixed(2)+', '+gs.goal_position[1].toFixed(2)+')');
   } else if (gs.message) {
-    html += '<div class="status-row"><span class="status-label">Info</span><span class="status-value" style="font-size:11px">'+gs.message+'</span></div>';
+    html += row('Info', gs.message);
   }
+  if (gs.locked_goal) html += row('Locked', '('+gs.locked_goal[0].toFixed(2)+', '+gs.locked_goal[1].toFixed(2)+')', 'found');
   el.innerHTML = html;
+}
+
+function row(label, value, cls) {
+  return '<div class="status-row"><span class="status-label">'+label+'</span><span class="status-value'+(cls?' '+cls:'')+'">'+value+'</span></div>';
 }
 </script>
 </body>
