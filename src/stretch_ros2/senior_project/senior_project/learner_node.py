@@ -1183,6 +1183,10 @@ class StretchExploreEnv(gym.Env):
         # Ratchet progress for goal-seeking
         self._best_goal_dist = float('inf')
 
+        # Training phase tracking (published in reward breakdown)
+        self._current_training_phase = "EXPERT_DEMO"
+        self._expert_avg_return = 0.0
+
         # Observation space: lidar(36) + goal(5) + vel(2) + prev_act(2) + has_goal(1) + grid(256) + frontier(2) + novelty(1)
         grid_flat_size = GRID_SIZE * GRID_SIZE  # 256
         obs_dim = NUM_LIDAR_BINS + 5 + 2 + 2 + 1 + grid_flat_size + 2 + 1  # = 305
@@ -1585,6 +1589,8 @@ class StretchExploreEnv(gym.Env):
             "explore_stats": stats,
             "episode": self.episode_index,
             "step": self.step_count,
+            "training_phase": self._current_training_phase,
+            "expert_avg_return": self._expert_avg_return,
         }
         msg = StringMsg()
         msg.data = json.dumps(breakdown)
@@ -2032,6 +2038,7 @@ def main():
             # Log expert vs RL comparison
             if t <= demo_steps:
                 expert_avg = expert.get_avg_return()
+                env._expert_avg_return = expert_avg
                 ros.get_logger().info(
                     f"[EXPERT] ep={expert.total_episodes} "
                     f"return={expert.episode_return:+.1f} "
@@ -2066,6 +2073,8 @@ def main():
         # Log phase transition
         if t == demo_steps:
             expert_avg = expert.get_avg_return()
+            env._expert_avg_return = expert_avg
+            env._current_training_phase = "RANDOM_EXPLORE"
             ros.get_logger().info(
                 f"\n{G}{'='*50}\n  EXPERT DEMO PHASE COMPLETE\n{'='*50}{RST}\n"
                 f"  Expert episodes: {expert.total_episodes}\n"
@@ -2076,6 +2085,7 @@ def main():
                 f"{G}{'='*50}{RST}"
             )
         elif t == demo_steps + args.start_steps:
+            env._current_training_phase = "RL_POLICY"
             ros.get_logger().info(
                 f"\n{G}{'='*50}\n  RL POLICY NOW ACTIVE\n{'='*50}{RST}\n"
                 f"  Expert baseline avg return: {expert.get_avg_return():+.1f}\n"

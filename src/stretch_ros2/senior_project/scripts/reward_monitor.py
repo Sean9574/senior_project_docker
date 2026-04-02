@@ -10,8 +10,11 @@ Updated for v5 (never-terminate) learner:
 """
 
 import argparse
+import csv
 import json
 import logging
+import math
+import os
 import signal
 import sys
 import threading
@@ -19,6 +22,8 @@ import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
+from datetime import datetime
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import cv2
@@ -48,6 +53,28 @@ DEFAULT_SCAN_INTERVAL = 15.0
 DEFAULT_CAMERA_FPS = 15.0
 DEFAULT_CAMERA_JPEG_QUALITY = 85
 DEFAULT_CAMERA_MAX_WIDTH = 800
+
+# =============================================================================
+# Experiment CSV Logging
+# =============================================================================
+
+STEP_CSV_COLUMNS = [
+    "wall_clock", "sim_id", "episode", "step", "total_step", "mode", "reward",
+    "r_discovery", "r_revisit", "r_proximity", "r_collision", "r_progress",
+    "r_goal", "r_step", "r_timeout",
+    "min_distance", "nav_zone", "velocity_v", "velocity_w",
+    "robot_x", "robot_y", "goal_dist", "cells_discovered", "frontier_count",
+]
+
+EPISODE_CSV_COLUMNS = [
+    "wall_clock", "sim_id", "episode", "total_steps_at_end", "episode_steps",
+    "episode_return", "outcome", "goals_reached", "cells_discovered",
+    "avg_min_distance", "avg_velocity", "bumps", "training_phase",
+]
+
+SYNC_CSV_COLUMNS = [
+    "wall_clock", "sync_number", "sim_steps", "weighted",
+]
 
 # =============================================================================
 # Data Structures
@@ -95,6 +122,43 @@ class DomainStats:
     training_phase: str = "UNKNOWN"  # EXPERT_DEMO / RANDOM_EXPLORE / RL_POLICY
     expert_episode_returns: deque = field(default_factory=lambda: deque(maxlen=100))
     rl_episode_returns: deque = field(default_factory=lambda: deque(maxlen=100))
+
+    # --- CSV Experiment Logging ---
+    _csv_steps_writer: Optional[object] = field(default=None, repr=False)
+    _csv_steps_file: Optional[object] = field(default=None, repr=False)
+    _csv_episodes_writer: Optional[object] = field(default=None, repr=False)
+    _csv_episodes_file: Optional[object] = field(default=None, repr=False)
+    _csv_start_time: float = 0.0
+    _csv_episode_min_dists: list = field(default_factory=list)
+    _csv_episode_velocities: list = field(default_factory=list)
+    _csv_episode_bumps: int = 0
+    _csv_episode_cells: int = 0
+    _csv_episode_goals: int = 0
+    _csv_steps_logged: int = 0
+    _csv_episodes_logged: int = 0
+
+    def init_csv_logging(self, experiment_dir: str, sim_id: int, start_time: float):
+        """Initialize CSV writers for this domain. Call once after creation."""
+        self._csv_start_time = start_time
+        sim_dir = os.path.join(experiment_dir, f"sim_{sim_id}")
+        os.makedirs(sim_dir, exist_ok=True)
+
+        self._csv_steps_file = open(os.path.join(sim_dir, "steps.csv"), "w", newline="")
+        self._csv_steps_writer = csv.DictWriter(self._csv_steps_file, fieldnames=STEP_CSV_COLUMNS)
+        self._csv_steps_writer.writeheader()
+
+        self._csv_episodes_file = open(os.path.join(sim_dir, "episodes.csv"), "w", newline="")
+        self._csv_episodes_writer = csv.DictWriter(self._csv_episodes_file, fieldnames=EPISODE_CSV_COLUMNS)
+        self._csv_episodes_writer.writeheader()
+
+    def close_csv(self):
+        """Flush final episode and close CSV files."""
+        if self._csv_episodes_writer and self.current_episode_steps > 0:
+            self._flush_csv_episode(time.time() - self._csv_start_time, success=False)
+        if self._csv_steps_file:
+            self._csv_steps_file.close()
+        if self._csv_episodes_file:
+            self._csv_episodes_file.close()
 
     def add_reward(self, reward: float, timestamp: float):
         self.rewards.append(reward)
@@ -157,6 +221,10 @@ class DomainStats:
                     self.successes += 1
                 else:
                     self.timeouts += 1
+                # Flush CSV episode row
+                if self._csv_episodes_writer:
+                    now = time.time() - self._csv_start_time
+                    self._flush_csv_episode(now, success=self._last_success)
             self.current_episode_return = 0.0
             self.current_episode_steps = 0
             self.goals_reached = 0
@@ -168,6 +236,87 @@ class DomainStats:
         # Training phase and expert baseline
         self.training_phase = breakdown.get("training_phase", self.training_phase)
         self.expert_avg_return = breakdown.get("expert_avg_return", self.expert_avg_return)
+
+        # --- CSV Logging ---
+        if self._csv_steps_writer:
+            now = time.time() - self._csv_start_time
+            vel = breakdown.get("velocity", {})
+            state = breakdown.get("state", {})
+            explore_stats = breakdown.get("explore_stats", {})
+            reward_terms = breakdown.get("reward_terms", {})
+
+            self._csv_steps_writer.writerow({
+                "wall_clock": f"{now:.2f}",
+                "sim_id": self.domain_id,
+                "episode": episode_num,
+                "step": breakdown.get("step", 0),
+                "total_step": self.total_steps,
+                "mode": breakdown.get("mode", ""),
+                "reward": f"{breakdown.get('reward', 0.0):.4f}",
+                "r_discovery": f"{reward_terms.get('discovery', 0.0):.4f}",
+                "r_revisit": f"{reward_terms.get('revisit', 0.0):.4f}",
+                "r_proximity": f"{reward_terms.get('proximity', 0.0):.4f}",
+                "r_collision": f"{reward_terms.get('collision', 0.0):.4f}",
+                "r_progress": f"{reward_terms.get('progress', 0.0):.4f}",
+                "r_goal": f"{reward_terms.get('goal', 0.0):.4f}",
+                "r_step": f"{reward_terms.get('step', 0.0):.4f}",
+                "r_timeout": f"{reward_terms.get('timeout', 0.0):.4f}",
+                "min_distance": f"{min_dist:.4f}",
+                "nav_zone": zone,
+                "velocity_v": f"{vel.get('v', 0.0):.4f}",
+                "velocity_w": f"{vel.get('w', 0.0):.4f}",
+                "robot_x": f"{state.get('x', 0.0):.3f}",
+                "robot_y": f"{state.get('y', 0.0):.3f}",
+                "goal_dist": f"{state.get('goal_dist', 0.0):.3f}",
+                "cells_discovered": explore_stats.get("total_discovered", 0),
+                "frontier_count": explore_stats.get("frontier_count", 0),
+            })
+            self._csv_steps_logged += 1
+            if self._csv_steps_logged % 500 == 0:
+                self._csv_steps_file.flush()
+
+            # Track per-episode accumulators for CSV
+            if min_dist > 0:
+                self._csv_episode_min_dists.append(min_dist)
+            self._csv_episode_velocities.append(abs(vel.get("v", 0.0)))
+            if collision:
+                self._csv_episode_bumps += 1
+            self._csv_episode_cells = explore_stats.get("total_discovered", 0)
+            self._csv_episode_goals = breakdown.get("goals_reached", 0)
+
+    def _flush_csv_episode(self, wall_clock: float, success: bool = False):
+        """Write one episode summary row to CSV."""
+        if not self._csv_episodes_writer:
+            return
+        avg_min_d = (
+            sum(self._csv_episode_min_dists) / len(self._csv_episode_min_dists)
+            if self._csv_episode_min_dists else 0.0
+        )
+        avg_vel = (
+            sum(self._csv_episode_velocities) / len(self._csv_episode_velocities)
+            if self._csv_episode_velocities else 0.0
+        )
+        self._csv_episodes_writer.writerow({
+            "wall_clock": f"{wall_clock:.2f}",
+            "sim_id": self.domain_id,
+            "episode": self.last_episode_num,
+            "total_steps_at_end": self.total_steps,
+            "episode_steps": self.current_episode_steps,
+            "episode_return": f"{self.current_episode_return:.2f}",
+            "outcome": "goal_reached" if success else "timeout",
+            "goals_reached": self._csv_episode_goals,
+            "cells_discovered": self._csv_episode_cells,
+            "avg_min_distance": f"{avg_min_d:.4f}",
+            "avg_velocity": f"{avg_vel:.4f}",
+            "bumps": self._csv_episode_bumps,
+            "training_phase": self.training_phase,
+        })
+        self._csv_episodes_file.flush()
+        self._csv_episodes_logged += 1
+        # Reset accumulators
+        self._csv_episode_min_dists = []
+        self._csv_episode_velocities = []
+        self._csv_episode_bumps = 0
 
     def update_goal_status(self, status: Dict):
         self.goal_status = status
@@ -1129,10 +1278,493 @@ function row(label, value, cls) {
 
 
 # =============================================================================
+# Sync Event Monitor (watches checkpoints for weight averaging events)
+# =============================================================================
+
+class SyncMonitor:
+    """Watches checkpoint dirs for _last_sync metadata changes."""
+
+    def __init__(self, ckpt_dir: str, num_sims: int, experiment_dir: str, start_time: float):
+        self.ckpt_dir = ckpt_dir
+        self.num_sims = num_sims
+        self.start_time = start_time
+        self.last_sync_time_str = None
+        self.sync_count = 0
+
+        self.sync_file = open(os.path.join(experiment_dir, "sync_events.csv"), "w", newline="")
+        self.sync_writer = csv.DictWriter(self.sync_file, fieldnames=SYNC_CSV_COLUMNS)
+        self.sync_writer.writeheader()
+
+    def check(self):
+        """Check if a new sync happened by reading checkpoint metadata."""
+        try:
+            import torch
+        except ImportError:
+            return
+        ckpt_path = os.path.join(self.ckpt_dir, "sim_0", "td3_safe_rl_agent.pt")
+        if not os.path.exists(ckpt_path):
+            return
+        try:
+            ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+            sync_meta = ckpt.get("_last_sync")
+            if sync_meta is None:
+                return
+            sync_time_str = sync_meta.get("time", "")
+            if sync_time_str == self.last_sync_time_str:
+                return
+            self.last_sync_time_str = sync_time_str
+            self.sync_count += 1
+            now = time.time() - self.start_time
+            self.sync_writer.writerow({
+                "wall_clock": f"{now:.2f}",
+                "sync_number": self.sync_count,
+                "sim_steps": json.dumps(sync_meta.get("steps_at_sync", [])),
+                "weighted": sync_meta.get("weighted", False),
+            })
+            self.sync_file.flush()
+            print(f"  [SYNC] #{self.sync_count} detected at {now:.0f}s")
+        except Exception:
+            pass  # Checkpoint might be mid-write
+
+    def close(self):
+        self.sync_file.close()
+
+
+# =============================================================================
+# Graph Generation (reads CSVs, produces matplotlib figures)
+# =============================================================================
+
+def generate_experiment_graphs(experiment_dirs: List[str], output_dir: str, window: int = 20):
+    """
+    Generate publication-quality graphs comparing experiment runs.
+    Each experiment_dir should contain sim_*/episodes.csv, sim_*/steps.csv, etc.
+    """
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        import matplotlib.ticker as mticker
+        import numpy as np
+        import pandas as pd
+    except ImportError as e:
+        print(f"[GRAPHS] Missing dependency: {e}. Install matplotlib, pandas, numpy.")
+        return []
+
+    COLORS = ["#2563eb", "#dc2626", "#16a34a", "#ea580c", "#9333ea", "#0891b2", "#ca8a04", "#db2777"]
+    SIM_COLORS = ["#60a5fa", "#f87171", "#4ade80", "#fb923c", "#c084fc", "#22d3ee", "#facc15", "#f472b6"]
+
+    plt.rcParams.update({
+        "figure.facecolor": "white", "axes.facecolor": "white",
+        "axes.grid": True, "axes.spines.top": False, "axes.spines.right": False,
+        "grid.alpha": 0.3, "grid.linewidth": 0.5, "font.size": 11,
+        "axes.titlesize": 13, "axes.titleweight": "bold", "axes.labelsize": 11,
+        "legend.fontsize": 9, "legend.framealpha": 0.9,
+        "figure.dpi": 150, "savefig.dpi": 300, "savefig.bbox": "tight",
+    })
+
+    os.makedirs(output_dir, exist_ok=True)
+    saved_files = []
+
+    # Load experiments
+    experiments = []
+    for exp_dir in experiment_dirs:
+        exp_dir = os.path.expanduser(exp_dir)
+        config = {}
+        cfg_path = os.path.join(exp_dir, "config.json")
+        if os.path.exists(cfg_path):
+            with open(cfg_path) as f:
+                config = json.load(f)
+
+        label = config.get("label", os.path.basename(exp_dir))
+        sim_episodes = {}
+        sim_steps = {}
+        for sim_dir in sorted(Path(exp_dir).glob("sim_*")):
+            sid = int(sim_dir.name.split("_")[1])
+            ep_path = sim_dir / "episodes.csv"
+            if ep_path.exists():
+                df = pd.read_csv(ep_path)
+                if len(df) > 0:
+                    sim_episodes[sid] = df
+            st_path = sim_dir / "steps.csv"
+            if st_path.exists():
+                df = pd.read_csv(st_path)
+                if len(df) > 0:
+                    sim_steps[sid] = df
+
+        sync_events = None
+        sync_path = os.path.join(exp_dir, "sync_events.csv")
+        if os.path.exists(sync_path):
+            df = pd.read_csv(sync_path)
+            if len(df) > 0:
+                sync_events = df
+
+        num_sims = config.get("num_sims", max(len(sim_episodes), 1))
+        experiments.append({
+            "label": label, "num_sims": num_sims,
+            "sim_episodes": sim_episodes, "sim_steps": sim_steps,
+            "sync_events": sync_events,
+        })
+
+    if not experiments:
+        print("[GRAPHS] No experiment data found.")
+        return []
+
+    def rolling(values, w):
+        return pd.Series(values).rolling(window=w, min_periods=1).mean().values
+
+    def aggregate(exp):
+        frames = list(exp["sim_episodes"].values())
+        if not frames:
+            return pd.DataFrame()
+        df = pd.concat(frames, ignore_index=True).sort_values("wall_clock").reset_index(drop=True)
+        return df
+
+    def sim_label(exp):
+        n = exp["num_sims"]
+        return f"{exp['label']} ({n} sim{'s' if n > 1 else ''})"
+
+    # --- Fig 1: Convergence vs wall-clock ---
+    fig, ax = plt.subplots(figsize=(10, 6))
+    for i, exp in enumerate(experiments):
+        c = COLORS[i % len(COLORS)]
+        eps = aggregate(exp)
+        if eps.empty:
+            continue
+        t = eps["wall_clock"].values / 60.0
+        r = eps["episode_return"].values
+        ax.plot(t, r, color=c, alpha=0.12, linewidth=0.5)
+        ax.plot(t, rolling(r, window), color=c, linewidth=2.2, label=sim_label(exp))
+    ax.set_xlabel("Wall-Clock Time (minutes)")
+    ax.set_ylabel("Episode Return")
+    ax.set_title("Convergence: Episode Return vs Wall-Clock Time")
+    ax.legend(loc="lower right")
+    ax.axhline(y=0, color="gray", linewidth=0.5, linestyle="--", alpha=0.5)
+    p = os.path.join(output_dir, "01_convergence_wallclock.png")
+    fig.savefig(p); plt.close(fig); saved_files.append(p)
+
+    # --- Fig 2: Convergence vs total steps ---
+    fig, ax = plt.subplots(figsize=(10, 6))
+    for i, exp in enumerate(experiments):
+        c = COLORS[i % len(COLORS)]
+        eps = aggregate(exp)
+        if eps.empty:
+            continue
+        s = eps["total_steps_at_end"].values
+        r = eps["episode_return"].values
+        ax.plot(s, r, color=c, alpha=0.12, linewidth=0.5)
+        ax.plot(s, rolling(r, window), color=c, linewidth=2.2, label=sim_label(exp))
+    ax.set_xlabel("Total Environment Steps")
+    ax.set_ylabel("Episode Return")
+    ax.set_title("Sample Efficiency: Episode Return vs Total Steps")
+    ax.legend(loc="lower right")
+    ax.axhline(y=0, color="gray", linewidth=0.5, linestyle="--", alpha=0.5)
+    ax.xaxis.set_major_formatter(mticker.FuncFormatter(lambda x, _: f"{x/1000:.0f}k"))
+    p = os.path.join(output_dir, "02_convergence_steps.png")
+    fig.savefig(p); plt.close(fig); saved_files.append(p)
+
+    # --- Fig 3: Goal success rate ---
+    fig, ax = plt.subplots(figsize=(10, 6))
+    for i, exp in enumerate(experiments):
+        c = COLORS[i % len(COLORS)]
+        eps = aggregate(exp)
+        if eps.empty:
+            continue
+        t = eps["wall_clock"].values / 60.0
+        succ = (eps["outcome"] == "goal_reached").astype(float).values
+        ax.plot(t, rolling(succ, 50) * 100, color=c, linewidth=2.2, label=sim_label(exp))
+    ax.set_xlabel("Wall-Clock Time (minutes)")
+    ax.set_ylabel("Goal Success Rate (%)")
+    ax.set_title("Goal Success Rate (50-episode rolling window)")
+    ax.legend(loc="lower right")
+    ax.set_ylim(-2, 102)
+    p = os.path.join(output_dir, "03_success_rate.png")
+    fig.savefig(p); plt.close(fig); saved_files.append(p)
+
+    # --- Fig 4: Exploration coverage ---
+    fig, ax = plt.subplots(figsize=(10, 6))
+    for i, exp in enumerate(experiments):
+        c = COLORS[i % len(COLORS)]
+        for j, (sid, df) in enumerate(exp["sim_episodes"].items()):
+            if df.empty:
+                continue
+            label = sim_label(exp) if j == 0 else None
+            alpha = 0.8 if exp["num_sims"] == 1 else 0.5
+            ax.plot(df["wall_clock"].values / 60.0, df["cells_discovered"].values,
+                    color=c, alpha=alpha, linewidth=1.5, label=label)
+    ax.set_xlabel("Wall-Clock Time (minutes)")
+    ax.set_ylabel("Cells Discovered")
+    ax.set_title("Exploration Coverage Over Time (per sim)")
+    ax.legend(loc="lower right")
+    p = os.path.join(output_dir, "04_exploration_coverage.png")
+    fig.savefig(p); plt.close(fig); saved_files.append(p)
+
+    # --- Fig 5: Reward breakdown per experiment ---
+    comp_defs = [
+        ("r_discovery", "Discovery", "#8b5cf6"), ("r_progress", "Progress", "#22c55e"),
+        ("r_step", "Step Cost", "#64748b"), ("r_revisit", "Revisit", "#ec4899"),
+        ("r_proximity", "Proximity", "#f97316"), ("r_collision", "Collision", "#ef4444"),
+        ("r_goal", "Goal", "#eab308"), ("r_timeout", "Timeout", "#92400e"),
+    ]
+    for exp in experiments:
+        frames = list(exp["sim_steps"].values())
+        if not frames:
+            continue
+        all_st = pd.concat(frames, ignore_index=True).sort_values("wall_clock")
+        fig, ax = plt.subplots(figsize=(12, 5))
+        t = all_st["wall_clock"].values / 60.0
+        for col, clabel, color in comp_defs:
+            if col in all_st.columns:
+                ax.plot(t, rolling(all_st[col].values, 500), color=color, linewidth=1.5,
+                        label=clabel, alpha=0.85)
+        ax.set_xlabel("Wall-Clock Time (minutes)")
+        ax.set_ylabel("Reward Component (rolling avg)")
+        ax.set_title(f"Reward Breakdown — {exp['label']}")
+        ax.legend(loc="upper right", ncol=2, fontsize=8)
+        ax.axhline(y=0, color="gray", linewidth=0.5, linestyle="--", alpha=0.5)
+        safe = exp["label"].replace(" ", "_").replace("/", "_")[:40]
+        p = os.path.join(output_dir, f"05_reward_breakdown_{safe}.png")
+        fig.savefig(p); plt.close(fig); saved_files.append(p)
+
+    # --- Fig 6: Sync event impact ---
+    for exp in experiments:
+        if exp["sync_events"] is None or exp["sync_events"].empty:
+            continue
+        eps = aggregate(exp)
+        if eps.empty:
+            continue
+        fig, ax = plt.subplots(figsize=(10, 6))
+        t = eps["wall_clock"].values / 60.0
+        r = eps["episode_return"].values
+        ax.plot(t, r, color="#94a3b8", alpha=0.15, linewidth=0.5)
+        ax.plot(t, rolling(r, 20), color=COLORS[0], linewidth=2.0, label="Return (smoothed)")
+        for j, st in enumerate(exp["sync_events"]["wall_clock"].values):
+            ax.axvline(x=st / 60.0, color="#ef4444", linewidth=1.0, linestyle="--", alpha=0.6,
+                       label="Weight Sync" if j == 0 else None)
+        ax.set_xlabel("Wall-Clock Time (minutes)")
+        ax.set_ylabel("Episode Return")
+        ax.set_title(f"Sync Event Impact — {exp['label']}")
+        ax.legend(loc="lower right")
+        safe = exp["label"].replace(" ", "_").replace("/", "_")[:40]
+        p = os.path.join(output_dir, f"06_sync_impact_{safe}.png")
+        fig.savefig(p); plt.close(fig); saved_files.append(p)
+
+    # --- Fig 7: Time to threshold ---
+    all_returns = []
+    for exp in experiments:
+        eps = aggregate(exp)
+        if not eps.empty:
+            all_returns.extend(eps["episode_return"].values)
+    if all_returns:
+        max_ret = np.percentile(all_returns, 90)
+        thresholds = [max_ret * 0.25, max_ret * 0.5, max_ret * 0.75] if max_ret > 0 else [-100, -50, 0]
+        fig, ax = plt.subplots(figsize=(10, 6))
+        x = np.arange(len(thresholds))
+        bw = 0.8 / max(len(experiments), 1)
+        for i, exp in enumerate(experiments):
+            eps = aggregate(exp)
+            if eps.empty:
+                continue
+            t = eps["wall_clock"].values / 60.0
+            r = eps["episode_return"].values
+            sm = rolling(r, window)
+            reach = []
+            for th in thresholds:
+                hit = np.where(sm >= th)[0]
+                reach.append(t[hit[0]] if len(hit) > 0 else (t[-1] if len(t) > 0 else 0))
+            off = (i - len(experiments) / 2 + 0.5) * bw
+            bars = ax.bar(x + off, reach, bw, color=COLORS[i % len(COLORS)],
+                          label=sim_label(exp), alpha=0.85, edgecolor="white", linewidth=0.5)
+            for bar, val in zip(bars, reach):
+                ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.5,
+                        f"{val:.1f}", ha="center", va="bottom", fontsize=8, fontweight="bold")
+        ax.set_xlabel("Return Threshold")
+        ax.set_ylabel("Time to Reach (minutes)")
+        ax.set_title("Time to Convergence Threshold")
+        ax.set_xticks(x)
+        ax.set_xticklabels([f"{t:.0f}" for t in thresholds])
+        ax.legend()
+        p = os.path.join(output_dir, "07_time_to_threshold.png")
+        fig.savefig(p); plt.close(fig); saved_files.append(p)
+
+    # --- Fig 8: Per-sim returns ---
+    for exp in experiments:
+        if exp["num_sims"] <= 1:
+            continue
+        fig, ax = plt.subplots(figsize=(10, 6))
+        for sid, df in exp["sim_episodes"].items():
+            if df.empty:
+                continue
+            t = df["wall_clock"].values / 60.0
+            r = df["episode_return"].values
+            c = SIM_COLORS[sid % len(SIM_COLORS)]
+            ax.plot(t, r, color=c, alpha=0.1, linewidth=0.5)
+            ax.plot(t, rolling(r, 15), color=c, linewidth=1.8, label=f"Sim {sid}")
+        ax.set_xlabel("Wall-Clock Time (minutes)")
+        ax.set_ylabel("Episode Return")
+        ax.set_title(f"Per-Sim Learning Curves — {exp['label']}")
+        ax.legend(loc="lower right", ncol=2)
+        ax.axhline(y=0, color="gray", linewidth=0.5, linestyle="--", alpha=0.5)
+        safe = exp["label"].replace(" ", "_").replace("/", "_")[:40]
+        p = os.path.join(output_dir, f"08_per_sim_returns_{safe}.png")
+        fig.savefig(p); plt.close(fig); saved_files.append(p)
+
+    # --- Fig 9: Safety metrics ---
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+    for i, exp in enumerate(experiments):
+        c = COLORS[i % len(COLORS)]
+        eps = aggregate(exp)
+        if eps.empty:
+            continue
+        lb = sim_label(exp)
+        t = eps["wall_clock"].values / 60.0
+        if "avg_min_distance" in eps.columns:
+            ax1.plot(t, rolling(eps["avg_min_distance"].values, 50), color=c, linewidth=2.0, label=lb)
+        if "bumps" in eps.columns:
+            ax2.plot(t, rolling(eps["bumps"].values.astype(float), 50), color=c, linewidth=2.0, label=lb)
+    ax1.set_xlabel("Wall-Clock Time (min)"); ax1.set_ylabel("Avg Min Distance (m)")
+    ax1.set_title("Obstacle Awareness"); ax1.legend(loc="lower right", fontsize=8)
+    ax2.set_xlabel("Wall-Clock Time (min)"); ax2.set_ylabel("Bumps per Episode")
+    ax2.set_title("Collision Frequency"); ax2.legend(loc="upper right", fontsize=8)
+    fig.tight_layout()
+    p = os.path.join(output_dir, "09_safety_metrics.png")
+    fig.savefig(p); plt.close(fig); saved_files.append(p)
+
+    # --- Fig 10: Expert State Machine vs RL Policy convergence ---
+    for exp in experiments:
+        eps = aggregate(exp)
+        if eps.empty or "training_phase" not in eps.columns:
+            continue
+
+        expert_eps = eps[eps["training_phase"] == "EXPERT_DEMO"]
+        rl_eps = eps[eps["training_phase"] == "RL_POLICY"]
+
+        if expert_eps.empty and rl_eps.empty:
+            continue
+
+        fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+
+        # 10a: Episode return over time — expert vs RL with baseline
+        ax = axes[0, 0]
+        if not expert_eps.empty:
+            t_exp = expert_eps["wall_clock"].values / 60.0
+            r_exp = expert_eps["episode_return"].values
+            ax.plot(t_exp, r_exp, color="#f59e0b", alpha=0.2, linewidth=0.5)
+            ax.plot(t_exp, rolling(r_exp, min(15, len(r_exp))), color="#f59e0b",
+                    linewidth=2.5, label="Expert State Machine")
+            expert_mean = r_exp.mean()
+            # Extend baseline across full time range
+            all_t = eps["wall_clock"].values / 60.0
+            ax.axhline(y=expert_mean, color="#f59e0b", linewidth=1.5, linestyle="--",
+                        alpha=0.7, label=f"Expert Avg ({expert_mean:.0f})")
+        if not rl_eps.empty:
+            t_rl = rl_eps["wall_clock"].values / 60.0
+            r_rl = rl_eps["episode_return"].values
+            ax.plot(t_rl, r_rl, color="#2563eb", alpha=0.15, linewidth=0.5)
+            ax.plot(t_rl, rolling(r_rl, min(15, len(r_rl))), color="#2563eb",
+                    linewidth=2.5, label="RL Policy")
+        # Mark random exploration phase
+        random_eps = eps[eps["training_phase"] == "RANDOM_EXPLORE"]
+        if not random_eps.empty:
+            t_rand = random_eps["wall_clock"].values / 60.0
+            r_rand = random_eps["episode_return"].values
+            ax.plot(t_rand, rolling(r_rand, min(10, len(r_rand))), color="#94a3b8",
+                    linewidth=1.5, linestyle=":", label="Random Explore", alpha=0.7)
+        ax.set_xlabel("Wall-Clock Time (minutes)")
+        ax.set_ylabel("Episode Return")
+        ax.set_title("Expert vs RL: Episode Return")
+        ax.legend(loc="lower right", fontsize=8)
+        ax.axhline(y=0, color="gray", linewidth=0.5, linestyle="--", alpha=0.3)
+
+        # 10b: Goal success rate — expert vs RL
+        ax = axes[0, 1]
+        if not expert_eps.empty:
+            succ_exp = (expert_eps["outcome"] == "goal_reached").astype(float).values
+            t_exp = expert_eps["wall_clock"].values / 60.0
+            w_exp = min(20, len(succ_exp))
+            ax.plot(t_exp, rolling(succ_exp, w_exp) * 100, color="#f59e0b",
+                    linewidth=2.5, label="Expert")
+        if not rl_eps.empty:
+            succ_rl = (rl_eps["outcome"] == "goal_reached").astype(float).values
+            t_rl = rl_eps["wall_clock"].values / 60.0
+            w_rl = min(20, len(succ_rl))
+            ax.plot(t_rl, rolling(succ_rl, w_rl) * 100, color="#2563eb",
+                    linewidth=2.5, label="RL Policy")
+        ax.set_xlabel("Wall-Clock Time (minutes)")
+        ax.set_ylabel("Goal Success Rate (%)")
+        ax.set_title("Expert vs RL: Success Rate")
+        ax.legend(loc="lower right", fontsize=8)
+        ax.set_ylim(-2, 102)
+
+        # 10c: Bumps per episode — expert vs RL (safety comparison)
+        ax = axes[1, 0]
+        if not expert_eps.empty and "bumps" in expert_eps.columns:
+            t_exp = expert_eps["wall_clock"].values / 60.0
+            b_exp = expert_eps["bumps"].values.astype(float)
+            ax.plot(t_exp, rolling(b_exp, min(15, len(b_exp))), color="#f59e0b",
+                    linewidth=2.5, label="Expert")
+        if not rl_eps.empty and "bumps" in rl_eps.columns:
+            t_rl = rl_eps["wall_clock"].values / 60.0
+            b_rl = rl_eps["bumps"].values.astype(float)
+            ax.plot(t_rl, rolling(b_rl, min(15, len(b_rl))), color="#2563eb",
+                    linewidth=2.5, label="RL Policy")
+        ax.set_xlabel("Wall-Clock Time (minutes)")
+        ax.set_ylabel("Bumps per Episode")
+        ax.set_title("Expert vs RL: Collision Safety")
+        ax.legend(loc="upper right", fontsize=8)
+
+        # 10d: Summary bar chart — side by side averages
+        ax = axes[1, 1]
+        metrics = []
+        expert_vals = []
+        rl_vals = []
+        if not expert_eps.empty and not rl_eps.empty:
+            metrics.append("Avg Return")
+            expert_vals.append(expert_eps["episode_return"].mean())
+            rl_vals.append(rl_eps["episode_return"].mean())
+
+            metrics.append("Success %")
+            expert_vals.append((expert_eps["outcome"] == "goal_reached").mean() * 100)
+            rl_vals.append((rl_eps["outcome"] == "goal_reached").mean() * 100)
+
+            if "bumps" in expert_eps.columns:
+                metrics.append("Avg Bumps")
+                expert_vals.append(expert_eps["bumps"].astype(float).mean())
+                rl_vals.append(rl_eps["bumps"].astype(float).mean())
+
+            if "avg_min_distance" in expert_eps.columns:
+                metrics.append("Avg Min Dist")
+                expert_vals.append(expert_eps["avg_min_distance"].mean())
+                rl_vals.append(rl_eps["avg_min_distance"].mean())
+
+        if metrics:
+            x = np.arange(len(metrics))
+            bw = 0.35
+            ax.bar(x - bw/2, expert_vals, bw, color="#f59e0b", label="Expert", alpha=0.85)
+            ax.bar(x + bw/2, rl_vals, bw, color="#2563eb", label="RL Policy", alpha=0.85)
+            ax.set_xticks(x)
+            ax.set_xticklabels(metrics, fontsize=9)
+            ax.legend(fontsize=8)
+            # Add value labels
+            for xi, (ev, rv) in enumerate(zip(expert_vals, rl_vals)):
+                ax.text(xi - bw/2, ev + 0.5, f"{ev:.1f}", ha="center", va="bottom", fontsize=7, fontweight="bold", color="#b45309")
+                ax.text(xi + bw/2, rv + 0.5, f"{rv:.1f}", ha="center", va="bottom", fontsize=7, fontweight="bold", color="#1d4ed8")
+        ax.set_title("Expert vs RL: Summary Comparison")
+
+        fig.suptitle(f"Expert State Machine vs RL Policy — {exp['label']}", fontsize=14, fontweight="bold", y=1.01)
+        fig.tight_layout()
+        safe = exp["label"].replace(" ", "_").replace("/", "_")[:40]
+        p = os.path.join(output_dir, f"10_expert_vs_rl_{safe}.png")
+        fig.savefig(p); plt.close(fig); saved_files.append(p)
+
+    print(f"[GRAPHS] Generated {len(saved_files)} figures in {output_dir}")
+    return saved_files
+
+
+# =============================================================================
 # Flask App
 # =============================================================================
 
-def create_app(stats: Dict[str, DomainStats], mgr: MultiDomainManager):
+def create_app(stats: Dict[str, DomainStats], mgr: MultiDomainManager, experiment_dir: str = ""):
     app = Flask(__name__)
     app.config["SECRET_KEY"] = "rl_monitor"
     CORS(app)
@@ -1149,6 +1781,38 @@ def create_app(stats: Dict[str, DomainStats], mgr: MultiDomainManager):
         except:
             domain_id = 0
         return jsonify({"domain_id": domain_id, "topics": mgr.get_image_topics(domain_id)})
+
+    @app.route("/api/generate_graphs", methods=["POST"])
+    def api_generate_graphs():
+        """Generate graphs from current experiment data. POST with optional JSON body:
+        {"dirs": ["path1", "path2"], "output": "figures/", "window": 20}
+        If no dirs given, uses the current experiment_dir."""
+        data = request.get_json(silent=True) or {}
+        dirs = data.get("dirs", [experiment_dir] if experiment_dir else [])
+        out = data.get("output", os.path.join(experiment_dir, "figures") if experiment_dir else "./figures")
+        w = data.get("window", 20)
+        if not dirs:
+            return jsonify({"error": "No experiment directories configured"}), 400
+        try:
+            files = generate_experiment_graphs(dirs, out, window=w)
+            return jsonify({"success": True, "figures": files, "output_dir": out})
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+
+    @app.route("/api/experiment_status")
+    def api_experiment_status():
+        """Return current experiment logging status."""
+        csv_stats = {}
+        for key, ds in stats.items():
+            csv_stats[key] = {
+                "steps_logged": ds._csv_steps_logged,
+                "episodes_logged": ds._csv_episodes_logged,
+            }
+        return jsonify({
+            "experiment_dir": experiment_dir,
+            "logging_active": bool(experiment_dir),
+            "domains": csv_stats,
+        })
 
     def mjpeg_generator(domain_id: int, topic: str):
         cam = mgr.get_camera(domain_id)
@@ -1185,19 +1849,95 @@ def create_app(stats: Dict[str, DomainStats], mgr: MultiDomainManager):
 # =============================================================================
 
 def main():
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(
+        description="RL Training Monitor with experiment data logging and graph generation",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+    # Live monitor only (original behavior)
+    python reward_monitor.py
+
+    # Monitor + log experiment data
+    python reward_monitor.py --experiment ~/experiments/baseline_1sim --label "1 Sim Baseline"
+
+    # Monitor + log + track weight sync events
+    python reward_monitor.py --experiment ~/experiments/parallel_4sim \\
+        --label "4 Sims, sync 5min" --sync-dir ~/rl_checkpoints
+
+    # Generate graphs from saved experiments (no live monitor)
+    python reward_monitor.py --generate-graphs \\
+        --graph-dirs ~/experiments/baseline ~/experiments/parallel_4sim \\
+        --graph-output ~/figures
+        """,
+    )
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
     parser.add_argument("--scan-start", type=int, default=DEFAULT_SCAN_START)
     parser.add_argument("--scan-end", type=int, default=DEFAULT_SCAN_END)
     parser.add_argument("--scan-interval", type=float, default=DEFAULT_SCAN_INTERVAL)
     parser.add_argument("--namespaces", nargs="*", default=["", "stretch"])
+
+    # Experiment logging
+    parser.add_argument("--experiment", type=str, default="",
+                        help="Directory to save experiment CSVs (enables logging)")
+    parser.add_argument("--label", type=str, default="",
+                        help="Human-readable experiment label")
+    parser.add_argument("--sync-dir", type=str, default="",
+                        help="Checkpoint directory to monitor for sync events")
+    parser.add_argument("--sync-check-interval", type=float, default=30.0,
+                        help="Seconds between sync event checks (default: 30)")
+
+    # Graph generation (offline mode)
+    parser.add_argument("--generate-graphs", action="store_true",
+                        help="Generate graphs and exit (no live monitor)")
+    parser.add_argument("--graph-dirs", type=str, nargs="+", default=[],
+                        help="Experiment directories to compare in graphs")
+    parser.add_argument("--graph-output", type=str, default="./figures",
+                        help="Output directory for generated figures")
+    parser.add_argument("--graph-window", type=int, default=20,
+                        help="Rolling average window for graphs (default: 20)")
+
     args = parser.parse_args()
+
+    # --- Offline graph generation mode ---
+    if args.generate_graphs:
+        if not args.graph_dirs:
+            print("Error: --graph-dirs required with --generate-graphs")
+            sys.exit(1)
+        generate_experiment_graphs(args.graph_dirs, args.graph_output, window=args.graph_window)
+        sys.exit(0)
+
+    # --- Experiment directory setup ---
+    experiment_dir = ""
+    start_time = time.time()
+    sync_monitor = None
+
+    if args.experiment:
+        experiment_dir = os.path.expanduser(args.experiment)
+        os.makedirs(experiment_dir, exist_ok=True)
+        config = {
+            "label": args.label or os.path.basename(experiment_dir),
+            "start_time": datetime.now().isoformat(),
+            "scan_start": args.scan_start,
+            "scan_end": args.scan_end,
+            "sync_dir": args.sync_dir,
+        }
+        with open(os.path.join(experiment_dir, "config.json"), "w") as f:
+            json.dump(config, f, indent=2)
+
+        if args.sync_dir:
+            sync_dir = os.path.expanduser(args.sync_dir)
+            # Count sim dirs to determine num_sims
+            num_sims = len(list(Path(sync_dir).glob("sim_*"))) or 1
+            sync_monitor = SyncMonitor(sync_dir, num_sims, experiment_dir, start_time)
 
     print(f"""
     RL Training Monitor (Reward v5)
     ================================
     http://localhost:{args.port}
     Scanning domains {args.scan_start}-{args.scan_end}
+    {"Experiment: " + experiment_dir if experiment_dir else "Experiment logging: OFF"}
+    {"Label: " + args.label if args.label else ""}
+    {"Sync monitor: " + args.sync_dir if args.sync_dir else ""}
 
     REWARD SYSTEM:
       Terminal:  goal=+2000, timeout=-50 (collision NEVER terminates)
@@ -1212,7 +1952,18 @@ def main():
     mgr = MultiDomainManager(stats)
     mgr.discover_domains(args.scan_start, args.scan_end)
 
-    app, sio, updater = create_app(stats, mgr)
+    # Initialize CSV logging for any domains already discovered
+    if experiment_dir:
+        _sim_counter = [0]  # mutable counter for closure
+        def _init_csv_for_new_domains():
+            for key, ds in stats.items():
+                if ds._csv_steps_writer is None:
+                    ds.init_csv_logging(experiment_dir, _sim_counter[0], start_time)
+                    _sim_counter[0] += 1
+                    print(f"  [CSV] Logging sim_{_sim_counter[0]-1} (domain {ds.domain_id}:{ds.namespace})")
+        _init_csv_for_new_domains()
+
+    app, sio, updater = create_app(stats, mgr, experiment_dir=experiment_dir)
     threading.Thread(target=updater, daemon=True).start()
 
     def scan_loop():
@@ -1220,10 +1971,55 @@ def main():
             time.sleep(args.scan_interval)
             mgr.discover_domains(args.scan_start, args.scan_end)
             mgr.discover_namespaces_all()
+            # Initialize CSV for newly discovered domains
+            if experiment_dir:
+                _init_csv_for_new_domains()
 
     threading.Thread(target=scan_loop, daemon=True).start()
 
+    # Sync monitor thread
+    if sync_monitor:
+        def sync_loop():
+            while True:
+                time.sleep(args.sync_check_interval)
+                sync_monitor.check()
+        threading.Thread(target=sync_loop, daemon=True).start()
+
     def shutdown(*_):
+        # Close CSV files
+        for ds in stats.values():
+            ds.close_csv()
+        if sync_monitor:
+            sync_monitor.close()
+        # Auto-generate graphs on shutdown if experiment logging was active
+        if experiment_dir:
+            print(f"\n[SHUTDOWN] Generating graphs from {experiment_dir}...")
+            try:
+                fig_dir = os.path.join(experiment_dir, "figures")
+                generate_experiment_graphs([experiment_dir], fig_dir)
+                print(f"[SHUTDOWN] Figures saved to {fig_dir}/")
+            except Exception as e:
+                print(f"[SHUTDOWN] Graph generation failed: {e}")
+
+            # Print summary
+            total_steps = sum(ds._csv_steps_logged for ds in stats.values())
+            total_eps = sum(ds._csv_episodes_logged for ds in stats.values())
+            elapsed = time.time() - start_time
+            print(f"\n{'='*60}")
+            print(f"  Experiment Complete")
+            print(f"{'='*60}")
+            print(f"  Duration:  {elapsed/60:.1f} minutes")
+            print(f"  Steps:     {total_steps}")
+            print(f"  Episodes:  {total_eps}")
+            print(f"  Data:      {experiment_dir}")
+            if sync_monitor:
+                print(f"  Syncs:     {sync_monitor.sync_count}")
+            print(f"{'='*60}")
+            print(f"\n  To compare experiments:")
+            print(f"  python reward_monitor.py --generate-graphs \\")
+            print(f"    --graph-dirs {experiment_dir} <other_experiment_dir> \\")
+            print(f"    --graph-output ./figures\n")
+
         mgr.stop_all()
         sys.exit(0)
 
