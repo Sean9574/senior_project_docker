@@ -223,7 +223,6 @@ WORKDIR $AMENT_WS/src
 RUN git clone https://github.com/hello-robot/stretch_mujoco.git
 
 # ROBOCASA FIX: Replace robocasa_gen.py with a stub (we use custom scene.xml)
-# ROBOCASA FIX: Replace robocasa_gen.py with a stub (we use custom scene.xml)
 RUN echo '# Stub - robocasa kitchen generation disabled' > $AMENT_WS/src/stretch_mujoco/stretch_mujoco/robocasa_gen.py && \
     echo 'LayoutType = None' >> $AMENT_WS/src/stretch_mujoco/stretch_mujoco/robocasa_gen.py && \
     echo 'StyleType = None' >> $AMENT_WS/src/stretch_mujoco/stretch_mujoco/robocasa_gen.py && \
@@ -331,17 +330,19 @@ RUN apt-get update && apt-get install -y \
     libasound2-dev \
     && rm -rf /var/lib/apt/lists/*
 
-    # --- Intel RealSense SDK (librealsense) userspace (no DKMS inside Docker) ---
+# --- Intel RealSense SDK (optional — not needed for MuJoCo sim) ---
+# Wrapped in subshell so build continues if Intel repo is unreachable
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl gnupg2 lsb-release ca-certificates \
- && mkdir -p /etc/apt/keyrings \
- && curl -sSfL https://librealsense.intel.com/Debian/librealsense.pgp \
+ && (mkdir -p /etc/apt/keyrings \
+ && curl -sSfL --connect-timeout 10 --max-time 30 https://librealsense.intel.com/Debian/librealsense.pgp \
     | gpg --dearmor -o /etc/apt/keyrings/librealsense.gpg \
  && echo "deb [signed-by=/etc/apt/keyrings/librealsense.gpg] https://librealsense.intel.com/Debian/apt-repo $(lsb_release -cs) main" \
     > /etc/apt/sources.list.d/librealsense.list \
  && apt-get update && apt-get install -y --no-install-recommends \
     librealsense2-dev \
     librealsense2-utils \
+ || echo "WARNING: RealSense SDK install failed (Intel repo unreachable) — skipping, not needed for MuJoCo sim") \
  && rm -rf /var/lib/apt/lists/*
 
  RUN pip3 uninstall -y numba llvmlite numpy || true && \
@@ -372,10 +373,12 @@ RUN find $AMENT_WS/src -name "setup.py" | xargs -I {} sh -c \
     'sed -i "s/with open.*README.md.*as fh:/long_description = \"\"/g; s/long_description = fh.read()//g" {}'
 
 
-# Build workspace with FastRTPS (default) so realsense compiles
+# Build workspace — skip realsense2_camera (not needed for MuJoCo sim,
+# and librealsense2-dev may not be available if Intel repo was unreachable)
 # We switch to Cyclone DDS at RUNTIME in entrypoint.sh for better Docker performance
 RUN /bin/bash -c "source /opt/ros/humble/setup.bash && \
-    colcon build --symlink-install --cmake-args -DCMAKE_BUILD_TYPE=Release"
+    colcon build --symlink-install --cmake-args -DCMAKE_BUILD_TYPE=Release \
+    --packages-ignore realsense2_camera realsense2_camera_msgs realsense2_description"
 
 # Copy URDF file to expected location
 RUN mkdir -p $AMENT_WS/install/stretch_description/share/stretch_description/urdf && \
