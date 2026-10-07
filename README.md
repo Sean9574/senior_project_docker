@@ -17,7 +17,7 @@ Supports:
 - Linux 22.04
 - Docker installed
 - X11 desktop (for RViz)
-- (Optional) NVIDIA GPU + `nvidia-container-toolkit`
+- NVIDIA GPU (Perferablly High End) + `nvidia-container-toolkit`
 
 ---
 
