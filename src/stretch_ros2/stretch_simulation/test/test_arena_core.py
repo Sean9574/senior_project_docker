@@ -127,3 +127,36 @@ def test_respawn_at_places_the_robot_at_rest_in_room_frame():
     assert (x, y, yaw) == pytest.approx((1.5, -2.0, math.pi / 2), abs=1e-6)
     assert v == pytest.approx(0.0, abs=1e-9) and w == pytest.approx(0.0, abs=1e-9)
     assert a.cmd[1] == (0.0, 0.0)
+
+
+def _quat_xyzw_to_mat(q):
+    x, y, z, w = q
+    return np.array([[1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+                     [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+                     [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)]])
+
+
+@needs_mujoco
+def test_camera_optical_frame_looks_where_the_robot_faces():
+    a = _arena(2)
+    for yaw in (0.0, math.pi / 2):
+        a.respawn_at(1, 1.0, 2.0, yaw)
+        pos, quat = a.camera_pose(1)
+        assert np.linalg.norm(quat) == pytest.approx(1.0)
+        z_opt = _quat_xyzw_to_mat(quat)[:, 2]          # optical z = viewing direction
+        assert z_opt @ np.array([math.cos(yaw), math.sin(yaw), 0.0]) > 0.7
+        assert math.hypot(pos[0] - 1.0, pos[1] - 2.0) < 0.5   # on the robot, in the room frame
+        assert 0.8 < pos[2] < 1.6                              # head height
+
+
+@needs_mujoco
+def test_camera_optical_frame_matches_mujoco_camera_axes():
+    a = _arena(1)
+    room = a.world.rooms[0]
+    pos, quat = a.camera_pose(0)
+    r_cam = a.data.cam_xmat[room.camera_rgb].reshape(3, 3)
+    r_opt = _quat_xyzw_to_mat(quat)
+    # ROS optical: x right, y down, z forward; MuJoCo camera: x right, y up, looks along -z
+    assert np.allclose(r_opt[:, 0], r_cam[:, 0], atol=1e-6)
+    assert np.allclose(r_opt[:, 1], -r_cam[:, 1], atol=1e-6)
+    assert np.allclose(r_opt[:, 2], -r_cam[:, 2], atol=1e-6)

@@ -113,6 +113,20 @@ class Arena:
         geomid[foreign] = -1
         return (dist, geomid) if return_geoms else dist
 
+    def camera_pose(self, i: int):
+        """Pose of robot i's head colour camera as a ROS optical frame
+        (x right, y down, z forward) in its room frame: (xyz, quat xyzw).
+        Published as TF so the goal generator turns pixels into odom points
+        exactly, whatever way the rendered image is rotated."""
+        room = self.world.rooms[i]
+        r_cam = self.data.cam_xmat[room.camera_rgb].reshape(3, 3)
+        r_opt = r_cam @ np.diag([1.0, -1.0, -1.0])  # MuJoCo camera looks along -z, y up
+        quat_wxyz = np.zeros(4)
+        self._mj.mju_mat2Quat(quat_wxyz, r_opt.ravel())
+        pos = self.data.cam_xpos[room.camera_rgb] - np.array([room.origin[0], room.origin[1], 0.0])
+        w, x, y, z = quat_wxyz
+        return pos.copy(), np.array([x, y, z, w])
+
     # ------------------------------------------------------------ episodes
     def respawn(self, i: int) -> Tuple[float, float, float]:
         """Move robot i to a random collision-free pose in its room (room

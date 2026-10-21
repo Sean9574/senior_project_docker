@@ -8,6 +8,8 @@ Per robot i (namespace r{i}):
              /r{i}/camera/depth/image_rect_raw (32FC1, m), /r{i}/camera/color/camera_info
   subscribes /r{i}/cmd_vel (clamped; stops after 0.5 s without a command)
   serves     /r{i}/reset (std_srvs/Trigger): respawn that robot only
+  TF         r{i}/odom -> r{i}/camera_color_optical_frame (with each image), so
+             the SAM3 goal generator's TF path places detections exactly
 
 Physics runs in its own thread, paced to wall time; camera rendering happens
 in that thread too (the GL context belongs to it).
@@ -21,12 +23,13 @@ import time
 import numpy as np
 import rclpy
 from cv_bridge import CvBridge
-from geometry_msgs.msg import Twist
+from geometry_msgs.msg import TransformStamped, Twist
 from nav_msgs.msg import Odometry
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
 from sensor_msgs.msg import CameraInfo, Image, LaserScan
 from std_srvs.srv import Trigger
+from tf2_ros import TransformBroadcaster
 
 from stretch_mujoco_driver.arena_core import Arena
 from stretch_mujoco_driver.arena_world import build_arena
@@ -77,6 +80,7 @@ class ArenaSimNode(Node):
 
         self.lock = threading.Lock()
         self.bridge = CvBridge()
+        self.tf_broadcaster = TransformBroadcaster(self)
         self.last_cmd_t = [0.0] * self.n
         cam_qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT)
         self.odom_pub, self.scan_pub, self.rgb_pub, self.depth_pub, self.info_pub = [], [], [], [], []
@@ -219,6 +223,7 @@ class ArenaSimNode(Node):
     def _publish_cameras(self, cameras):
         rgb_r, depth_r, info, limit_depth = cameras
         stamp = self._stamp()
+        transforms = []
         for i, room in enumerate(self.arena.world.rooms):
             frame = f"r{i}/camera_color_optical_frame"
             rgb_r.update_scene(self.arena.data, camera=room.camera_rgb)
@@ -233,6 +238,19 @@ class ArenaSimNode(Node):
             self.rgb_pub[i].publish(img)
             self.depth_pub[i].publish(dmsg)
             self.info_pub[i].publish(info)
+            transforms.append(self._camera_tf(i, stamp, frame))
+        self.tf_broadcaster.sendTransform(transforms)
+
+    def _camera_tf(self, i: int, stamp, frame: str) -> TransformStamped:
+        pos, quat = self.arena.camera_pose(i)
+        tf = TransformStamped()
+        tf.header.stamp = stamp
+        tf.header.frame_id = f"r{i}/odom"
+        tf.child_frame_id = frame
+        tf.transform.translation.x, tf.transform.translation.y, tf.transform.translation.z = map(float, pos)
+        (tf.transform.rotation.x, tf.transform.rotation.y,
+         tf.transform.rotation.z, tf.transform.rotation.w) = map(float, quat)
+        return tf
 
     def destroy_node(self):
         self._running = False
