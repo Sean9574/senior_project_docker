@@ -76,3 +76,32 @@ def test_robots_start_at_their_room_origins(world8):
     for room in world8.rooms:
         x, y = d.qpos[room.qpos_adr:room.qpos_adr + 2]
         assert (x, y) == pytest.approx(room.origin, abs=1e-6)
+
+
+
+@needs_mujoco
+def test_one_light_and_one_colliding_floor_for_any_room_count(world8):
+    import mujoco
+    m = world8.model
+    assert m.nlight == 1   # per-room lights would overexpose the SAM3 images
+    planes = [g for g in range(m.ngeom) if m.geom_type[g] == mujoco.mjtGeom.mjGEOM_PLANE]
+    assert len(planes) == 8
+    assert sum(1 for g in planes if m.geom_contype[g] or m.geom_conaffinity[g]) == 1
+
+
+@needs_mujoco
+def test_scene_headlight_is_kept(world8):
+    assert list(world8.model.vis.headlight.diffuse) == pytest.approx([0.6, 0.6, 0.6])
+    assert list(world8.model.vis.headlight.ambient) == pytest.approx([0.3, 0.3, 0.3])
+
+
+@needs_mujoco
+def test_robots_in_every_room_stand_on_the_floor(world8):
+    import mujoco
+    d = mujoco.MjData(world8.model)
+    mujoco.mj_forward(world8.model, d)
+    z0 = [d.qpos[r.qpos_adr + 2] for r in world8.rooms]
+    for _ in range(250):
+        mujoco.mj_step(world8.model, d)
+    for room, z in zip(world8.rooms, z0):
+        assert d.qpos[room.qpos_adr + 2] == pytest.approx(z, abs=0.02)

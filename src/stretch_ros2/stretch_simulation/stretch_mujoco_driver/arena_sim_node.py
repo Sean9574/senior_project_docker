@@ -31,11 +31,12 @@ from sensor_msgs.msg import CameraInfo, Image, LaserScan
 from std_srvs.srv import Trigger
 from tf2_ros import TransformBroadcaster
 
-from stretch_mujoco_driver.arena_core import Arena
+from stretch_mujoco_driver.arena_core import Arena, steps_owed
 from stretch_mujoco_driver.arena_world import build_arena
 
 CMD_TIMEOUT_S = 0.5
 TICK_S = 0.01  # physics loop period (wall time)
+MAX_STEPS_PER_TICK = 50  # catch-up cap after a stall
 
 
 def _default_robot_xml() -> str:
@@ -124,7 +125,7 @@ class ArenaSimNode(Node):
     # ------------------------------------------------------------ physics thread
     def _physics_loop(self):
         model = self.arena.model
-        substeps = max(int(round(TICK_S / model.opt.timestep)), 1)
+        dt = model.opt.timestep
         cameras = self._make_cameras() if self.use_cameras else None
         next_odom = next_scan = next_cam = next_rtf_log = time.time()
         sim_s, wall_start = 0.0, time.time()
@@ -136,8 +137,10 @@ class ArenaSimNode(Node):
                     if self.last_cmd_t[i] and now - self.last_cmd_t[i] > CMD_TIMEOUT_S:
                         self.arena.set_cmd(i, 0.0, 0.0)
                         self.last_cmd_t[i] = 0.0
-                self.arena.step(substeps)
-                sim_s += substeps * model.opt.timestep
+                # Pace by sim-time deficit: exactly real time for any timestep
+                steps = steps_owed(sim_s, now - wall_start, dt, MAX_STEPS_PER_TICK)
+                self.arena.step(steps)
+                sim_s += steps * dt
                 if now >= next_odom:
                     self._publish_odom()
                     next_odom = now + self.odom_period

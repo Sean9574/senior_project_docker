@@ -13,6 +13,7 @@ Layout helpers are pure; build_arena() needs `mujoco` (imported lazily).
 import math
 import os
 import re
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from typing import Dict, List, Tuple
 
@@ -89,7 +90,23 @@ def _room_spec(room_xml: str, wall_height: float):
         if geom.name.startswith("wall_"):
             geom.size = [geom.size[0], geom.size[1], wall_height / 2.0]
             geom.pos = [geom.pos[0], geom.pos[1], wall_height / 2.0]
-    return spec
+    # Lights are added once for the whole arena: N copies of a directional
+    # light would add up and overexpose the images SAM3 sees
+    lights = [dict(dir=list(l.dir), directional=l.directional, diffuse=list(l.diffuse),
+                   specular=list(l.specular), ambient=list(l.ambient), castshadow=l.castshadow)
+              for l in spec.lights]
+    for light in list(spec.lights):
+        light.delete()
+    return spec, lights
+
+
+def _headlight(room_xml: str) -> Dict[str, List[float]]:
+    """<visual><headlight .../> of the room XML (not exposed by mjSpec in 3.2.6)."""
+    node = ET.parse(room_xml).getroot().find("visual/headlight")
+    if node is None:
+        return {}
+    return {k: [float(x) for x in node.get(k).split()]
+            for k in ("diffuse", "ambient", "specular") if node.get(k)}
 
 
 def _subtree(model, root: int) -> set:
@@ -135,7 +152,7 @@ def build_arena(robot_xml: str, room_xml: str, n: int, room_size: float = 10.0,
                 keep_rangefinders: bool = False) -> ArenaWorld:
     import mujoco
     robot = _robot_spec(robot_xml, keep_rangefinders)
-    room = _room_spec(room_xml, wall_height)
+    room, lights = _room_spec(room_xml, wall_height)
 
     arena = mujoco.MjSpec()
     arena.compiler.degree = robot.compiler.degree
@@ -148,7 +165,20 @@ def build_arena(robot_xml: str, room_xml: str, n: int, room_size: float = 10.0,
     for i, (ox, oy) in enumerate(origins):
         arena.worldbody.add_frame(pos=[ox, oy, 0.0]).attach_body(room.find_body("room"), f"room{i}_", "")
         arena.worldbody.add_frame(pos=[ox, oy, 0.0]).attach_body(robot.find_body("base_link"), f"r{i}_", "")
+    for light in lights[:1]:
+        cols, rows = grid_shape(n)
+        pitch = room_size + gap
+        arena.worldbody.add_light(pos=[(cols - 1) * pitch / 2, (rows - 1) * pitch / 2, 5.0], **light)
     model = arena.compile()
+    for key, value in _headlight(room_xml).items():
+        setattr(model.vis.headlight, key, value)
+    # MuJoCo planes collide as infinite planes whatever their size: keep only
+    # room 0's floor collidable, or every wheel contact is counted N times
+    for i in range(1, n):
+        g = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, f"room{i}_floor")
+        if g >= 0:
+            model.geom_contype[g] = 0
+            model.geom_conaffinity[g] = 0
     data = mujoco.MjData(model)
     mujoco.mj_forward(model, data)
 

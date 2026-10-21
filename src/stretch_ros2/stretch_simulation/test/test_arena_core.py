@@ -112,7 +112,7 @@ def test_ray_cast_scan_matches_the_models_own_rangefinders():
         a.respawn(0)
         sensor = np.array([a.data.sensordata[world.model.sensor_adr[s]] for s in rf])
         ours = a.scan(0)
-        both = (sensor > 0) & (sensor < 9.99) & (ours > 0)
+        both = (sensor > 0) & (ours > 0)
         assert both.sum() > 300
         assert np.max(np.abs(sensor[both] - ours[both])) < 0.01
 
@@ -178,3 +178,27 @@ def test_commanded_turn_rate_is_the_real_turn_rate():
     a.set_cmd(0, 0.0, 1.0)
     a.step(int(2.0 / a.model.opt.timestep))
     assert a.odom(0)[4] == pytest.approx(1.0, rel=0.15)
+
+
+
+def test_paced_physics_keeps_up_with_wall_time_for_any_timestep():
+    # 10 ms ticks with a 4 ms step: rounding a fixed substep count ran at 0.8x
+    for dt in (0.002, 0.004, 0.003):
+        sim = 0.0
+        for k in range(1, 1001):
+            n = arena_core.steps_owed(sim, wall_elapsed=k * 0.01, dt=dt, max_steps=50)
+            sim += n * dt
+        assert abs(sim - 10.0) <= dt
+
+
+def test_paced_physics_never_bursts_more_than_the_cap():
+    assert arena_core.steps_owed(0.0, wall_elapsed=5.0, dt=0.004, max_steps=25) == 25
+
+
+@needs_mujoco
+def test_far_beams_clamp_to_the_rangefinder_cutoff():
+    a = _arena(1)
+    a.respawn_at(0, -4.5, -4.5, math.pi / 4)   # corner: diagonal beams see > 10 m
+    scan = a.scan(0)
+    assert scan.max() == pytest.approx(10.0)
+    assert (scan <= 10.0).all()

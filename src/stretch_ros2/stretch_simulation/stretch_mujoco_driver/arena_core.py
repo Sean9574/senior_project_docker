@@ -37,6 +37,14 @@ def wheel_speeds(v: float, w: float) -> Tuple[float, float]:
             (v + w * WHEEL_SEPARATION / 2.0) / WHEEL_RADIUS)
 
 
+def steps_owed(sim_s: float, wall_elapsed: float, dt: float, max_steps: int) -> int:
+    """Physics steps needed to bring simulated time up to wall time (pacing by
+    deficit, so any timestep keeps 1.0x real time), capped per call so a
+    stall doesn't turn into a long burst."""
+    owed = int((wall_elapsed - sim_s) / dt + 1e-9)
+    return max(0, min(owed, max_steps))
+
+
 def _yaw(q) -> float:
     w, x, y, z = q
     return math.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
@@ -113,6 +121,9 @@ class Arena:
                              geomid, dist, len(sites), LIDAR_CUTOFF_M)
         foreign = (geomid >= 0) & ~np.isin(geomid, list(room.geoms))
         dist[foreign] = -1.0
+        # The model's rangefinders (cutoff 10) report far hits as exactly 10;
+        # mj_multiRay's cutoff only prunes, so clamp to match
+        dist[dist > LIDAR_CUTOFF_M] = LIDAR_CUTOFF_M
         geomid[foreign] = -1
         return (dist, geomid) if return_geoms else dist
 
