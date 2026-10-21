@@ -25,6 +25,12 @@ from std_msgs.msg import String
 
 from senior_project.status_panel_core import PanelState, render, summary_line
 
+try:
+    from rclpy.executors import ExternalShutdownException
+except ImportError:  # older rclpy
+    class ExternalShutdownException(Exception):
+        pass
+
 CLEAR = "\x1b[H\x1b[2J"
 HIDE_CURSOR = "\x1b[?25l"
 SHOW_CURSOR = "\x1b[?25h"
@@ -86,7 +92,7 @@ def main():
         sys.stdout.write(HIDE_CURSOR)
     try:
         rclpy.spin(node)
-    except (KeyboardInterrupt, rclpy.executors.ExternalShutdownException):
+    except (KeyboardInterrupt, ExternalShutdownException):
         pass
     finally:
         if interactive:

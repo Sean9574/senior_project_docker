@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import os
+import sys
 from pathlib import Path
 
 from ament_index_python.packages import get_package_share_directory
@@ -7,6 +8,7 @@ from launch import LaunchDescription
 from launch.actions import (
     DeclareLaunchArgument,
     ExecuteProcess,
+    OpaqueFunction,
     LogInfo,
     TimerAction,
 )
@@ -148,6 +150,26 @@ def generate_launch_description():
         )
     )
 
+    ld.add_action(
+        DeclareLaunchArgument(
+            "status_panel", default_value="true", choices=["true", "false"],
+            description="Live status panel in this terminal; other node output goes to log files",
+        )
+    )
+    ld.add_action(DeclareLaunchArgument(
+        "target", default_value="", description="Prompt shown in the status panel header"))
+    ld.add_action(OpaqueFunction(function=_launch_setup))
+    return ld
+
+
+def _launch_setup(context):
+    actions = []
+    # Panel on (and a learner to report): the panel owns this terminal, every
+    # other process writes to its log file under $ROS_LOG_DIR instead
+    panel = (LaunchConfiguration("status_panel").perform(context) == "true"
+             and LaunchConfiguration("run_rl").perform(context) == "true")
+    out = "log" if panel else "screen"
+
     # --- Load URDF and rewrite mesh paths ---
     robot_description_file = Path(
         get_package_share_directory('stretch_description')
@@ -167,13 +189,13 @@ def generate_launch_description():
 
 
     # Robot state publisher (namespaced; TF frames still global)
-    ld.add_action(
+    actions.append(
         Node(
             package="robot_state_publisher",
             executable="robot_state_publisher",
             name="robot_state_publisher",
             namespace=LaunchConfiguration("ns"),
-            output="both",
+            output=out,
             parameters=[
                 {"robot_description": robot_description_content},
                 {"publish_frequency": 30.0},
@@ -183,7 +205,7 @@ def generate_launch_description():
     )
 
     # Joint state publisher (namespaced)
-    ld.add_action(
+    actions.append(
         Node(
             package="joint_state_publisher",
             executable="joint_state_publisher",
@@ -199,12 +221,12 @@ def generate_launch_description():
     )
 
     # RViz (launched normally) - FIXED: removed hardcoded config path
-    ld.add_action(
+    actions.append(
         Node(
             package="rviz2",
             executable="rviz2",
             name="rviz2",
-            output="screen",
+            output=out,
             arguments=[],
             remappings=[
                 # PoseStamped goals; the learner converts them to PointStamped
@@ -243,12 +265,12 @@ def generate_launch_description():
             "robocasa_style": LaunchConfiguration("robocasa_style"),
         }
     ]
-    ld.add_action(
+    actions.append(
         Node(
             package="stretch_simulation",
             executable="stretch_mujoco_driver",
             emulate_tty=True,
-            output="screen",
+            output=out,
             remappings=[
                 ("cmd_vel", "/stretch/cmd_vel"),
                 ("joint_states", "/stretch/joint_states"),
@@ -290,13 +312,13 @@ def generate_launch_description():
             "--eval-episodes",
             LaunchConfiguration("eval_episodes"),
         ],
-        output="screen",
+        output=out,
         condition=IfCondition(LaunchConfiguration("run_rl")),
         
     )
 
     # Delay slightly so sim is alive first
-    ld.add_action(TimerAction(period=2.0, actions=[learner_proc]))
+    actions.append(TimerAction(period=2.0, actions=[learner_proc]))
     
     # --- START REWARD MONITOR ---
     launch_file_dir = os.path.dirname(os.path.abspath(__file__))
@@ -308,16 +330,32 @@ def generate_launch_description():
             'python3', reward_monitor_path,
             '--experiment', PathJoinSubstitution([LaunchConfiguration("ckpt_dir"), "monitor"]),
         ],
-        output='screen',
+        output=out,
         condition=IfCondition(LaunchConfiguration("use_reward_monitor")),
     )
     
     # Start reward monitor after learner starts
-    ld.add_action(TimerAction(period=5.0, actions=[reward_monitor_proc]))
+    actions.append(TimerAction(period=5.0, actions=[reward_monitor_proc]))
 
-    ld.add_action(
+    actions.append(
         LogInfo(
             msg="[RL.launch] Sim + TD3 learner + Reward Monitor"
         )
     )
-    return ld
+
+    if panel:
+        actions.append(
+            ExecuteProcess(
+                cmd=[
+                    "python3", "-m", "senior_project.status_panel",
+                    "--total-steps", LaunchConfiguration("total_steps"),
+                    "--target", LaunchConfiguration("target"),
+                    # Redirected output (docker logs, nohup): summary lines, no redraws
+                    *([] if sys.stdout.isatty() else ["--plain"]),
+                ],
+                output="screen",
+                emulate_tty=True,
+                output_format="{line}",
+            )
+        )
+    return actions

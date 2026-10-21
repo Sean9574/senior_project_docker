@@ -62,6 +62,31 @@ switch targets mid-run:
 ros2 topic pub --once /sam3_goal_generator/set_target std_msgs/String "data: 'potted plant'"
 ```
 
+The terminal turns into a live status panel (redrawn every half second):
+
+```
+ Stretch TD3  target "chair"  domain 90  up 01:08:42
+ ------------------------------------------------------
+ Phase    RL_POLICY   48,210 / 200,000  [##........] 24%
+          ETA 3h48m   ~11 steps/s
+ Episode  #412  GOAL-SEEK  12.4s  goal 1.8m  clr 0.62m
+ Last 20  ++++++-+++++-+++-+++   success 85%  seen 95%
+ Return   avg20 +5.8   best +10.5
+ Health   SAM3 ok "chair" | step 0.11s | reset 3.2s
+          ckpt saved 2m00s ago
+ Alerts   14:17:18 WARN learner: replay save failed
+
+ logs: /home/stretch/rl_checkpoints/logs   (Ctrl+C stops training)
+```
+
+- **Last 20:** `+` reached the object, `-` timed out. *seen* is how often SAM3 spotted it at all.
+- **Health:** `SAM3 NOT CONFIRMED` means the server never accepted your prompt. If the
+  learner stops reporting for 30 s, a `learner silent` line appears.
+- **Alerts:** the latest warnings and errors from any node; repeats are counted (`x3`), not repeated.
+- **Logs:** full node output goes to `~/rl_checkpoints/logs` on the host. Add
+  `status_panel:=false` to get the old scrolling output instead. When output is
+  redirected (`docker logs`, `nohup`), the panel prints one summary line every 30 s.
+
 What happens each episode:
 
 1. The robot spawns at a random pose at least 1 m from every obstacle (`[SPAWN] x=… y=… yaw=…`).

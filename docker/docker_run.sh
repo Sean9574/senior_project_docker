@@ -79,6 +79,7 @@ DOCKER_RUN_ARGS=(
   --cap-add=SYS_NICE
   --name "$CONTAINER_NAME"
   -e ROS_DOMAIN_ID="$DOMAIN"
+  -e ROS_LOG_DIR=/home/stretch/rl_checkpoints/logs
   -e RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
   -e NVIDIA_DRIVER_CAPABILITIES=all
   -e CUDA_CACHE_DISABLE=0

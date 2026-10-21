@@ -47,3 +47,9 @@ def test_stop_all_twice_is_safe(tmp_path, capsys):
     capsys.readouterr()
     r.stop_all()
     assert capsys.readouterr().out == ""
+
+
+def test_children_never_draw_their_own_status_panel(tmp_path):
+    # All sims share the runner's terminal: one panel each would garble it
+    r = ParallelRunner(num_sims=2, target="chair", base_ckpt_dir=str(tmp_path))
+    assert _args(r._build_launch_command(0))["status_panel"] == "false"

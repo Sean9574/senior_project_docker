@@ -114,6 +114,8 @@ class ParallelRunner:
             f"total_steps:={self.total_steps}",
             f"ckpt_dir:={ckpt_dir}",
             "use_rviz:=false",
+            # Children share this terminal: no per-sim status panel
+            "status_panel:=false",
             # One dashboard (sim 0) scans every sim's domain
             f"use_reward_monitor:={'true' if sim_id == 0 else 'false'}",
         ]

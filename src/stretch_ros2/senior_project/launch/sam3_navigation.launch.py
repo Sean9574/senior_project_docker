@@ -135,6 +135,10 @@ def generate_launch_description():
         description="Spawn the robot at a random free pose every episode",
     ))
     ld.add_action(DeclareLaunchArgument("headless", default_value="false"))
+    ld.add_action(DeclareLaunchArgument(
+        "status_panel", default_value="true", choices=["true", "false"],
+        description="Live status panel in this terminal; node output goes to log files",
+    ))
 
     # Camera topics
     ld.add_action(DeclareLaunchArgument(
@@ -171,6 +175,8 @@ def _configure_launch(context):
     mono_port = LaunchConfiguration("mono_depth_port").perform(context)
 
     actions = []
+    # With the status panel on, these processes log to files instead of the terminal
+    out = "log" if LaunchConfiguration("status_panel").perform(context) == "true" else "screen"
 
     # URLs
     sam3_url = f"http://{sam3_host}:{sam3_port}"
@@ -205,7 +211,7 @@ def _configure_launch(context):
         
         sam3_server = ExecuteProcess(
             cmd=["bash", "-c", cmd_string],
-            output='screen',
+            output=out,
             name='sam3_server',
         )
 
@@ -236,7 +242,7 @@ def _configure_launch(context):
         
         mono_depth_server = ExecuteProcess(
             cmd=["bash", "-c", cmd_string],
-            output="screen",
+            output=out,
             name="mono_depth_server",
         )
         actions.append(mono_depth_server)
@@ -264,6 +270,8 @@ def _configure_launch(context):
             "ckpt_dir": LaunchConfiguration("ckpt_dir"),
             "load_ckpt": LaunchConfiguration("load_ckpt"),
             "headless": LaunchConfiguration("headless"),
+            "status_panel": LaunchConfiguration("status_panel"),
+            "target": LaunchConfiguration("target"),
             "eval_episodes": LaunchConfiguration("eval_episodes"),
             "random_spawn": LaunchConfiguration("random_spawn"),
         }.items(),
@@ -278,7 +286,7 @@ def _configure_launch(context):
         package="senior_project",
         executable="sam3_goal_generator",
         name="sam3_goal_generator",
-        output="screen",
+        output=out,
         parameters=[{
             "server_url": sam3_url,
             "mono_depth_url": mono_url,
