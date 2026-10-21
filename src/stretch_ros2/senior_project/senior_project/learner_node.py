@@ -1237,6 +1237,11 @@ class StretchExploreEnv(gym.Env):
 
         # Wall-clock step timing (sim runs asynchronously from the learner)
         self._last_step_wall: Optional[float] = None
+
+        # Reported to the terminal status panel via the reward breakdown
+        self._goal_seen_this_episode = False
+        self._last_reset_s: Optional[float] = None
+        self.last_ckpt_wall: Optional[float] = None
         self._dt_hist: deque = deque(maxlen=DEBUG_EVERY_N)
 
         # Training phase tracking (published in reward breakdown)
@@ -1270,7 +1275,10 @@ class StretchExploreEnv(gym.Env):
     def reset(self, *, seed=None, options=None):
         super().reset(seed=seed)
 
+        reset_start = time.time()
         sim_was_reset = self.ros.reset_simulation()
+        self._last_reset_s = time.time() - reset_start
+        self._goal_seen_this_episode = False
 
         self.step_count = 0
         self.episode_return = 0.0
@@ -1384,6 +1392,7 @@ class StretchExploreEnv(gym.Env):
         # Topic goals can appear or jump mid-episode: re-baseline progress then,
         # so the first step after a new goal earns 0 progress (no inf / spikes).
         goal_xy = self._current_goal_xy()
+        self._goal_seen_this_episode = self._goal_seen_this_episode or has_goal
         if has_goal and (not self._goal_tracked or self._goal_moved(goal_xy)):
             self.prev_goal_dist = d_goal
             self._goal_tracked = True
@@ -1676,6 +1685,12 @@ class StretchExploreEnv(gym.Env):
             "step": self.step_count,
             "training_phase": self._current_training_phase,
             "expert_avg_return": self._expert_avg_return,
+            # terminal status panel
+            "global_step": self.total_steps,
+            "goal_seen": self._goal_seen_this_episode,
+            "episode_return": self.episode_return,
+            "last_reset_s": self._last_reset_s,
+            "last_ckpt_wall": self.last_ckpt_wall,
         }
         msg = StringMsg()
         msg.data = json.dumps(breakdown)
@@ -2089,6 +2104,7 @@ def main():
         try:
             agent.save(ckpt_path + ".tmp", extra_state=training_state)
             os.replace(ckpt_path + ".tmp", ckpt_path)
+            env.last_ckpt_wall = time.time()
         except Exception as e:
             ros.get_logger().error(f"[CKPT] {R}Agent save failed: {e}{RST}")
 

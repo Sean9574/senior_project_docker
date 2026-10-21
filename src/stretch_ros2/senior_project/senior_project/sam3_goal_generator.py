@@ -303,6 +303,7 @@ class SAM3GoalGeneratorV2(Node):
         self.create_subscription(String, '~/set_target', self.target_callback, 10)
         # Learner signals a new episode (robot respawned): forget the old goal
         self._episode_epoch = 0
+        self._prompt_confirmed = False  # reported in ~/status for the terminal panel
         self.create_subscription(Empty, f'/{self.ns}/episode_reset', self.episode_reset_callback, 10)
 
         # ==================== Publishers ====================
@@ -484,6 +485,7 @@ class SAM3GoalGeneratorV2(Node):
         the server is starting. Logs an error (not a fake success) on failure."""
         self.get_logger().info(f'Setting SAM3 prompt to "{target}" (waiting up to {timeout_s:.0f}s for the server)')
         ok = send_prompt(lambda url: self.session.post(url, timeout=5), self.server_url, target, timeout_s)
+        self._prompt_confirmed = ok
         if ok:
             self.get_logger().info(f'SAM3 server confirmed prompt: "{target}"')
         else:
@@ -1156,6 +1158,7 @@ class SAM3GoalGeneratorV2(Node):
                 'locked_goal': list(self._locked_goal) if self._locked_goal else None,
             }
 
+        status['prompt_confirmed'] = self._prompt_confirmed
         self.status_pub.publish(String(data=json.dumps(status)))
 
         # ===== Build visualization =====

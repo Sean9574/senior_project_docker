@@ -33,6 +33,7 @@ setup(
             'sam3_server = senior_project.sam3_server:main',
             'parallel_runner = senior_project.parallel_runner:main',
             'expert_baseline = senior_project.expert_baseline_node:main',
+            'status_panel = senior_project.status_panel:main',
         ],
     },
 )
