@@ -49,6 +49,7 @@ from std_msgs.msg import Bool, Float64MultiArray, Header, String
 from std_srvs.srv import SetBool, Trigger
 from stretch_core.rwlock import RWLock
 from stretch_mujoco import StretchMujocoSimulator
+from stretch_mujoco import utils as stretch_mujoco_utils
 from stretch_mujoco.enums.actuators import Actuators
 from stretch_mujoco.enums.stretch_cameras import CameraSettings, StretchCameras
 from stretch_mujoco.enums.stretch_sensors import StretchSensors
@@ -63,6 +64,7 @@ from tf2_ros.static_transform_broadcaster import StaticTransformBroadcaster
 from tf_transformations import quaternion_from_euler
 
 from stretch_mujoco_driver.joint_trajectory_server import JointTrajectoryAction
+from stretch_mujoco_driver.spawn import Box, Circle, sample_spawn_pose, yaw_to_quat
 
 DEFAULT_TIMEOUT = 0.5
 DEFAULT_GOAL_TIMEOUT = 10.0
@@ -73,6 +75,54 @@ DEFAULT_SIM_TOOL = "eoa_wrist_dw3_tool_sg3"
 # Real Stretch base limits (Nav2 config caps 0.26 m/s, 1.0 rad/s)
 DEFAULT_MAX_LINEAR_MPS = 0.3
 DEFAULT_MAX_ANGULAR_RADPS = 1.0
+DEFAULT_SPAWN_CLEARANCE_M = 1.0
+DEFAULT_SPAWN_BOUNDS = (-5.0, 5.0, -5.0, 5.0)  # used when the floor plane is infinite
+
+
+def obstacles_from_model(model):
+    """2D footprints of every colliding world geom (robot and floor excluded),
+    the arena bounds from the floor plane, and the base's default height."""
+    import mujoco
+
+    data = mujoco.MjData(model)
+    mujoco.mj_forward(model, data)
+    base_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "base_link")
+
+    def in_robot(body_id):
+        while body_id > 0:
+            if body_id == base_id:
+                return True
+            body_id = model.body_parentid[body_id]
+        return False
+
+    obstacles, bounds = [], None
+    for g in range(model.ngeom):
+        gtype = model.geom_type[g]
+        cx, cy = float(data.geom_xpos[g][0]), float(data.geom_xpos[g][1])
+        size = model.geom_size[g]
+        if gtype == mujoco.mjtGeom.mjGEOM_PLANE:
+            if size[0] > 0 and size[1] > 0:  # size 0 = infinite plane
+                bounds = (cx - size[0], cx + size[0], cy - size[1], cy + size[1])
+            continue
+        if in_robot(model.geom_bodyid[g]):
+            continue
+        if model.geom_contype[g] == 0 and model.geom_conaffinity[g] == 0:
+            continue  # visual-only, the robot can't hit it
+        if gtype == mujoco.mjtGeom.mjGEOM_BOX:
+            xmat = data.geom_xmat[g].reshape(3, 3)
+            yaw = float(np.arctan2(xmat[1, 0], xmat[0, 0]))
+            obstacles.append(Box(cx, cy, float(size[0]), float(size[1]), yaw))
+        elif gtype in (mujoco.mjtGeom.mjGEOM_SPHERE, mujoco.mjtGeom.mjGEOM_CYLINDER):
+            obstacles.append(Circle(cx, cy, float(size[0])))
+        else:  # capsules, meshes, ellipsoids: conservative bounding circle
+            obstacles.append(Circle(cx, cy, float(model.geom_rbound[g])))
+
+    base_z = 0.0
+    for j in range(model.njnt):
+        if model.jnt_bodyid[j] == base_id:
+            base_z = float(model.qpos0[model.jnt_qposadr[j] + 2])
+            break
+    return obstacles, bounds or DEFAULT_SPAWN_BOUNDS, base_z
 
 
 class StretchMujocoDriver(Node):
@@ -90,6 +140,14 @@ class StretchMujocoDriver(Node):
         self.declare_parameter("mujoco_xml", "")
         self.declare_parameter("max_linear_mps", DEFAULT_MAX_LINEAR_MPS)
         self.declare_parameter("max_angular_radps", DEFAULT_MAX_ANGULAR_RADPS)
+        # Random start pose every reset (the learner must find the target from anywhere)
+        self.declare_parameter("random_spawn", False)
+        self.declare_parameter("spawn_clearance", DEFAULT_SPAWN_CLEARANCE_M)
+        self._random_spawn = self.get_parameter("random_spawn").value
+        if isinstance(self._random_spawn, str):
+            self._random_spawn = self._random_spawn.lower() == "true"
+        self._spawn_clearance = float(self.get_parameter("spawn_clearance").value)
+        self._spawn_rng = np.random.default_rng()
         self.max_linear_mps = float(self.get_parameter("max_linear_mps").value)
         self.max_angular_radps = float(self.get_parameter("max_angular_radps").value)
 
@@ -154,12 +212,28 @@ class StretchMujocoDriver(Node):
                 style=robocasa_style,
             )
 
+        if model is None:
+            # Same world the simulator would load by default, but held here so
+            # its obstacles are known for random spawning
+            import mujoco
+            model = mujoco.MjModel.from_xml_path(stretch_mujoco_utils.default_scene_xml_path)
+
+        self._spawn_obstacles, self._spawn_bounds, self._spawn_z = obstacles_from_model(model)
+        if self._random_spawn:
+            self.get_logger().info(
+                f"[SPAWN] Random spawn on: {len(self._spawn_obstacles)} obstacles, "
+                f"bounds {self._spawn_bounds}, clearance {self._spawn_clearance} m"
+            )
+        start_translation, start_rotation_quat = self._next_start_pose()
+
         sim = StretchMujocoSimulator(
             model=model,
             camera_hz=2,
             cameras_to_use=(
                 [StretchCameras.cam_d435i_rgb,StretchCameras.cam_d435i_depth] if use_cameras else StretchCameras.none()
             ),
+            start_translation=start_translation,
+            start_rotation_quat=start_rotation_quat,
         )
 
         sim.start(headless=not use_mujoco_viewer)
@@ -899,6 +973,20 @@ class StretchMujocoDriver(Node):
         response.message = "Stopped the robot."
         return response
 
+    def _next_start_pose(self):
+        """(start_translation, start_rotation_quat) for the next sim start:
+        a random collision-free pose when random_spawn is on, else (None, None)."""
+        if not self._random_spawn:
+            return None, None
+        pose = sample_spawn_pose(self._spawn_rng, self._spawn_obstacles,
+                                 self._spawn_bounds, clearance=self._spawn_clearance)
+        if pose is None:
+            self.get_logger().warn("[SPAWN] No free pose found; using the default start pose")
+            return None, None
+        x, y, yaw = pose
+        self.get_logger().info(f"[SPAWN] x={x:+.2f} y={y:+.2f} yaw={np.degrees(yaw):+.0f} deg")
+        return [x, y, self._spawn_z], yaw_to_quat(yaw)
+
     def reset_simulation_callback(self, request, response):
         """
         Reset the MuJoCo simulation to its initial state.
@@ -919,8 +1007,11 @@ class StretchMujocoDriver(Node):
             # Phase 2: Try direct MuJoCo reset (fastest, cleanest)
             reset_done = False
             
+            # Random spawn needs a restart with a new start pose (Method C)
+            if self._random_spawn:
+                pass
             # Method A: Try sim.reset() if available (some stretch_mujoco versions)
-            if hasattr(self.sim, 'reset') and callable(self.sim.reset):
+            elif hasattr(self.sim, 'reset') and callable(self.sim.reset):
                 try:
                     self.sim.reset()
                     reset_done = True
@@ -929,7 +1020,7 @@ class StretchMujocoDriver(Node):
                     self.get_logger().warn(f"[RESET] sim.reset() failed: {e}")
             
             # Method B: Try direct mj_resetData via sim internals
-            if not reset_done:
+            if not reset_done and not self._random_spawn:
                 try:
                     import mujoco
                     # StretchMujocoSimulator may expose mjmodel/mjdata
@@ -954,6 +1045,7 @@ class StretchMujocoDriver(Node):
                     import time
                     time.sleep(0.5)
                     
+                    start_translation, start_rotation_quat = self._next_start_pose()
                     self.sim = StretchMujocoSimulator(
                         model=self._sim_model,
                         camera_hz=2,
@@ -962,6 +1054,8 @@ class StretchMujocoDriver(Node):
                             if self._use_cameras
                             else StretchCameras.none()
                         ),
+                        start_translation=start_translation,
+                        start_rotation_quat=start_rotation_quat,
                     )
                     self.sim.start(headless=not self._use_mujoco_viewer)
                     
