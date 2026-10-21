@@ -145,6 +145,36 @@ It asks for the same prompt and gets the same random spawns and rewards. Its
 episodes are tagged `EXPERT_BASELINE`, kept out of the RL learning curves, and
 compared against RL in Fig. 10.
 
+## Many robots in one simulator (grid arena)
+
+```bash
+ros2 launch senior_project grid_navigation.launch.py
+```
+
+```
+What should the robot go to? (e.g. chair, potted plant, blue cylinder): chair
+How many robots? [8]:
+```
+
+This runs N copies of the room, each with its own Stretch, inside **one**
+MuJoCo simulator, trained by **one** learner with one replay buffer. It uses
+much less memory than one simulator and learner per robot.
+
+- **Rooms:** laid out in a grid with 2.5 m walls, so no robot sees, bumps
+  into, or gets goals from another room.
+- **Respawns:** each robot respawns in its own room at a random free spot
+  without restarting anything.
+- **Shared SAM3:** one SAM3 server serves every robot. The per-robot
+  detection rate drops as N grows (1 Hz at 8 robots).
+- **Panel:** shows one row per robot plus combined progress and success rates.
+- **Checkpoints:** go to `~/rl_checkpoints/grid`, separate from single-robot runs.
+- **Evaluation:** `eval_episodes:=K` runs K episodes in total across all robots
+  and adds a `robot` column to the CSV.
+
+Before the first long run, do the speed checks in
+[docs/grid_checks.md](docs/grid_checks.md) on the training machine. They report
+whether physics, cameras and SAM3 keep up with the robot count you picked.
+
 ## Parallel training
 
 Start one shared SAM3 server, then the sims:

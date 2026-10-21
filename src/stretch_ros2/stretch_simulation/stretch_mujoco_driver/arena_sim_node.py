@@ -62,12 +62,16 @@ class ArenaSimNode(Node):
         self.use_cameras = str(p("use_cameras", True).value).lower() == "true"
         random_spawn = str(p("random_spawn", True).value).lower() == "true"
         seed = int(p("seed", 0).value)
+        # 4 ms (the model's default is 2 ms): measured identical driving speed
+        # and twice the real-time headroom with 8 robots in one process
+        timestep = float(p("physics_timestep", 0.004).value)
 
         t0 = time.time()
         world = build_arena(robot_xml, room_xml, self.n,
                             room_size=float(p("room_size", 10.0).value),
                             gap=float(p("room_gap", 2.0).value),
                             wall_height=float(p("wall_height", 2.5).value))
+        world.model.opt.timestep = timestep
         self.arena = Arena(world, rng=np.random.default_rng(seed or None),
                            clearance=float(p("spawn_clearance", 1.0).value))
         self.random_spawn = random_spawn
