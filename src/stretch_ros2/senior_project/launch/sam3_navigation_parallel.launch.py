@@ -81,12 +81,8 @@ def generate_launch_description():
         description="Total training steps per simulation"
     ))
     ld.add_action(DeclareLaunchArgument(
-        "rollout_steps", default_value="2048",
-        description="Rollout steps per update"
-    ))
-    ld.add_action(DeclareLaunchArgument(
         "ckpt_dir",
-        default_value=os.path.expanduser("~/ament_ws/src/stretch_ros2/senior_project/parallel_training"),
+        default_value=os.path.expanduser("~/rl_checkpoints"),
         description="Base checkpoint directory"
     ))
     ld.add_action(DeclareLaunchArgument(
@@ -136,7 +132,7 @@ def _start_sam3_servers(context):
         for sim_id in range(num_sims):
             port = sam3_base_port + sim_id
             cmd_string = (
-                f"source /opt/ros/humble/setup.bash && "
+                f"source /opt/ros/$ROS_DISTRO/setup.bash && "
                 f"source {home}/ament_ws/install/setup.bash && "
                 f"python3 -m senior_project.sam3_server --port {port}"
             )
@@ -152,7 +148,7 @@ def _start_sam3_servers(context):
         # Shared mode - single server
         actions.append(LogInfo(msg=f"[SAM3] Starting SHARED SAM3 server on port {sam3_base_port}"))
         cmd_string = (
-            f"source /opt/ros/humble/setup.bash && "
+            f"source /opt/ros/$ROS_DISTRO/setup.bash && "
             f"source {home}/ament_ws/install/setup.bash && "
             f"python3 -m senior_project.sam3_server --port {sam3_base_port}"
         )
@@ -177,7 +173,6 @@ def _start_parallel_runner_delayed(context):
     num_sims = LaunchConfiguration("num_sims").perform(context)
     target = LaunchConfiguration("target").perform(context)
     total_steps = LaunchConfiguration("total_steps").perform(context)
-    rollout_steps = LaunchConfiguration("rollout_steps").perform(context)
     ckpt_dir = os.path.expanduser(LaunchConfiguration("ckpt_dir").perform(context))
     stagger_delay = LaunchConfiguration("stagger_delay").perform(context)
     headless = LaunchConfiguration("headless").perform(context)
@@ -189,7 +184,7 @@ def _start_parallel_runner_delayed(context):
         "--num_sims", str(num_sims),
         "--target", str(target),
         "--total_steps", str(total_steps),
-        "--rollout_steps", str(rollout_steps),
+        "--goal_source", "topic",
         "--ckpt_dir", str(ckpt_dir),
         "--stagger_delay", str(stagger_delay),
         "--headless", str(headless),

@@ -9,20 +9,19 @@ This gives you a fair comparison: same sim, same physics, same reward
 structure, same episode timing — only the controller is different.
 
 Usage:
-    # Run on its own domain so it doesn't interfere with RL sims
-    ROS_DOMAIN_ID=20 ros2 launch senior_project expert_baseline.launch.py
+    # Run on its own domain (100) so it doesn't interfere with RL sims (90-99)
+    ROS_DOMAIN_ID=100 ros2 launch senior_project expert_baseline.launch.py
 
     # With SAM3 goal generator (for goal-seeking comparison)
-    ROS_DOMAIN_ID=20 ros2 launch senior_project expert_baseline.launch.py \
+    ROS_DOMAIN_ID=100 ros2 launch senior_project expert_baseline.launch.py \
         use_sam3:=true target:=person
 
     # Headless, no RViz (for parallel benchmarking)
-    ROS_DOMAIN_ID=20 ros2 launch senior_project expert_baseline.launch.py \
+    ROS_DOMAIN_ID=100 ros2 launch senior_project expert_baseline.launch.py \
         use_rviz:=false use_mujoco_viewer:=false
 
-    # Then monitor everything:
-    python reward_monitor.py --scan-start 0 --scan-end 25 \
-        --experiment ~/experiments/expert_vs_rl
+    # Then monitor everything (default scan range is 90-100):
+    python reward_monitor.py --experiment ~/experiments/expert_vs_rl
 """
 
 import os
@@ -37,7 +36,7 @@ from launch.actions import (
     TimerAction,
 )
 from launch.conditions import IfCondition
-from launch.substitutions import LaunchConfiguration
+from launch.substitutions import LaunchConfiguration, PythonExpression
 from launch_ros.actions import Node
 
 
@@ -57,14 +56,12 @@ def generate_launch_description():
         "use_mujoco_viewer", default_value="false", choices=["true", "false"],
     ))
     ld.add_action(DeclareLaunchArgument(
-        "use_cameras", default_value="true", choices=["true", "false"],
+        "use_cameras", default_value="false", choices=["true", "false"],
+        description="Cameras are only needed for SAM3 goals (use_sam3:=true)",
     ))
     ld.add_action(DeclareLaunchArgument(
-        "mujoco_xml",
-        default_value=os.path.expanduser(
-            "~/ament_ws/src/stretch_ros2/senior_project/config/scene.xml"
-        ),
-        description="Path to MuJoCo scene XML",
+        "mujoco_xml", default_value="",
+        description="MuJoCo world XML (empty = driver default world, same as RL.launch.py)",
     ))
 
     # Sim args
@@ -237,6 +234,8 @@ def generate_launch_description():
             LaunchConfiguration("total_episodes"),
             "--total-steps",
             LaunchConfiguration("total_steps"),
+            "--goal-source",
+            PythonExpression(["'topic' if '", LaunchConfiguration("use_sam3"), "' == 'true' else 'random'"]),
         ],
         output="screen",
     )
@@ -250,19 +249,6 @@ def generate_launch_description():
 
     # If use_sam3 is true, start the goal generator so the expert has goals
     # to navigate toward, making the comparison with RL goal-seeking fair.
-    home = os.path.expanduser("~")
-    sam3_goal_cmd = (
-        f"source /opt/ros/humble/setup.bash && "
-        f"source {home}/ament_ws/install/setup.bash && "
-        f"ros2 run senior_project sam3_goal_generator "
-        f"--ros-args "
-        f"-p target:=$(ros2 launch --print-arguments | echo person) "  # fallback
-        f"-p auto_publish_goal:=true "
-        f"-p depth_mode:=auto "
-        f"-p server_url:=http://localhost:8100"
-    )
-
-    # Simpler: use ExecuteProcess with the module directly
     sam3_goal_proc = ExecuteProcess(
         cmd=[
             "python3", "-m", "senior_project.sam3_goal_generator",

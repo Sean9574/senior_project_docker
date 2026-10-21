@@ -112,9 +112,12 @@ def generate_launch_description():
     
     ld.add_action(DeclareLaunchArgument("use_reward_monitor", default_value="true"))
     ld.add_action(DeclareLaunchArgument("total_steps", default_value="200000"))
-    ld.add_action(DeclareLaunchArgument("rollout_steps", default_value="2048"))
     ld.add_action(DeclareLaunchArgument(
-        "ckpt_dir", default_value=os.path.expanduser("~/parallel_training"),
+        "ckpt_dir", default_value=os.path.expanduser("~/rl_checkpoints"),
+    ))
+    ld.add_action(DeclareLaunchArgument(
+        "goal_source", default_value="topic", choices=["random", "topic"],
+        description="topic = learner follows the SAM3 goal generator (this file's purpose)",
     ))
     ld.add_action(DeclareLaunchArgument("load_ckpt", default_value=""))
     ld.add_action(DeclareLaunchArgument("headless", default_value="false"))
@@ -181,7 +184,7 @@ def _configure_launch(context):
         # FIXED: Proper ROS environment sourcing and correct workspace path
         home = os.path.expanduser("~")
         cmd_string = (
-            f"source /opt/ros/humble/setup.bash && "
+            f"source /opt/ros/$ROS_DISTRO/setup.bash && "
             f"source {home}/ament_ws/install/setup.bash && "
             f"python3 -m senior_project.sam3_server --port {sam3_port}"
         )
@@ -230,7 +233,7 @@ def _configure_launch(context):
         # FIXED: Proper ROS environment sourcing and correct workspace path
         home = os.path.expanduser("~")
         cmd_string = (
-            f"source /opt/ros/humble/setup.bash && "
+            f"source /opt/ros/$ROS_DISTRO/setup.bash && "
             f"source {home}/ament_ws/install/setup.bash && "
             f"python3 {home}/ament_ws/src/stretch_ros2/senior_project/senior_project/mono_depth_server.py "
             f"--model {mono_model} --port {mono_port}"
@@ -263,8 +266,8 @@ def _configure_launch(context):
             "mujoco_xml": LaunchConfiguration("mujoco_xml"),
             "use_reward_monitor": LaunchConfiguration("use_reward_monitor"),
             "total_steps": LaunchConfiguration("total_steps"),
-            "rollout_steps": LaunchConfiguration("rollout_steps"),
             "ckpt_dir": LaunchConfiguration("ckpt_dir"),
+            "goal_source": LaunchConfiguration("goal_source"),
             "load_ckpt": LaunchConfiguration("load_ckpt"),
             "headless": LaunchConfiguration("headless"),
         }.items(),

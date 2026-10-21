@@ -1,5 +1,8 @@
 <mujoco model="explore_arena">
-  <include file="/home/stretch/ament_ws/src/stretch_mujoco/stretch_mujoco/models/stretch.xml"/>
+  <!-- Relative include: this file must sit in stretch_mujoco/models/ (the Docker
+       image copies it there as explore_arena.xml). Use with
+       mujoco_xml:=<stretch_mujoco>/models/explore_arena.xml -->
+  <include file="stretch.xml"/>
   
   <statistic center="0 0 .75" extent="1.2" meansize="0.05"/>
   <visual>

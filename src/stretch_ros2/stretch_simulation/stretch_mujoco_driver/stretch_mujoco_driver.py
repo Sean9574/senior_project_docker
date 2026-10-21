@@ -70,6 +70,9 @@ DEFAULT_ROBOCASA_TASK = "PnPCounterToCab"
 DEFAULT_ACTION_SERVER_HZ = 30.0
 DEFAULT_JOINT_STATE_HZ = 30.0
 DEFAULT_SIM_TOOL = "eoa_wrist_dw3_tool_sg3"
+# Real Stretch base limits (Nav2 config caps 0.26 m/s, 1.0 rad/s)
+DEFAULT_MAX_LINEAR_MPS = 0.3
+DEFAULT_MAX_ANGULAR_RADPS = 1.0
 
 
 class StretchMujocoDriver(Node):
@@ -85,6 +88,10 @@ class StretchMujocoDriver(Node):
 
         # Declare ONCE
         self.declare_parameter("mujoco_xml", "")
+        self.declare_parameter("max_linear_mps", DEFAULT_MAX_LINEAR_MPS)
+        self.declare_parameter("max_angular_radps", DEFAULT_MAX_ANGULAR_RADPS)
+        self.max_linear_mps = float(self.get_parameter("max_linear_mps").value)
+        self.max_angular_radps = float(self.get_parameter("max_angular_radps").value)
 
         use_cameras = self.get_parameter("use_cameras").value
         use_mujoco_viewer = self.get_parameter("use_mujoco_viewer").value
@@ -93,8 +100,10 @@ class StretchMujocoDriver(Node):
         self._mujoco_xml = (self.get_parameter("mujoco_xml").value or "").strip()
 
         if self._mujoco_xml and not os.path.isfile(self._mujoco_xml):
+            # Fail loudly: silently falling back to another world makes runs
+            # incomparable without anyone noticing.
             self.get_logger().error(f"[mujoco_xml] File not found: {self._mujoco_xml}")
-            self._mujoco_xml = ""
+            raise FileNotFoundError(f"mujoco_xml not found: {self._mujoco_xml}")
 
         if self._mujoco_xml:
             self.get_logger().info(f"[mujoco_xml] Using custom MJCF/XML: {self._mujoco_xml}")
@@ -224,8 +233,8 @@ class StretchMujocoDriver(Node):
             )
             self.robot_mode_rwlock.release_read()
             return
-        self.linear_velocity_mps = twist.linear.x
-        self.angular_velocity_radps = twist.angular.z
+        self.linear_velocity_mps = max(-self.max_linear_mps, min(self.max_linear_mps, twist.linear.x))
+        self.angular_velocity_radps = max(-self.max_angular_radps, min(self.max_angular_radps, twist.angular.z))
         self.last_twist_time = self.get_clock().now()
         self.robot_mode_rwlock.release_read()
 

@@ -11,7 +11,7 @@ from launch.actions import (
     TimerAction,
 )
 from launch.conditions import IfCondition
-from launch.substitutions import LaunchConfiguration
+from launch.substitutions import LaunchConfiguration, PathJoinSubstitution, PythonExpression
 from launch_ros.actions import Node
 
 
@@ -30,6 +30,19 @@ def generate_launch_description():
     )
     ld.add_action(
         DeclareLaunchArgument(
+            "headless", default_value="false", choices=["true", "false"],
+            description="true = no RViz and no MuJoCo viewer (parallel / no display)",
+        )
+    )
+    ld.add_action(
+        DeclareLaunchArgument(
+            "goal_source", default_value="random", choices=["random", "topic"],
+            description="random: line-of-sight goals + curriculum; topic: <ns>/goal (SAM3 / RViz)",
+        )
+    )
+    ld.add_action(DeclareLaunchArgument("seed", default_value="42"))
+    ld.add_action(
+        DeclareLaunchArgument(
             "use_mujoco_viewer",
             default_value="false",
             choices=["true", "false"],
@@ -38,16 +51,18 @@ def generate_launch_description():
     ld.add_action(
         DeclareLaunchArgument(
             "use_cameras",
-            default_value="true",
+            default_value="false",
             choices=["true", "false"],
+            description="Cameras are only needed for SAM3 goals (goal_source:=topic)",
         )
     )
     
     ld.add_action(
         DeclareLaunchArgument(
             "mujoco_xml",
-            default_value="/home/sean/ament_ws/src/stretch_ros2/senior_project/map/map.xml",
-            description="Path to map"
+            default_value="",
+            description="MuJoCo world XML (empty = driver default world, which the "
+                        "Docker image sets to senior_project/config/scene.xml)"
         )
     )
     # ---- NEW: Reward Monitor Argument ----
@@ -60,50 +75,11 @@ def generate_launch_description():
         )
     )
 
-    # ---- NEW: Hard Reset Arguments ----
-    ld.add_action(
-        DeclareLaunchArgument(
-            "episode_num",
-            default_value="1",
-            description="Current episode number (set by hard_reset.sh)"
-        )
-    )
-    ld.add_action(
-        DeclareLaunchArgument(
-            "models_dir",
-            default_value="./models",
-            description="Models checkpoint directory (set by hard_reset.sh)"
-        )
-    )
-    ld.add_action(
-        DeclareLaunchArgument(
-            "use_hard_reset",
-            default_value="false",
-            choices=["true", "false"],
-            description="Use hard reset (kill/restart) instead of normal training"
-        )
-    )
-    ld.add_action(
-        DeclareLaunchArgument(
-            "episode_length",
-            default_value="180",
-            description="Episode length in seconds (for hard reset mode)"
-        )
-    )
-    ld.add_action(
-        DeclareLaunchArgument(
-            "max_episodes",
-            default_value="30.0",
-            description="Maximum number of episodes (for hard reset mode)"
-        )
-    )
-
     # ---- RL-specific args (forwarded into learner_node.py) ----
     ld.add_action(DeclareLaunchArgument("total_steps", default_value="200000"))
-    ld.add_action(DeclareLaunchArgument("rollout_steps", default_value="2048"))
     ld.add_action(
         DeclareLaunchArgument(
-            "ckpt_dir", default_value=os.path.expanduser("~/parallel_training")
+            "ckpt_dir", default_value=os.path.expanduser("~/rl_checkpoints")
         )
     )
     ld.add_action(DeclareLaunchArgument("load_ckpt", default_value=""))
@@ -112,18 +88,10 @@ def generate_launch_description():
     ld.add_action(DeclareLaunchArgument("cmd_topic", default_value="/stretch/cmd_vel"))
     ld.add_action(DeclareLaunchArgument("lidar_topic", default_value="/stretch/scan"))
     ld.add_action(DeclareLaunchArgument("imu_topic", default_value="imu"))
-    ld.add_action(
-        DeclareLaunchArgument(
-            "use_obstacle", default_value="0", choices=["0", "1"]
-        )
-    )
     # Dynamic goal topic (matches learner_node.py; with ns=stretch this is /stretch/goal)
     ld.add_action(DeclareLaunchArgument("goal_topic", default_value="goal"))
 
     # --- Evaluation args ---
-    ld.add_action(
-        DeclareLaunchArgument("eval_every_steps", default_value="3000")
-    )
     ld.add_action(
         DeclareLaunchArgument(
             "eval_episodes", default_value="0",
@@ -239,10 +207,13 @@ def generate_launch_description():
             output="screen",
             arguments=[],
             remappings=[
-                ("/move_base_simple/goal", "/goal"),
-                ("/goal_pose", "/goal")
+                ("/move_base_simple/goal", ["/", LaunchConfiguration("ns"), "/goal"]),
+                ("/goal_pose", ["/", LaunchConfiguration("ns"), "/goal"]),
             ],
-            condition=IfCondition(LaunchConfiguration("use_rviz")),
+            condition=IfCondition(PythonExpression([
+                "'", LaunchConfiguration("use_rviz"), "' == 'true' and '",
+                LaunchConfiguration("headless"), "' != 'true'",
+            ])),
         )
     )
 
@@ -256,7 +227,10 @@ def generate_launch_description():
                 "fail_out_of_range_goal"
             ),
             "mode": LaunchConfiguration("mode"),
-            "use_mujoco_viewer": LaunchConfiguration("use_mujoco_viewer"),
+            "use_mujoco_viewer": PythonExpression([
+                "'", LaunchConfiguration("use_mujoco_viewer"), "' == 'true' and '",
+                LaunchConfiguration("headless"), "' != 'true'",
+            ]),
             "use_cameras": LaunchConfiguration("use_cameras"),
             "mujoco_xml": LaunchConfiguration("mujoco_xml"),
 
@@ -285,7 +259,7 @@ def generate_launch_description():
 
 
 
-    # --- START THE PPO LEARNER ---
+    # --- START THE TD3 LEARNER ---
     learner_proc = ExecuteProcess(
         cmd=[
             "python3",
@@ -297,6 +271,10 @@ def generate_launch_description():
             LaunchConfiguration("total_steps"),
             "--ckpt-dir",
             LaunchConfiguration("ckpt_dir"),
+            "--goal-source",
+            LaunchConfiguration("goal_source"),
+            "--seed",
+            LaunchConfiguration("seed"),
             "--load-ckpt",
             LaunchConfiguration("load_ckpt"),
             "--odom-topic",
@@ -326,7 +304,10 @@ def generate_launch_description():
     reward_monitor_path = os.path.join(package_dir, 'scripts', 'reward_monitor.py')
     
     reward_monitor_proc = ExecuteProcess(
-        cmd=['python3', reward_monitor_path],
+        cmd=[
+            'python3', reward_monitor_path,
+            '--experiment', PathJoinSubstitution([LaunchConfiguration("ckpt_dir"), "monitor"]),
+        ],
         output='screen',
         condition=IfCondition(LaunchConfiguration("use_reward_monitor")),
     )
@@ -334,28 +315,9 @@ def generate_launch_description():
     # Start reward monitor after learner starts
     ld.add_action(TimerAction(period=5.0, actions=[reward_monitor_proc]))
 
-    # ---- NEW: HARD RESET MODE ----
-    # Find the bash script (assuming it's in SENIOR_PROJECT/scripts/)
-    bash_script_path = os.path.join(package_dir, 'scripts', 'hard_reset.sh')
-    
-    # Execute hard reset bash script instead of normal launch
-    hard_reset_proc = ExecuteProcess(
-        cmd=[
-            'bash',
-            bash_script_path,
-            LaunchConfiguration("episode_length"),
-            LaunchConfiguration("max_episodes")
-        ],
-        output='screen',
-        shell=False,
-        condition=IfCondition(LaunchConfiguration("use_hard_reset")),
-    )
-    
-    ld.add_action(hard_reset_proc)
-
     ld.add_action(
         LogInfo(
-            msg="[RL.launch] Sim + PPO learner + Reward Monitor"
+            msg="[RL.launch] Sim + TD3 learner + Reward Monitor"
         )
     )
     return ld

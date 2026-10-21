@@ -70,87 +70,29 @@ from std_srvs.srv import Trigger
 from visualization_msgs.msg import Marker
 
 # =============================================================================
-# Import shared constants and classes from learner_node
-# Try importing from the package first, fall back to local definitions
+# Shared constants and classes from learner_node (one source of truth: if
+# this import fails, fix the install instead of running drifted copies)
 # =============================================================================
 
-try:
-    from senior_project.learner_node import (
-        ROBOT_WIDTH_M, ROBOT_HALF_WIDTH_M, DESIRED_CLEARANCE_M, MIN_SAFE_DISTANCE,
-        ZONE_FREE, ZONE_AWARE, ZONE_CAUTION, ZONE_DANGER, ZONE_EMERGENCY,
-        R_COLLISION, COLLISION_COOLDOWN_STEPS, R_GOAL, GOAL_RADIUS,
-        PROGRESS_SCALE, STEP_COST_GOAL,
-        R_NEW_CELL, R_STEP_EXPLORE, R_REVISIT,
-        R_PROXIMITY, PROXIMITY_THRESHOLD,
-        EPISODE_SECONDS, GRID_SIZE, GRID_RESOLUTION, GRID_MAX_RANGE,
-        V_MAX, V_MIN_FORWARD, W_MAX, MIN_TURN_RADIUS,
-        CMD_SMOOTHING_ALPHA, VISIT_DECAY, NOVELTY_RADIUS,
-        LIDAR_FORWARD_OFFSET_RAD, NUM_LIDAR_BINS, LIDAR_MAX_RANGE,
-        OCC_GRID_UPDATE_INTERVAL, FRONTIER_CACHE_INTERVAL,
-        DEBUG_EVERY_N, PUBLISH_MAP, PUBLISH_MAP_EVERY_N, PUBLISH_PATH,
-        PATH_HISTORY_LENGTH, MAP_FRAME,
-        yaw_from_quat, wrap_to_pi,
-        NavigationState, DynamicNavigator, EgoOccupancyGrid,
-        ExpertStateMachine,
-        StretchRosInterface, StretchExploreEnv,
-    )
-    IMPORTED_FROM_PACKAGE = True
-    print("[EXPERT] Imported classes from senior_project.learner_node")
-except ImportError:
-    IMPORTED_FROM_PACKAGE = False
-    print("[EXPERT] Could not import from package — using inline definitions")
-
-    # =========================================================================
-    # Inline fallback constants (must match learner_node.py exactly)
-    # =========================================================================
-    ROBOT_WIDTH_M = 0.33
-    ROBOT_HALF_WIDTH_M = 0.165
-    DESIRED_CLEARANCE_M = 0.25
-    MIN_SAFE_DISTANCE = ROBOT_HALF_WIDTH_M + DESIRED_CLEARANCE_M
-
-    ZONE_FREE = 1.2
-    ZONE_AWARE = 0.90
-    ZONE_CAUTION = 0.65
-    ZONE_DANGER = 0.45
-    ZONE_EMERGENCY = 0.30
-
-    R_COLLISION = -5.0
-    COLLISION_COOLDOWN_STEPS = 8
-    R_GOAL = 2000.0
-    R_TIMEOUT = -50.0
-    GOAL_RADIUS = 0.45
-    PROGRESS_SCALE = 400.0
-    STEP_COST_GOAL = -2.5
-    R_NEW_CELL = 5.0
-    R_STEP_EXPLORE = -0.3
-    R_REVISIT = -2.0
-    R_PROXIMITY = -3.0
-    PROXIMITY_THRESHOLD = 0.65
-
-    EPISODE_SECONDS = 45.0
-    GRID_SIZE = 16
-    GRID_RESOLUTION = 0.75
-    V_MAX = 1.0
-    V_MIN_FORWARD = 0.15
-    W_MAX = 3.0
-    MIN_TURN_RADIUS = 0.40
-    CMD_SMOOTHING_ALPHA = 0.75
-    NUM_LIDAR_BINS = 36
-    LIDAR_MAX_RANGE = 20.0
-    LIDAR_FORWARD_OFFSET_RAD = math.pi
-    OCC_GRID_UPDATE_INTERVAL = 1
-    FRONTIER_CACHE_INTERVAL = 10
-    DEBUG_EVERY_N = 100
-    PUBLISH_MAP = True
-    PUBLISH_MAP_EVERY_N = 100
-    PUBLISH_PATH = True
-    PATH_HISTORY_LENGTH = 1000
-    MAP_FRAME = "odom"
-    VISIT_DECAY = 0.995
-    GRID_MAX_RANGE = 12.0
-
-    print("[EXPERT] WARNING: Using inline constants. If learner_node.py changes, update these too.")
-    print("[EXPERT] To fix: ensure senior_project is installed (colcon build + source install/setup.bash)")
+from senior_project.learner_node import (
+    ROBOT_WIDTH_M, ROBOT_HALF_WIDTH_M, DESIRED_CLEARANCE_M, MIN_SAFE_DISTANCE,
+    ZONE_FREE, ZONE_AWARE, ZONE_CAUTION, ZONE_DANGER, ZONE_EMERGENCY,
+    R_COLLISION, COLLISION_COOLDOWN_STEPS, R_GOAL, GOAL_RADIUS,
+    PROGRESS_SCALE, STEP_COST_GOAL,
+    R_NEW_CELL, R_STEP_EXPLORE, R_REVISIT,
+    R_PROXIMITY, PROXIMITY_THRESHOLD,
+    EPISODE_SECONDS, GRID_SIZE, GRID_RESOLUTION, GRID_MAX_RANGE,
+    V_MAX, V_MIN_FORWARD, W_MAX, MIN_TURN_RADIUS,
+    CMD_SMOOTHING_ALPHA, VISIT_DECAY, NOVELTY_RADIUS,
+    LIDAR_FORWARD_OFFSET_RAD, NUM_LIDAR_BINS, LIDAR_MAX_RANGE,
+    OCC_GRID_UPDATE_INTERVAL, FRONTIER_CACHE_INTERVAL,
+    DEBUG_EVERY_N, PUBLISH_MAP, PUBLISH_MAP_EVERY_N, PUBLISH_PATH,
+    PATH_HISTORY_LENGTH, MAP_FRAME,
+    yaw_from_quat, wrap_to_pi,
+    NavigationState, DynamicNavigator, EgoOccupancyGrid,
+    ExpertStateMachine,
+    StretchRosInterface, StretchExploreEnv,
+)
 
 
 # =============================================================================
@@ -175,6 +117,8 @@ def main():
     parser.add_argument("--total-steps", type=int, default=0,
                         help="Max steps (0 = no limit)")
     parser.add_argument("--seed", type=int, default=99)
+    parser.add_argument("--goal-source", choices=["random", "topic"], default="random",
+                        help="random: same LOS goals + curriculum as RL; topic: SAM3 goals")
 
     args = parser.parse_args()
 
@@ -192,7 +136,8 @@ def main():
     executor = SingleThreadedExecutor()
     executor.add_node(ros)
 
-    env = StretchExploreEnv(ros)
+    env = StretchExploreEnv(ros, goal_source=args.goal_source,
+                            rng=np.random.default_rng(args.seed))
     # Override the training phase so the reward monitor knows this is the baseline
     env._current_training_phase = "EXPERT_BASELINE"
     env._expert_avg_return = 0.0

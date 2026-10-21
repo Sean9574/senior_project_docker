@@ -13,14 +13,14 @@ setup(
         (f'share/{package_name}', ['package.xml']),
         # Only install *.launch.py once (no duplicate glob for *.py)
         (f'share/{package_name}/launch', glob('launch/*.launch.py')),
-        (f'share/{package_name}/modules', glob('modules/*.py')),
         (f'share/{package_name}/scripts', glob('scripts/*.py')),
-        (f'share/{package_name}/meshes', glob('meshes/*')),
+        (f'share/{package_name}/config', glob('config/*')),
+        (f'share/{package_name}/map', glob('map/*')),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
     maintainer='sean',
-    maintainer_email='sean9574@gmail.com',
+    maintainer_email='sbrainard@ltu.edu',
     description='Stretch RL training + sim bridge',
     license='Apache-2.0',
     entry_points={
@@ -33,7 +33,6 @@ setup(
             'sam3_server = senior_project.sam3_server:main',
             'parallel_runner = senior_project.parallel_runner:main',
             'expert_baseline = senior_project.expert_baseline_node:main',
-            
         ],
     },
 )
