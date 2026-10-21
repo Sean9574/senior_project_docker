@@ -90,3 +90,34 @@ def phase_for_step(t: int, demo_steps: int, start_steps: int) -> str:
     if t < demo_steps + start_steps:
         return "RANDOM_EXPLORE"
     return "RL_POLICY"
+
+
+# =============================================================================
+# Vectorised training (grid arena: N robots, one agent, one replay buffer)
+# =============================================================================
+
+def vector_update_count(n_new: int, update_every: int, carry: int) -> Tuple[int, int]:
+    """Gradient updates owed for n_new transitions at one update per
+    `update_every` transitions; leftovers carry to the next step."""
+    total = carry + n_new
+    return total // update_every, total % update_every
+
+
+def vector_transitions(prev_obs: list, actions: list, results: list, reset_fn) -> Tuple[list, list, list]:
+    """Turn one vector step into replay transitions.
+
+    results[i] = (next_obs, reward, terminated, truncated, info) of robot i.
+    Transition i = (prev_obs[i], actions[i], reward, next_obs, terminated):
+    only a true terminal state stops bootstrapping, a timeout does not.
+    Robots whose episode ended are reset with reset_fn(i) -> new first obs.
+    Returns (transitions, observations for the next step, finished indices).
+    """
+    transitions, next_obs, finished = [], [], []
+    for i, (obs, reward, terminated, truncated, _info) in enumerate(results):
+        transitions.append((prev_obs[i], actions[i], reward, obs, bool(terminated)))
+        if terminated or truncated:
+            finished.append(i)
+            next_obs.append(reset_fn(i))
+        else:
+            next_obs.append(obs)
+    return transitions, next_obs, finished

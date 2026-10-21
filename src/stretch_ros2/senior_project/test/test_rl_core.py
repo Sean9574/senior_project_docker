@@ -99,3 +99,35 @@ def test_phase_for_step(t, want):
 def test_phase_with_no_demo_or_random_steps_is_rl():
     assert rl_core.phase_for_step(1, 0, 0) == "RL_POLICY"
 
+
+
+# ---------------------------------------------------------------- vector loop
+
+@pytest.mark.parametrize("n_new, every, carry, want", [
+    (8, 4, 0, (2, 0)),   # 8 robots, 1 update per 4 transitions
+    (3, 4, 0, (0, 3)),
+    (3, 4, 3, (1, 2)),   # leftover transitions carry over
+    (1, 1, 0, (1, 0)),
+])
+def test_vector_update_count_keeps_per_transition_ratio(n_new, every, carry, want):
+    assert rl_core.vector_update_count(n_new, every, carry) == want
+
+
+def test_one_robot_finishing_does_not_disturb_the_others():
+    prev = ["o0", "o1", "o2"]
+    acts = ["a0", "a1", "a2"]
+    results = [("n0", 0.1, False, False, {}),
+               ("n1", 10.0, True, False, {}),     # robot 1 reached its goal
+               ("n2", -0.1, False, True, {})]     # robot 2 timed out
+    resets = []
+
+    def reset(i):
+        resets.append(i)
+        return f"reset{i}"
+
+    transitions, next_obs, finished = rl_core.vector_transitions(prev, acts, results, reset)
+    assert transitions == [("o0", "a0", 0.1, "n0", False),
+                           ("o1", "a1", 10.0, "n1", True),
+                           ("o2", "a2", -0.1, "n2", False)]  # timeout is not terminal
+    assert next_obs == ["n0", "reset1", "reset2"]
+    assert finished == [1, 2] and resets == [1, 2]

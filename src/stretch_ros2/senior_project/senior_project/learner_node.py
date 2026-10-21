@@ -987,8 +987,13 @@ class EgoOccupancyGrid:
 
 class StretchRosInterface(Node):
     def __init__(self, ns: str = "", odom_topic="/odom", scan_topic="/scan_filtered",
-                 imu_topic="/imu_mobile_base", goal_topic="goal", cmd_topic="/stretch/cmd_vel"):
-        super().__init__("learner_node")
+                 imu_topic="/imu_mobile_base", goal_topic="goal", cmd_topic="/stretch/cmd_vel",
+                 node_name: str = "learner_node", reset_service: str = "/sim/reset",
+                 topic_prefix: str = ""):
+        # Grid arena: one interface per robot (node_name/reset_service/topic_prefix
+        # per robot); single-robot defaults keep the original names
+        super().__init__(node_name)
+        self._spin_fn = None
 
         self.last_odom: Optional[Odometry] = None
         self.last_scan: Optional[LaserScan] = None
@@ -1027,29 +1032,39 @@ class StretchRosInterface(Node):
         self.create_subscription(PoseStamped, goal_pose_name, self._goal_pose_cb, 10)
 
         self.cmd_pub = self.create_publisher(Twist, cmd_name, 10)
-        self.reward_pub = self.create_publisher(Float32, "/reward", 10)
-        self.reward_breakdown_pub = self.create_publisher(StringMsg, "/reward_breakdown", 10)
-        self.map_pub = self.create_publisher(OccupancyGrid, "/exploration_map", 10)
-        self.heatmap_pub = self.create_publisher(OccupancyGrid, "/visit_heatmap", 10)
-        self.path_pub = self.create_publisher(Marker, "/robot_path", 10)
-        self.frontier_pub = self.create_publisher(MarkerArray, "/frontiers", 10)
-        self.safety_zone_pub = self.create_publisher(Marker, "/safety_zone", 10)
+        self.reward_pub = self.create_publisher(Float32, f"{topic_prefix}/reward", 10)
+        self.reward_breakdown_pub = self.create_publisher(StringMsg, f"{topic_prefix}/reward_breakdown", 10)
+        self.map_pub = self.create_publisher(OccupancyGrid, f"{topic_prefix}/exploration_map", 10)
+        self.heatmap_pub = self.create_publisher(OccupancyGrid, f"{topic_prefix}/visit_heatmap", 10)
+        self.path_pub = self.create_publisher(Marker, f"{topic_prefix}/robot_path", 10)
+        self.frontier_pub = self.create_publisher(MarkerArray, f"{topic_prefix}/frontiers", 10)
+        self.safety_zone_pub = self.create_publisher(Marker, f"{topic_prefix}/safety_zone", 10)
         self.goal_reached_pub = self.create_publisher(PointStamped, f"/{ns}/goal_reached", 10)
         # Tells the SAM3 goal generator to drop its locked goal (robot respawns)
         self.episode_reset_pub = self.create_publisher(Empty, make_topic("episode_reset"), 10)
-        self.goal_marker_pub = self.create_publisher(Marker, "/goal_marker", 10)
-        self.last_known_marker_pub = self.create_publisher(Marker, "/last_known_marker", 10)
+        self.goal_marker_pub = self.create_publisher(Marker, f"{topic_prefix}/goal_marker", 10)
+        self.last_known_marker_pub = self.create_publisher(Marker, f"{topic_prefix}/last_known_marker", 10)
 
         self.path_history: deque = deque(maxlen=PATH_HISTORY_LENGTH)
         self.get_logger().info("[VIZ] Publishing: /exploration_map, /visit_heatmap, /robot_path, /safety_zone, /goal_marker")
 
-        self.reset_client = self.create_client(Trigger, '/sim/reset')
+        self.reset_client = self.create_client(Trigger, reset_service)
         self._sim_reset_available = False
         if self.reset_client.wait_for_service(timeout_sec=2.0):
             self._sim_reset_available = True
-            self.get_logger().info('[ROS] /sim/reset service FOUND')
+            self.get_logger().info(f'[ROS] {reset_service} service FOUND')
         else:
-            self.get_logger().warn('[ROS] /sim/reset service NOT found — soft reset only')
+            self.get_logger().warn(f'[ROS] {reset_service} service NOT found — soft reset only')
+
+    def set_spin(self, spin_fn):
+        """Grid arena: spin a shared executor (all robots) instead of this node alone."""
+        self._spin_fn = spin_fn
+
+    def spin(self, timeout_sec: float):
+        if self._spin_fn is not None:
+            self._spin_fn(timeout_sec)
+        else:
+            rclpy.spin_once(self, timeout_sec=timeout_sec)
 
     def add_path_point(self, x: float, y: float):
         self.path_history.append((x, y))
@@ -1110,7 +1125,7 @@ class StretchRosInterface(Node):
         old_scan = self.last_scan
         start = time.time()
         while self.last_scan is old_scan and time.time() - start < timeout:
-            rclpy.spin_once(self, timeout_sec=0.05)
+            self.spin(0.05)
         if self._last_raw_ranges is None or self.last_scan is None:
             self.get_logger().warn("[LIDAR] No scan for self-mask calibration")
             return
@@ -1141,7 +1156,7 @@ class StretchRosInterface(Node):
         while time.time() - start < timeout:
             if self.last_odom is not None and self.last_scan is not None:
                 return True
-            rclpy.spin_once(self, timeout_sec=0.1)
+            self.spin(0.1)
         self.get_logger().warn("[ENV] Timeout waiting for sensors")
         return False
 
@@ -1156,7 +1171,7 @@ class StretchRosInterface(Node):
         self.episode_reset_pub.publish(Empty())
         for _ in range(10):
             self.send_cmd(0.0, 0.0)
-            rclpy.spin_once(self, timeout_sec=0.01)
+            self.spin(0.01)
 
         if not self._sim_reset_available:
             if self.reset_client.wait_for_service(timeout_sec=2.0):
@@ -1167,7 +1182,7 @@ class StretchRosInterface(Node):
             future = self.reset_client.call_async(req)
             start = time.time()
             while not future.done() and (time.time() - start) < timeout:
-                rclpy.spin_once(self, timeout_sec=0.1)
+                self.spin(0.1)
             if future.done():
                 result = future.result()
                 if result and result.success:
@@ -1185,7 +1200,7 @@ class StretchRosInterface(Node):
         old_scan = self.last_scan
         start = time.time()
         while time.time() - start < timeout:
-            rclpy.spin_once(self, timeout_sec=0.1)
+            self.spin(0.1)
             if (self.last_odom is not None and self.last_odom is not old_odom and
                 self.last_scan is not None and self.last_scan is not old_scan):
                 return True
@@ -1239,6 +1254,8 @@ class StretchExploreEnv(gym.Env):
         self._last_step_wall: Optional[float] = None
 
         # Reported to the terminal status panel via the reward breakdown
+        self.robot_index: Optional[int] = None  # grid arena robot number
+        self._pending = None
         self._goal_seen_this_episode = False
         self._last_reset_s: Optional[float] = None
         self.last_ckpt_wall: Optional[float] = None
@@ -1322,6 +1339,19 @@ class StretchExploreEnv(gym.Env):
         return obs, {"sim_reset": sim_was_reset}
 
     def step(self, action: np.ndarray):
+        self.send(action)
+        t_end = time.time() + self.control_dt
+        while time.time() < t_end:
+            self.ros.spin(0.01)
+        # Don't act on readings from before the command: wait (bounded) for new ones
+        t_fresh = time.time() + FRESH_DATA_TIMEOUT
+        while not self.has_fresh_data() and time.time() < t_fresh:
+            self.ros.spin(0.01)
+        return self.collect()
+
+    def send(self, action: np.ndarray):
+        """First half of step(): send the command. The grid arena calls send()
+        on every robot, waits once, then collect() on every robot."""
         a = np.clip(action, -1.0, 1.0)
 
         has_goal_for_velocity = self.ros.last_goal is not None
@@ -1331,17 +1361,16 @@ class StretchExploreEnv(gym.Env):
         self._smooth_w = CMD_SMOOTHING_ALPHA * rl_w + (1.0 - CMD_SMOOTHING_ALPHA) * self._smooth_w
 
         self.ros.send_cmd(self._smooth_v, self._smooth_w)
-        cmd_odom, cmd_scan = self.ros.last_odom, self.ros.last_scan
+        self._pending = (a, rl_v, rl_w, self.ros.last_odom, self.ros.last_scan)
 
-        t_end = time.time() + self.control_dt
-        while time.time() < t_end:
-            rclpy.spin_once(self.ros, timeout_sec=0.01)
-        # Don't act on readings from before the command: wait (bounded) for new ones
-        t_fresh = time.time() + FRESH_DATA_TIMEOUT
-        while ((self.ros.last_odom is cmd_odom or self.ros.last_scan is cmd_scan)
-               and time.time() < t_fresh):
-            rclpy.spin_once(self.ros, timeout_sec=0.01)
+    def has_fresh_data(self) -> bool:
+        """Odom and scan both arrived after the last send()."""
+        _, _, _, cmd_odom, cmd_scan = self._pending
+        return self.ros.last_odom is not cmd_odom and self.ros.last_scan is not cmd_scan
 
+    def collect(self):
+        """Second half of step(): observe, score and report the sent action."""
+        a, rl_v, rl_w, _, _ = self._pending
         now = time.time()
         dt = (now - self._last_step_wall) if self._last_step_wall is not None else self.control_dt
         self._last_step_wall = now
@@ -1682,6 +1711,7 @@ class StretchExploreEnv(gym.Env):
             },
             "explore_stats": stats,
             "episode": self.episode_index,
+            "robot": self.robot_index,
             "step": self.step_count,
             "training_phase": self._current_training_phase,
             "expert_avg_return": self._expert_avg_return,
@@ -1913,51 +1943,48 @@ EVAL_CSV_COLUMNS = ["episode", "goal_seen", "time_to_seen_s", "success", "steps"
                     "dist_when_seen", "path_len_after_seen", "spl", "bumps", "min_clearance"]
 
 
-def run_evaluation(env: "StretchExploreEnv", agent: "TD3AgentCNN", ros: StretchRosInterface,
-                   n_episodes: int, out_dir: str) -> Dict:
-    """Run n_episodes with no exploration noise and no learning (random spawn,
-    prompted target); write one CSV row per episode. SPL is measured from the
+class EvalEpisode:
+    """Per-episode evaluation numbers for one robot. SPL is measured from the
     moment SAM3 first reports the target: straight-line distance to the goal
     region then, over the path driven after that; 0 for failures."""
+
+    def __init__(self, env: "StretchExploreEnv"):
+        self.env = env
+        self.seen_at, self.dist_seen, self.last_xy = None, 0.0, None
+        self.path_after, self.time_s, self.bumps, self.steps = 0.0, 0.0, 0, 0
+        self.min_clear, self.success = LIDAR_MAX_RANGE, False
+
+    def on_step(self, info: Dict):
+        st = self.env._get_robot_state()
+        self.time_s += info["dt"]
+        self.steps += 1
+        if self.seen_at is None and self.env.ros.last_goal is not None:
+            self.seen_at, self.dist_seen = self.time_s, self.env._goal_distance()
+            self.last_xy = (st["x"], st["y"])
+        elif self.last_xy is not None:
+            self.path_after += math.hypot(st["x"] - self.last_xy[0], st["y"] - self.last_xy[1])
+            self.last_xy = (st["x"], st["y"])
+        self.bumps += int("collision" in info["reward_terms"])
+        self.min_clear = min(self.min_clear, info["min_distance"])
+        self.success = info["success"]
+
+    def row(self, episode: int) -> Dict:
+        shortest = max(self.dist_seen - GOAL_RADIUS, 0.0)
+        spl = (shortest / max(self.path_after, shortest)) if (self.success and shortest > 0) else 0.0
+        return {
+            "episode": episode, "goal_seen": int(self.seen_at is not None),
+            "time_to_seen_s": f"{self.seen_at:.2f}" if self.seen_at is not None else "",
+            "success": int(self.success), "steps": self.steps, "time_s": f"{self.time_s:.2f}",
+            "dist_when_seen": f"{self.dist_seen:.3f}", "path_len_after_seen": f"{self.path_after:.3f}",
+            "spl": f"{spl:.3f}", "bumps": self.bumps, "min_clearance": f"{self.min_clear:.3f}",
+        }
+
+
+def _write_eval(rows: List[Dict], columns: List[str], out_dir: str, logger) -> Dict:
     import csv
     out_path = os.path.join(out_dir, f"eval_{time.strftime('%Y%m%d_%H%M%S')}.csv")
-    rows = []
-    for ep in range(1, n_episodes + 1):
-        obs, _ = env.reset()
-        seen_at, dist_seen, last_xy = None, 0.0, None
-        path_after, time_s, bumps, min_clear, steps = 0.0, 0.0, 0, LIDAR_MAX_RANGE, 0
-        success, done = False, False
-        while not done:
-            obs, _, term, trunc, info = env.step(agent.act(obs, noise_std=0.0))
-            st = env._get_robot_state()
-            time_s += info["dt"]
-            steps += 1
-            if seen_at is None and env.ros.last_goal is not None:
-                seen_at, dist_seen = time_s, env._goal_distance()
-                last_xy = (st["x"], st["y"])
-            elif last_xy is not None:
-                path_after += math.hypot(st["x"] - last_xy[0], st["y"] - last_xy[1])
-                last_xy = (st["x"], st["y"])
-            bumps += int("collision" in info["reward_terms"])
-            min_clear = min(min_clear, info["min_distance"])
-            success = info["success"]
-            done = term or trunc
-        shortest = max(dist_seen - GOAL_RADIUS, 0.0)
-        spl = (shortest / max(path_after, shortest)) if (success and shortest > 0) else 0.0
-        rows.append({
-            "episode": ep, "goal_seen": int(seen_at is not None),
-            "time_to_seen_s": f"{seen_at:.2f}" if seen_at is not None else "",
-            "success": int(success), "steps": steps, "time_s": f"{time_s:.2f}",
-            "dist_when_seen": f"{dist_seen:.3f}", "path_len_after_seen": f"{path_after:.3f}",
-            "spl": f"{spl:.3f}", "bumps": bumps, "min_clearance": f"{min_clear:.3f}",
-        })
-        ros.get_logger().info(
-            f"[EVAL {ep}/{n_episodes}] {'SUCCESS' if success else 'timeout'} "
-            f"seen={'%.1fs' % seen_at if seen_at is not None else 'never'} spl={spl:.2f} bumps={bumps}"
-        )
-    ros.send_cmd(0.0, 0.0)
     with open(out_path, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=EVAL_CSV_COLUMNS)
+        writer = csv.DictWriter(f, fieldnames=columns)
         writer.writeheader()
         writer.writerows(rows)
     n = max(len(rows), 1)
@@ -1968,11 +1995,220 @@ def run_evaluation(env: "StretchExploreEnv", agent: "TD3AgentCNN", ros: StretchR
         "bumps_per_episode": sum(r["bumps"] for r in rows) / n,
         "csv": out_path,
     }
-    ros.get_logger().info(
+    logger.info(
         f"[EVAL] seen={summary['seen_rate']:.0%} success={summary['success_rate']:.0%} "
         f"SPL={summary['mean_spl']:.2f} bumps/ep={summary['bumps_per_episode']:.2f} -> {out_path}"
     )
     return summary
+
+
+def _log_eval_row(logger, row: Dict, done: int, total: int, robot: Optional[int] = None):
+    who = f" r{robot}" if robot is not None else ""
+    seen = f"{row['time_to_seen_s']}s" if row["goal_seen"] else "never"
+    logger.info(f"[EVAL {done}/{total}]{who} {'SUCCESS' if row['success'] else 'timeout'} "
+                f"seen={seen} spl={row['spl']} bumps={row['bumps']}")
+
+
+def run_evaluation(env: "StretchExploreEnv", agent: "TD3AgentCNN", ros: StretchRosInterface,
+                   n_episodes: int, out_dir: str) -> Dict:
+    """Run n_episodes with no exploration noise and no learning (random spawn,
+    prompted target); write one CSV row per episode."""
+    rows = []
+    for ep in range(1, n_episodes + 1):
+        obs, _ = env.reset()
+        tracker, done = EvalEpisode(env), False
+        while not done:
+            obs, _, term, trunc, info = env.step(agent.act(obs, noise_std=0.0))
+            tracker.on_step(info)
+            done = term or trunc
+        rows.append(tracker.row(ep))
+        _log_eval_row(ros.get_logger(), rows[-1], ep, n_episodes)
+    ros.send_cmd(0.0, 0.0)
+    return _write_eval(rows, EVAL_CSV_COLUMNS, out_dir, ros.get_logger())
+
+
+def _vector_step(envs: List["StretchExploreEnv"], actions: List[np.ndarray], spin) -> list:
+    """Send every robot its action, wait one control period (spinning all
+    robots' nodes), wait for fresh sensor data, then observe every robot."""
+    for env, action in zip(envs, actions):
+        env.send(action)
+    t_end = time.time() + envs[0].control_dt
+    while time.time() < t_end:
+        spin(0.01)
+    t_fresh = time.time() + FRESH_DATA_TIMEOUT
+    while not all(env.has_fresh_data() for env in envs) and time.time() < t_fresh:
+        spin(0.01)
+    return [env.collect() for env in envs]
+
+
+def run_evaluation_vector(envs: List["StretchExploreEnv"], agent: "TD3AgentCNN", spin,
+                          n_episodes: int, out_dir: str, logger) -> Dict:
+    """Grid arena evaluation: all robots run at once until n_episodes have
+    finished in total; CSV gets a `robot` column."""
+    obs = [env.reset()[0] for env in envs]
+    trackers = [EvalEpisode(env) for env in envs]
+    rows = []
+    while len(rows) < n_episodes:
+        results = _vector_step(envs, [agent.act(o, noise_std=0.0) for o in obs], spin)
+        for i, (next_obs, _, term, trunc, info) in enumerate(results):
+            trackers[i].on_step(info)
+            obs[i] = next_obs
+            if (term or trunc) and len(rows) < n_episodes:
+                rows.append({"robot": i, **trackers[i].row(len(rows) + 1)})
+                _log_eval_row(logger, rows[-1], len(rows), n_episodes, robot=i)
+                obs[i] = envs[i].reset()[0]
+                trackers[i] = EvalEpisode(envs[i])
+    for env in envs:
+        env.ros.send_cmd(0.0, 0.0)
+    return _write_eval(rows, ["robot"] + EVAL_CSV_COLUMNS, out_dir, logger)
+
+
+def run_vector(args) -> None:
+    """Grid arena training: N robots (namespaces r0..rN-1) in one simulator,
+    one TD3 agent, one replay buffer, one checkpoint."""
+    n = args.num_robots
+    set_seed(args.seed)
+    os.makedirs(args.ckpt_dir, exist_ok=True)
+    ckpt_path = os.path.join(args.ckpt_dir, CHECKPOINT_FILENAME)
+    load_path = args.load_ckpt or ckpt_path
+    replay_path = os.path.join(args.ckpt_dir, "replay_buffer.npz")
+    eval_mode = args.eval_episodes > 0
+
+    rclpy.init()
+    executor = SingleThreadedExecutor()
+
+    def spin(timeout_sec: float):
+        executor.spin_once(timeout_sec=timeout_sec)
+
+    rosses = []
+    for i in range(n):
+        ros = StretchRosInterface(
+            ns=f"r{i}", odom_topic=f"/r{i}/odom", scan_topic=f"/r{i}/scan", imu_topic=f"/r{i}/imu",
+            goal_topic="goal", cmd_topic=f"/r{i}/cmd_vel", node_name=f"learner_r{i}",
+            reset_service=f"/r{i}/reset", topic_prefix=f"/r{i}")
+        executor.add_node(ros)
+        ros.set_spin(spin)
+        rosses.append(ros)
+    envs = []
+    for i, ros in enumerate(rosses):
+        env = StretchExploreEnv(ros)
+        env.robot_index = i
+        envs.append(env)
+    log = rosses[0].get_logger()
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    obs_dim, act_dim = envs[0].observation_space.shape[0], 2
+    agent = TD3AgentCNN(obs_dim, act_dim, device=device)
+    replay = PrioritizedReplayBuffer(obs_dim, act_dim, size=args.replay_size, device=device)
+    log.info(f"[ARENA] {n} robots, one agent on {device}, replay {args.replay_size:,}, ckpt {args.ckpt_dir}")
+
+    t, weights_loaded = 0, False
+    if os.path.exists(load_path):
+        try:
+            state = agent.load(load_path, strict=False) or {}
+            weights_loaded = True
+            t = int(state.get("step", 0))
+            log.info(f"[CKPT] loaded {load_path} at step {t:,}")
+            if not eval_mode and replay.load(replay_path):
+                log.info(f"[CKPT] replay: {replay.count:,} transitions")
+        except Exception as e:
+            log.error(f"[CKPT] load failed: {e} — starting fresh")
+
+    def save_weights():
+        try:
+            agent.save(ckpt_path + ".tmp", extra_state={"step": t, "num_robots": n})
+            os.replace(ckpt_path + ".tmp", ckpt_path)
+            for env in envs:
+                env.last_ckpt_wall = time.time()
+        except Exception as e:
+            log.error(f"[CKPT] save failed: {e}")
+
+    def save_replay():
+        try:
+            tmp = replay_path.replace(".npz", "_tmp.npz")
+            replay.save(tmp)
+            os.replace(tmp, replay_path)
+        except Exception as e:
+            log.warn(f"[CKPT] replay save failed: {e}")
+
+    def stop(signum=None, frame=None, save=True):
+        for ros in rosses:
+            try: ros.send_cmd(0.0, 0.0)
+            except Exception: pass
+        if save and not eval_mode:
+            save_weights()
+            save_replay()
+        try:
+            executor.shutdown()
+            rclpy.shutdown()
+        except Exception:
+            pass
+        sys.exit(0)
+
+    signal.signal(signal.SIGINT, stop)
+    signal.signal(signal.SIGTERM, stop)
+
+    if eval_mode:
+        if not weights_loaded:
+            log.error(f"[EVAL] No trained weights at {load_path} — refusing to evaluate")
+            stop(save=False)
+        for env in envs:
+            env._current_training_phase = "EVAL"
+        run_evaluation_vector(envs, agent, spin, args.eval_episodes, args.ckpt_dir, log)
+        stop(save=False)
+
+    experts = [ExpertStateMachine() for _ in range(n)]
+    obs = [env.reset()[0] for env in envs]
+    carry, finished_since_replay_save, last_weights_save = 0, 0, time.time()
+    demo_steps, start_steps = args.demo_steps, args.start_steps
+    while t < args.total_steps:
+        phase = rl_core.phase_for_step(t + 1, demo_steps, start_steps)
+        actions = []
+        for i, env in enumerate(envs):
+            env._current_training_phase = phase
+            if phase == "EXPERT_DEMO":
+                has_goal = env.ros.last_goal is not None
+                actions.append(experts[i].act(env.last_nav_state,
+                                              env._goal_angle() if has_goal else 0.0,
+                                              env._goal_distance() if has_goal else 0.0, has_goal))
+            elif phase == "RANDOM_EXPLORE":
+                actions.append(np.array([np.random.uniform(-1.0, 1.0), np.random.uniform(-0.8, 0.8)],
+                                        dtype=np.float32))
+            else:
+                actions.append(agent.act(obs[i], noise_std=args.expl_noise))
+
+        results = _vector_step(envs, actions, spin)
+        if phase == "EXPERT_DEMO":
+            for i, (_, reward, _, _, info) in enumerate(results):
+                experts[i].track_reward(reward, success=info.get("success", False))
+        transitions, obs, finished = rl_core.vector_transitions(
+            obs, actions, results, lambda i: envs[i].reset()[0])
+        for o, a, r, o2, terminated in transitions:
+            if np.isfinite(r) and np.all(np.isfinite(o)) and np.all(np.isfinite(o2)):
+                replay.add(o, a, np.array([r], dtype=np.float32), o2,
+                           np.array([1.0 if terminated else 0.0], dtype=np.float32))
+        t += n
+
+        if finished:
+            if phase == "EXPERT_DEMO":
+                for i in finished:
+                    experts[i].reset_episode()
+            finished_since_replay_save += len(finished)
+            if time.time() - last_weights_save > 30.0:
+                save_weights()
+                last_weights_save = time.time()
+            if finished_since_replay_save >= REPLAY_SAVE_EVERY_EPISODES:
+                save_replay()
+                finished_since_replay_save = 0
+
+        if t >= min(args.update_after, demo_steps) and replay.count >= args.batch_size:
+            updates, carry = rl_core.vector_update_count(n, args.update_every, carry)
+            beta = PER_BETA_START + (PER_BETA_END - PER_BETA_START) * min(t / args.total_steps, 1.0)
+            for _ in range(updates):
+                agent.update(replay, args.batch_size, beta)
+
+    log.info(f"[ARENA] reached {args.total_steps:,} transitions")
+    stop()
 
 
 # =============================================================================
@@ -2009,7 +2245,12 @@ def main():
     parser.add_argument("--eval-episodes", type=int, default=0,
                         help="N > 0: evaluate the frozen policy for N episodes, write a CSV, exit")
 
+    parser.add_argument("--num-robots", type=int, default=0,
+                        help="N > 0: grid arena, N robots (r0..rN-1) in one simulator, one agent")
+
     args = parser.parse_args()
+    if args.num_robots > 0:
+        return run_vector(args)
     set_seed(args.seed)
 
     os.makedirs(args.ckpt_dir, exist_ok=True)
