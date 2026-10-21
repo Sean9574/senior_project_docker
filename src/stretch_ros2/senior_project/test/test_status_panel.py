@@ -116,3 +116,38 @@ def test_learner_that_never_reports_gets_a_hint():
     assert "crashed" not in _text(s, 30.0)
     out = _text(s, 120.0)
     assert "2m00s" in out and "crashed" in out
+
+
+# ---------------------------------------------------------------- grid arena
+
+def test_arena_progress_sums_every_robot():
+    s = _state()
+    s.on_breakdown(_bd(robot=0, global_step=100), 1.0)
+    s.on_breakdown(_bd(robot=1, global_step=200), 1.0)
+    assert "300 / 200,000" in _text(s, 1.0)
+
+
+def test_arena_shows_one_row_per_robot():
+    s = _state()
+    s.on_breakdown(_bd(robot=0, episode=4, mode="explore"), 1.0)
+    s.on_breakdown(_bd(robot=1, episode=7, mode="goal", state={"goal_dist": 2.5}), 1.0)
+    out = _text(s, 1.0)
+    assert " r0 " in out and " r1 " in out
+    assert "#4" in out and "#7" in out
+    assert "SEARCHING" in out and "GOAL-SEEK" in out
+
+
+def test_arena_pools_finished_episodes_across_robots():
+    s = _state()
+    s.on_breakdown(_bd(robot=0, done=True, success=True, goal_seen=True), 1.0)
+    s.on_breakdown(_bd(robot=1, done=True, success=False, goal_seen=True), 1.0)
+    assert "success 50%" in _text(s, 2.0)
+
+
+def test_arena_sam3_confirmation_per_robot():
+    s = _state()
+    s.on_generator_status({"target": "chair", "prompt_confirmed": True}, 1.0, robot=0)
+    s.on_generator_status({"target": "chair", "prompt_confirmed": False}, 1.0, robot=1)
+    assert "SAM3 NOT CONFIRMED: r1" in _text(s, 1.0)
+    s.on_generator_status({"target": "chair", "prompt_confirmed": True}, 2.0, robot=1)
+    assert 'SAM3 ok 2/2 "chair"' in _text(s, 2.0)

@@ -67,11 +67,25 @@ class PanelState:
         self.sam3_confirmed: Optional[bool] = None
         self.sam3_target = ""
 
+        # Grid arena: latest numbers per robot (key None = single-robot run)
+        self.robots: dict = {}
+        self.robot_sam3: dict = {}
+
         # [time, level, node, msg, count], newest last
         self.alerts: List[list] = []
 
     # ------------------------------------------------------------ updates
     def on_breakdown(self, d: dict, now: float) -> None:
+        robot = d.get("robot")
+        row = self.robots.setdefault(robot, {"global_step": 0, "marks": deque(maxlen=8)})
+        row.update(episode=int(d.get("episode", 0)), mode=d.get("mode", ""),
+                   goal_dist=float((d.get("state") or {}).get("goal_dist", 0.0)),
+                   global_step=int(d.get("global_step", row["global_step"])))
+        if d.get("done"):
+            row["marks"].append("+" if d.get("success") else "-")
+        if robot is not None:
+            self._on_arena_breakdown(d, now)
+            return
         episode = int(d.get("episode", 0))
         if episode != self.episode:
             self.episode_started_t = now
@@ -99,7 +113,36 @@ class PanelState:
             self.returns.append(ret)
             self.best_return = ret if self.best_return is None else max(self.best_return, ret)
 
-    def on_generator_status(self, d: dict, now: float) -> None:
+    def _on_arena_breakdown(self, d: dict, now: float) -> None:
+        """Aggregate numbers over all robots of the grid arena."""
+        self.last_breakdown_t = now
+        self.phase = d.get("training_phase", self.phase)
+        self.min_distance = float(d.get("min_distance", 0.0))
+        self.dt = float(d.get("dt", 0.0))
+        if d.get("last_reset_s") is not None:
+            self.last_reset_s = float(d["last_reset_s"])
+        if d.get("last_ckpt_wall") is not None:
+            self.last_ckpt_wall = float(d["last_ckpt_wall"])
+        self.global_step = sum(r["global_step"] for r in self.robots.values())
+        self._rate.append((now, self.global_step))
+        while len(self._rate) > 2 and now - self._rate[0][0] > RATE_WINDOW_S:
+            self._rate.popleft()
+        if d.get("done"):
+            self.outcomes.append((bool(d.get("success")), bool(d.get("goal_seen"))))
+            ret = float(d.get("episode_return", 0.0))
+            self.returns.append(ret)
+            self.best_return = ret if self.best_return is None else max(self.best_return, ret)
+
+    @property
+    def is_arena(self) -> bool:
+        return any(k is not None for k in self.robots)
+
+    def on_generator_status(self, d: dict, now: float, robot: Optional[int] = None) -> None:
+        if robot is not None:
+            if "prompt_confirmed" in d:
+                self.robot_sam3[robot] = bool(d["prompt_confirmed"])
+            self.sam3_target = d.get("target", self.sam3_target) or self.sam3_target
+            return
         if "prompt_confirmed" in d:
             self.sam3_confirmed = bool(d["prompt_confirmed"])
         self.sam3_target = d.get("target", self.sam3_target) or self.sam3_target
@@ -149,6 +192,11 @@ def _eta(state: PanelState) -> str:
 
 def _sam3(state: PanelState) -> str:
     target = state.sam3_target or state.target
+    if state.robot_sam3:
+        bad = sorted(r for r, ok in state.robot_sam3.items() if not ok)
+        if bad:
+            return "SAM3 NOT CONFIRMED: " + ", ".join(f"r{r}" for r in bad)
+        return f'SAM3 ok {len(state.robot_sam3)}/{len(state.robots) or len(state.robot_sam3)} "{target}"'
     if state.sam3_confirmed is None:
         return f'SAM3 waiting for "{target}"'
     if not state.sam3_confirmed:
@@ -170,11 +218,20 @@ def render(state: PanelState, now: float, width: int = 80) -> List[str]:
     else:
         lines.append(f" Phase    {state.phase or '?':<11} {_progress(state)}")
         lines.append(f"          {_eta(state)}")
-        seeking = state.mode == "goal"
-        ep_time = (now - state.episode_started_t) if state.episode_started_t is not None else 0.0
-        where = f"goal {state.goal_dist:.1f}m" if seeking else "object not seen yet"
-        lines.append(f" Episode  #{state.episode}  {'GOAL-SEEK' if seeking else 'SEARCHING'}  "
-                     f"{ep_time:.1f}s  {where}  clr {state.min_distance:.2f}m")
+        if state.is_arena:
+            for robot in sorted(k for k in state.robots if k is not None):
+                row = state.robots[robot]
+                seeking = row.get("mode") == "goal"
+                where = f"goal {row['goal_dist']:.1f}m" if seeking else ""
+                lines.append(f" r{robot:<3}    #{row.get('episode', 0):<5} "
+                             f"{'GOAL-SEEK' if seeking else 'SEARCHING':<9}  "
+                             f"{''.join(row['marks']):<8}  {where}")
+        else:
+            seeking = state.mode == "goal"
+            ep_time = (now - state.episode_started_t) if state.episode_started_t is not None else 0.0
+            where = f"goal {state.goal_dist:.1f}m" if seeking else "object not seen yet"
+            lines.append(f" Episode  #{state.episode}  {'GOAL-SEEK' if seeking else 'SEARCHING'}  "
+                         f"{ep_time:.1f}s  {where}  clr {state.min_distance:.2f}m")
 
     if state.outcomes:
         marks = "".join("+" if ok else "-" for ok, _ in state.outcomes)

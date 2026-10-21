@@ -37,12 +37,18 @@ SHOW_CURSOR = "\x1b[?25h"
 
 
 class StatusPanelNode(Node):
-    def __init__(self, state: PanelState, interactive: bool):
+    def __init__(self, state: PanelState, interactive: bool, num_robots: int = 0):
         super().__init__("status_panel")
         self.state = state
         self.interactive = interactive
-        self.create_subscription(String, "/reward_breakdown", self._on_breakdown, 10)
-        self.create_subscription(String, "/sam3_goal_generator/status", self._on_generator_status, 10)
+        if num_robots > 0:  # grid arena: one learner interface + goal generator per robot
+            for i in range(num_robots):
+                self.create_subscription(String, f"/r{i}/reward_breakdown", self._on_breakdown, 10)
+                self.create_subscription(String, f"/r{i}/sam3_goal_generator/status",
+                                         lambda msg, i=i: self._on_generator_status(msg, robot=i), 10)
+        else:
+            self.create_subscription(String, "/reward_breakdown", self._on_breakdown, 10)
+            self.create_subscription(String, "/sam3_goal_generator/status", self._on_generator_status, 10)
         self.create_subscription(Log, "/rosout", self._on_log, 50)
         self.create_timer(0.5 if interactive else 30.0, self._draw)
 
@@ -52,9 +58,9 @@ class StatusPanelNode(Node):
         except (ValueError, TypeError):
             pass
 
-    def _on_generator_status(self, msg: String):
+    def _on_generator_status(self, msg: String, robot=None):
         try:
-            self.state.on_generator_status(json.loads(msg.data), time.time())
+            self.state.on_generator_status(json.loads(msg.data), time.time(), robot=robot)
         except (ValueError, TypeError):
             pass
 
@@ -76,6 +82,7 @@ def main():
     parser = argparse.ArgumentParser(description="Live training status in the terminal")
     parser.add_argument("--total-steps", type=int, default=0)
     parser.add_argument("--target", type=str, default="")
+    parser.add_argument("--num-robots", type=int, default=0, help="grid arena robot count (0 = single robot)")
     parser.add_argument("--plain", action="store_true",
                         help="one summary line every 30 s instead of a redrawn panel")
     args, _ = parser.parse_known_args()
@@ -87,7 +94,7 @@ def main():
     interactive = not args.plain
 
     rclpy.init()
-    node = StatusPanelNode(state, interactive)
+    node = StatusPanelNode(state, interactive, num_robots=args.num_robots)
     if interactive:
         sys.stdout.write(HIDE_CURSOR)
     try:
