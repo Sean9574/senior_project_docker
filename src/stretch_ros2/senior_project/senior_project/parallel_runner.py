@@ -7,21 +7,20 @@ Spawns multiple simulations in parallel, each with its own:
   - Checkpoint directory (<ckpt_dir>/sim_N)
 and runs federated_sync.py to share weights between them.
 
-Goal sources:
-  - random (default): line-of-sight goals + curriculum, launched via RL.launch.py
-  - topic: SAM3 camera goals via sam3_navigation.launch.py. SAM3 servers are
-    NOT started by this runner: start one on 8100 (shared, default) or one per
-    sim on 8100+N (dedicated) first.
+Every sim chases the same prompted target (asked once if --target is not
+given) via sam3_navigation.launch.py, spawning at random poses. SAM3 servers
+are NOT started by this runner: start one on 8100 (shared, default) or one per
+sim on 8100+N (dedicated) first.
 
 Usage:
-    # 4 parallel sims learning random goals
+    # 4 parallel sims; asks what to go to
     python parallel_runner.py --num_sims 4
 
-    # 4 parallel sims chasing a SAM3 target through one shared server
-    python parallel_runner.py --num_sims 4 --goal_source topic --target "cup"
+    # 4 parallel sims chasing a chair
+    python parallel_runner.py --num_sims 4 --target "chair"
 
     # Run and merge on completion
-    python parallel_runner.py --num_sims 4 --merge_on_exit
+    python parallel_runner.py --num_sims 4 --target "chair" --merge_on_exit
 """
 
 import argparse
@@ -56,16 +55,12 @@ class ParallelRunner:
         sam3_mode: str = "shared",
         sam3_base_port: int = 8100,
         sync_every: int = 300,
-        goal_source: str = "random",
     ):
         self.num_sims = num_sims
         self.target = target
         self.total_steps = total_steps
         self.base_ckpt_dir = os.path.expanduser(base_ckpt_dir)
-        self.goal_source = goal_source
-        # random goals need no camera pipeline: train straight through RL.launch
-        self.launch_file = launch_file or (
-            "RL.launch.py" if goal_source == "random" else "sam3_navigation.launch.py")
+        self.launch_file = launch_file or "sam3_navigation.launch.py"
         self.package = package
         self.extra_args = extra_args or {}
         self.merge_on_exit = merge_on_exit
@@ -116,16 +111,10 @@ class ParallelRunner:
         common = [
             f"total_steps:={self.total_steps}",
             f"ckpt_dir:={ckpt_dir}",
-            f"goal_source:={self.goal_source}",
             "use_rviz:=false",
             # One dashboard (sim 0) scans every sim's domain
             f"use_reward_monitor:={'true' if sim_id == 0 else 'false'}",
         ]
-
-        if self.goal_source == "random":
-            cmd = ["ros2", "launch", self.package, self.launch_file, *common,
-                   "use_cameras:=false"]
-            return self._with_extra_args(cmd)
 
         # Determine SAM3 port based on mode
         if self.sam3_mode == "dedicated":
@@ -220,18 +209,16 @@ class ParallelRunner:
         print(f"\n{'='*60}")
         print(f"  Parallel TD3 Training - {self.num_sims} Simulations")
         print(f"{'='*60}")
-        print(f"  Goal Source: {self.goal_source} ({self.launch_file})")
+        print(f"  Target: {self.target}")
         print(f"  Total Steps: {self.total_steps}")
         print(f"  Headless: {self.headless}")
         print(f"  Checkpoint Dir: {self.base_ckpt_dir}")
         print(f"  Merge on Exit: {self.merge_on_exit}")
-        if self.goal_source == "topic":
-            print(f"  Target: {self.target}")
-            if self.sam3_mode == "dedicated":
-                print(f"  SAM3 Server Mode: DEDICATED (ports {self.sam3_base_port}-"
-                      f"{self.sam3_base_port + self.num_sims - 1}; start one server per port yourself)")
-            else:
-                print(f"  SAM3 Server Mode: SHARED (port {self.sam3_base_port}; start it yourself)")
+        if self.sam3_mode == "dedicated":
+            print(f"  SAM3 Server Mode: DEDICATED (ports {self.sam3_base_port}-"
+                  f"{self.sam3_base_port + self.num_sims - 1}; start one server per port yourself)")
+        else:
+            print(f"  SAM3 Server Mode: SHARED (port {self.sam3_base_port}; start it yourself)")
         print(f"  Sim Domains: {self.sim_base_domain} - {self.sim_base_domain + self.num_sims - 1}")
         if self.sync_every > 0 and self.num_sims > 1:
             print(f"  Federated Sync: every {self.sync_every}s")
@@ -396,7 +383,7 @@ class ParallelRunner:
         print(f"  Total Time: {elapsed/60:.1f} minutes")
         print(f"  Simulations: {self.num_sims}")
         print(f"  Headless: {self.headless}")
-        print(f"  Goal Source: {self.goal_source}")
+        print(f"  Target: {self.target}")
         print(f"  Sim Domains: {self.sim_base_domain} - {self.sim_base_domain + self.num_sims - 1}")
         print(f"  Checkpoints: {self.base_ckpt_dir}/sim_*/")
         if self.merge_on_exit:
@@ -406,7 +393,7 @@ class ParallelRunner:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Run parallel TD3 navigation training (random goals by default)",
+        description="Run parallel TD3 navigation training toward a prompted target",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
 
@@ -421,11 +408,6 @@ def main():
     parser.add_argument(
         "--total_steps", type=int, default=200000,
         help="Total training steps per simulation (default: 200000)"
-    )
-    parser.add_argument(
-        "--goal_source", type=str, default="random", choices=["random", "topic"],
-        help="random: line-of-sight goals + curriculum via RL.launch.py (default); "
-             "topic: SAM3 camera goals via sam3_navigation.launch.py"
     )
     parser.add_argument(
         "--ckpt_dir", type=str,
@@ -446,8 +428,7 @@ def main():
     )
     parser.add_argument(
         "--launch_file", type=str, default=None,
-        help="Launch file per simulation (default: RL.launch.py for random goals, "
-             "sam3_navigation.launch.py for topic goals)"
+        help="Launch file per simulation (default: sam3_navigation.launch.py)"
     )
     parser.add_argument(
         "--package", type=str, default="senior_project",
@@ -510,7 +491,6 @@ def main():
         sam3_mode=args.sam3_mode,
         sam3_base_port=args.sam3_base_port,
         sync_every=args.sync_every,
-        goal_source=args.goal_source,
     )
 
     runner.start_all()

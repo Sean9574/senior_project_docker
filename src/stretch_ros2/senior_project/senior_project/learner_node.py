@@ -5,10 +5,10 @@ Stretch Robot RL Environment + Learner — v6 (LEARNABLE GOAL-REACHING)
 Collisions still never terminate (v5 insight: terminating on collision teaches
 the agent that not moving is safest). v6 makes the task learnable:
 
-- GOALS: by default every episode gets a random goal the lidar can see
-  (rl_core.sample_goal), 1 m to curriculum.d_max away. d_max grows 1.5 m -> 4 m
-  as the success rate rises (rl_core.GoalCurriculum). --goal-source topic keeps
-  the SAM3 / RViz goal topic instead.
+- GOALS come from the user's prompt: sam3_navigation.launch.py asks what to go
+  to, SAM3 finds it in the camera image and publishes <ns>/goal. Until the
+  object is seen the robot explores; once seen it drives to it. The driver
+  spawns the robot at a random free pose every episode, so it must search.
 - REWARDS are O(1) so TD targets stay small:
     goal:     +10 on arrival, +1 per metre of progress (signed, potential-based),
               -0.01 per step
@@ -1001,7 +1001,6 @@ class StretchRosInterface(Node):
         self._target_was_lost: bool = False
         self._lost_time: float = 0.0
         self.last_imu: Optional[Imu] = None
-        self.accept_topic_goals: bool = True
         self.self_mask: Optional[np.ndarray] = None
         self._last_raw_ranges: Optional[np.ndarray] = None
 
@@ -1128,8 +1127,6 @@ class StretchRosInterface(Node):
         self._goal_cb(goal)
 
     def _goal_cb(self, msg):
-        if not self.accept_topic_goals:
-            return
         if self._target_was_lost and self.last_goal is None:
             self._target_was_lost = False
         self.last_goal = msg
@@ -1201,16 +1198,10 @@ class StretchExploreEnv(gym.Env):
     Simplified observation, simplified rewards, cached expensive computations.
     """
 
-    def __init__(self, ros: StretchRosInterface, control_dt: float = 0.1,
-                 goal_source: str = "random", rng: Optional[np.random.Generator] = None,
-                 curriculum: Optional[rl_core.GoalCurriculum] = None):
+    def __init__(self, ros: StretchRosInterface, control_dt: float = 0.1):
         super().__init__()
         self.ros = ros
         self.control_dt = control_dt
-        self.goal_source = goal_source
-        self.rng = rng if rng is not None else np.random.default_rng()
-        self.curriculum = curriculum if curriculum is not None else rl_core.GoalCurriculum()
-        self.ros.accept_topic_goals = (goal_source == "topic")
         self._self_mask_calibrated = False
 
         self.navigator = DynamicNavigator(num_sectors=36)
@@ -1305,8 +1296,6 @@ class StretchExploreEnv(gym.Env):
         self.ros._last_known_target_time = 0.0
         self.ros.path_history.clear()
 
-        if self.goal_source == "random":
-            self._spawn_random_goal()
         self._goal_tracked = self.ros.last_goal is not None
         self._last_goal_xy = self._current_goal_xy()
         self.prev_goal_dist = self._goal_distance()
@@ -1453,10 +1442,6 @@ class StretchExploreEnv(gym.Env):
         done = terminated or truncated
         outcome = ("success" if success else "timeout") if done else ""
 
-        if (done and self.goal_source == "random"
-                and rl_core.counts_for_curriculum(self._current_training_phase)):
-            self.curriculum.record(success)
-
         info = {
             "done": done,
             "outcome": outcome,
@@ -1486,7 +1471,6 @@ class StretchExploreEnv(gym.Env):
                 f"Return {ret_color}{self.episode_return:+.1f}\033[0m | Steps {self.step_count} | "
                 f"Cells {stats['total_discovered']} | Goals {self._goals_reached_this_episode} | "
                 f"MinDist {min_dist:.2f}m"
-                + (f" | GoalMax {self.curriculum.d_max:.1f}m" if self.goal_source == "random" else "")
             )
         elif collision and self._collision_cooldown == COLLISION_COOLDOWN_STEPS:
             self.ros.get_logger().info(
@@ -1660,34 +1644,6 @@ class StretchExploreEnv(gym.Env):
         return math.hypot(goal_xy[0] - self._last_goal_xy[0],
                           goal_xy[1] - self._last_goal_xy[1]) > GOAL_MOVED_RESET_M
 
-    def _spawn_random_goal(self):
-        """Random goal the lidar can see, curriculum-limited distance (odom frame)."""
-        scan = self.ros.last_scan
-        st = self._get_robot_state()
-        if scan is not None and len(scan.ranges) > 0:
-            ranges = np.asarray(scan.ranges, dtype=np.float32)
-            angle_min, angle_inc = scan.angle_min, scan.angle_increment
-        else:
-            ranges = np.full(360, LIDAR_MAX_RANGE, dtype=np.float32)
-            angle_min, angle_inc = 0.0, 2 * math.pi / 360
-        gx, gy, dist = rl_core.sample_goal(
-            self.rng, ranges, angle_min, angle_inc, LIDAR_FORWARD_OFFSET_RAD,
-            st["x"], st["y"], st["yaw"],
-            d_min=self.curriculum.d_min, d_max=self.curriculum.d_max,
-        )
-        goal = PointStamped()
-        goal.header.stamp = self.ros.get_clock().now().to_msg()
-        goal.header.frame_id = "odom"
-        goal.point.x = float(gx)
-        goal.point.y = float(gy)
-        self.ros.last_goal = goal
-        self.ros._last_goal_time = time.time()
-        self.ros._last_known_target_pos = (float(gx), float(gy))
-        self.ros._last_known_target_time = time.time()
-        self.ros.get_logger().info(
-            f"[GOAL] ({gx:+.2f}, {gy:+.2f}) dist={dist:.2f}m (curriculum max {self.curriculum.d_max:.1f}m)"
-        )
-
     def _publish_reward_breakdown(self, reward: float, info: Dict, has_goal: bool):
         self.ros.reward_pub.publish(Float32(data=float(reward)))
         st = self._get_robot_state()
@@ -1700,7 +1656,6 @@ class StretchExploreEnv(gym.Env):
             "done": info.get("done", False),
             "outcome": info.get("outcome", ""),
             "dt": info.get("dt", self.control_dt),
-            "curriculum_d_max": self.curriculum.d_max,
             "collision": info.get("collision", False),
             "success": info.get("success", False),
             "goals_reached": self._goals_reached_this_episode,
@@ -1935,46 +1890,51 @@ class TD3AgentCNN:
 # Evaluation (frozen policy, fixed goal set)
 # =============================================================================
 
-EVAL_CSV_COLUMNS = ["episode", "success", "steps", "time_s", "start_goal_dist",
-                    "path_len", "spl", "bumps", "min_clearance"]
+EVAL_CSV_COLUMNS = ["episode", "goal_seen", "time_to_seen_s", "success", "steps", "time_s",
+                    "dist_when_seen", "path_len_after_seen", "spl", "bumps", "min_clearance"]
 
 
 def run_evaluation(env: "StretchExploreEnv", agent: "TD3AgentCNN", ros: StretchRosInterface,
                    n_episodes: int, out_dir: str) -> Dict:
-    """Run n_episodes with no exploration noise and no learning; write one CSV
-    row per episode. SPL uses the straight-line distance to the goal region
-    (goals are line-of-sight), so it measures path efficiency of successes."""
+    """Run n_episodes with no exploration noise and no learning (random spawn,
+    prompted target); write one CSV row per episode. SPL is measured from the
+    moment SAM3 first reports the target: straight-line distance to the goal
+    region then, over the path driven after that; 0 for failures."""
     import csv
     out_path = os.path.join(out_dir, f"eval_{time.strftime('%Y%m%d_%H%M%S')}.csv")
     rows = []
     for ep in range(1, n_episodes + 1):
         obs, _ = env.reset()
-        st = env._get_robot_state()
-        start_d = env._goal_distance()
-        last_xy = (st["x"], st["y"])
-        path_len, time_s, bumps, min_clear, steps = 0.0, 0.0, 0, LIDAR_MAX_RANGE, 0
+        seen_at, dist_seen, last_xy = None, 0.0, None
+        path_after, time_s, bumps, min_clear, steps = 0.0, 0.0, 0, LIDAR_MAX_RANGE, 0
         success, done = False, False
         while not done:
             obs, _, term, trunc, info = env.step(agent.act(obs, noise_std=0.0))
             st = env._get_robot_state()
-            path_len += math.hypot(st["x"] - last_xy[0], st["y"] - last_xy[1])
-            last_xy = (st["x"], st["y"])
             time_s += info["dt"]
+            steps += 1
+            if seen_at is None and env.ros.last_goal is not None:
+                seen_at, dist_seen = time_s, env._goal_distance()
+                last_xy = (st["x"], st["y"])
+            elif last_xy is not None:
+                path_after += math.hypot(st["x"] - last_xy[0], st["y"] - last_xy[1])
+                last_xy = (st["x"], st["y"])
             bumps += int("collision" in info["reward_terms"])
             min_clear = min(min_clear, info["min_distance"])
-            steps += 1
             success = info["success"]
             done = term or trunc
-        shortest = max(start_d - GOAL_RADIUS, 0.0)
-        spl = (shortest / max(path_len, shortest)) if (success and shortest > 0) else 0.0
+        shortest = max(dist_seen - GOAL_RADIUS, 0.0)
+        spl = (shortest / max(path_after, shortest)) if (success and shortest > 0) else 0.0
         rows.append({
-            "episode": ep, "success": int(success), "steps": steps, "time_s": f"{time_s:.2f}",
-            "start_goal_dist": f"{start_d:.3f}", "path_len": f"{path_len:.3f}", "spl": f"{spl:.3f}",
-            "bumps": bumps, "min_clearance": f"{min_clear:.3f}",
+            "episode": ep, "goal_seen": int(seen_at is not None),
+            "time_to_seen_s": f"{seen_at:.2f}" if seen_at is not None else "",
+            "success": int(success), "steps": steps, "time_s": f"{time_s:.2f}",
+            "dist_when_seen": f"{dist_seen:.3f}", "path_len_after_seen": f"{path_after:.3f}",
+            "spl": f"{spl:.3f}", "bumps": bumps, "min_clearance": f"{min_clear:.3f}",
         })
         ros.get_logger().info(
             f"[EVAL {ep}/{n_episodes}] {'SUCCESS' if success else 'timeout'} "
-            f"d0={start_d:.2f}m path={path_len:.2f}m spl={spl:.2f} bumps={bumps}"
+            f"seen={'%.1fs' % seen_at if seen_at is not None else 'never'} spl={spl:.2f} bumps={bumps}"
         )
     ros.send_cmd(0.0, 0.0)
     with open(out_path, "w", newline="") as f:
@@ -1983,14 +1943,15 @@ def run_evaluation(env: "StretchExploreEnv", agent: "TD3AgentCNN", ros: StretchR
         writer.writerows(rows)
     n = max(len(rows), 1)
     summary = {
+        "seen_rate": sum(r["goal_seen"] for r in rows) / n,
         "success_rate": sum(r["success"] for r in rows) / n,
         "mean_spl": sum(float(r["spl"]) for r in rows) / n,
         "bumps_per_episode": sum(r["bumps"] for r in rows) / n,
         "csv": out_path,
     }
     ros.get_logger().info(
-        f"[EVAL] success={summary['success_rate']:.0%} SPL={summary['mean_spl']:.2f} "
-        f"bumps/ep={summary['bumps_per_episode']:.2f} -> {out_path}"
+        f"[EVAL] seen={summary['seen_rate']:.0%} success={summary['success_rate']:.0%} "
+        f"SPL={summary['mean_spl']:.2f} bumps/ep={summary['bumps_per_episode']:.2f} -> {out_path}"
     )
     return summary
 
@@ -2023,15 +1984,11 @@ def main():
     parser.add_argument("--load-ckpt", type=str, default="",
                         help="Checkpoint to load instead of <ckpt-dir>/" + CHECKPOINT_FILENAME)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--goal-source", choices=["random", "topic"], default="random",
-                        help="random: LOS goals + curriculum (training); topic: SAM3/RViz goal topic")
 
     parser.add_argument("--inference", action="store_true")
 
     parser.add_argument("--eval-episodes", type=int, default=0,
                         help="N > 0: evaluate the frozen policy for N episodes, write a CSV, exit")
-    parser.add_argument("--eval-seed", type=int, default=1234)
-    parser.add_argument("--eval-max-dist", type=float, default=4.0)
 
     args = parser.parse_args()
     set_seed(args.seed)
@@ -2056,15 +2013,10 @@ def main():
     act_dim = 2
 
     eval_mode = args.eval_episodes > 0
-    curriculum = rl_core.GoalCurriculum()
-    if eval_mode:
-        # Fixed goal set: same seed + same distance range for every checkpoint
-        curriculum = rl_core.GoalCurriculum(d_start=args.eval_max_dist, d_cap=args.eval_max_dist)
-    goal_rng = np.random.default_rng(args.eval_seed if eval_mode else args.seed)
-    env = StretchExploreEnv(ros, goal_source=args.goal_source, rng=goal_rng, curriculum=curriculum)
+    env = StretchExploreEnv(ros)
 
     ros.get_logger().info(f"[AGENT] device={device} obs_dim={obs_dim} act_dim={act_dim}")
-    ros.get_logger().info(f"[AGENT] v6: goal_source={args.goal_source}, explore_velocity={V_MIN_FORWARD}-{V_MAX}, goal_velocity=0-{V_MAX}, w_max={W_MAX}")
+    ros.get_logger().info(f"[AGENT] v6: prompt goals via {args.goal_topic}, explore_velocity={V_MIN_FORWARD}-{V_MAX}, goal_velocity=0-{V_MAX}, w_max={W_MAX}")
     ros.get_logger().info(f"[AGENT] Expert demo phase: {args.demo_steps} steps, then RL takes over")
     ros.get_logger().info(f"[AGENT] Collisions never terminate (bump={R_COLLISION}, cooldown={COLLISION_COOLDOWN_STEPS})")
     ros.get_logger().info(f"[AGENT] Explore: discovery({R_NEW_CELL}) + revisit({R_REVISIT}) + step({R_STEP_EXPLORE})")
@@ -2095,8 +2047,6 @@ def main():
                     env.obs_rms.mean = training_state["obs_rms_mean"]
                     env.obs_rms.var = training_state["obs_rms_var"]
                     env.obs_rms.count = training_state["obs_rms_count"]
-                if "curriculum" in training_state and not eval_mode:
-                    env.curriculum.load(training_state["curriculum"])
                 ros.get_logger().info(
                     f"[CKPT] {G}✓ Restored:{RST} step={resume_step}, "
                     f"episode={env.episode_index}"
@@ -2131,7 +2081,6 @@ def main():
             "obs_rms_mean": env.obs_rms.mean,
             "obs_rms_var": env.obs_rms.var,
             "obs_rms_count": env.obs_rms.count,
-            "curriculum": env.curriculum.state(),
         }
         try:
             agent.save(ckpt_path + ".tmp", extra_state=training_state)
@@ -2191,7 +2140,7 @@ def main():
         signal.signal(signal.SIGINT, shutdown_without_saving)
         signal.signal(signal.SIGTERM, shutdown_without_saving)
         env._current_training_phase = "EVAL"
-        ros.get_logger().info(f"[MODE] EVAL: {args.eval_episodes} episodes, goals <= {args.eval_max_dist} m, seed {args.eval_seed}")
+        ros.get_logger().info(f"[MODE] EVAL: {args.eval_episodes} episodes, prompted target, random spawns")
         run_evaluation(env, agent, ros, args.eval_episodes, args.ckpt_dir)
         shutdown_without_saving()
 

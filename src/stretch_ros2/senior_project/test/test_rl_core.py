@@ -3,7 +3,6 @@
 Run: python3 -m pytest src/stretch_ros2/senior_project/test/test_rl_core.py
 """
 
-import math
 import os
 import sys
 
@@ -83,132 +82,6 @@ def test_progress_reward_signed_and_finite():
     assert rl_core.goal_progress_reward(1.0, float("nan"), 1.0) == 0.0
 
 
-# ---------------------------------------------------------------- goal sampling
-
-def _scan(n=360, value=20.0):
-    return np.full(n, value, dtype=np.float32)
-
-
-def _gap_scan(center_deg, half_width_deg, wall=1.2, n=360):
-    """Wall at `wall` metres on every beam except a gap around center_deg (raw beam angle)."""
-    ranges = np.full(n, wall, dtype=np.float32)
-    for i in range(n):
-        diff = (i - center_deg + 180) % 360 - 180
-        if abs(diff) <= half_width_deg:
-            ranges[i] = 20.0
-    return ranges
-
-
-INC = 2 * math.pi / 360
-
-
-def test_goal_never_inside_radius():
-    rng = np.random.default_rng(0)
-    for _ in range(1000):
-        gx, gy, dist = rl_core.sample_goal(
-            rng, _scan(), 0.0, INC, 0.0, 0.0, 0.0, 0.0, d_min=1.0, d_max=1.5)
-        assert 1.0 <= dist <= 1.5
-        assert math.hypot(gx, gy) == pytest.approx(dist, abs=1e-6)
-        assert math.hypot(gx, gy) > 0.45
-
-
-def test_goal_respects_line_of_sight():
-    rng = np.random.default_rng(1)
-    ranges = _gap_scan(center_deg=0, half_width_deg=20)
-    for _ in range(200):
-        gx, gy, dist = rl_core.sample_goal(
-            rng, ranges, 0.0, INC, 0.0, 0.0, 0.0, 0.0, d_min=1.0, d_max=3.0)
-        bearing = math.degrees(math.atan2(gy, gx))
-        assert abs(bearing) <= 20.0
-
-
-def test_goal_in_odom_frame_uses_robot_pose():
-    # Gap straight ahead in the robot frame; robot at (2, 3) facing +y.
-    rng = np.random.default_rng(2)
-    ranges = _gap_scan(center_deg=0, half_width_deg=20)
-    for _ in range(100):
-        gx, gy, dist = rl_core.sample_goal(
-            rng, ranges, 0.0, INC, 0.0, 2.0, 3.0, math.pi / 2, d_min=1.0, d_max=3.0)
-        assert gy > 3.0
-        assert abs(gx - 2.0) <= dist * math.sin(math.radians(20)) + 1e-6
-
-
-def test_goal_applies_lidar_mount_offset():
-    # Learner mounts the lidar backwards (offset pi): raw beam 180 deg points forward.
-    rng = np.random.default_rng(3)
-    ranges = _gap_scan(center_deg=180, half_width_deg=20)
-    for _ in range(100):
-        gx, gy, _ = rl_core.sample_goal(
-            rng, ranges, 0.0, INC, math.pi, 0.0, 0.0, 0.0, d_min=1.0, d_max=3.0)
-        assert gx > 0.0
-
-
-def test_goal_fallback_when_everything_blocked_stays_in_range():
-    rng = np.random.default_rng(4)
-    ranges = _scan(value=1.0)  # wall at 1 m everywhere: no bearing passes the LOS test
-    gx, gy, dist = rl_core.sample_goal(
-        rng, ranges, 0.0, INC, 0.0, 0.0, 0.0, 0.0, d_min=1.0, d_max=3.0)
-    assert dist == pytest.approx(1.0)
-    assert math.hypot(gx, gy) == pytest.approx(1.0, abs=1e-6)
-
-
-# ---------------------------------------------------------------- curriculum
-
-def test_curriculum_raises_after_window():
-    c = rl_core.GoalCurriculum(d_min=1.0, d_start=1.5, d_cap=4.0, step=0.5, window=20, threshold=0.6)
-    for _ in range(19):
-        c.record(True)
-    assert c.d_max == pytest.approx(1.5)
-    c.record(True)
-    assert c.d_max == pytest.approx(2.0)
-    for _ in range(20):
-        c.record(False)
-    assert c.d_max == pytest.approx(2.0)
-
-
-def test_curriculum_needs_a_fresh_window_after_each_raise():
-    c = rl_core.GoalCurriculum(d_min=1.0, d_start=1.5, d_cap=4.0, step=0.5, window=20, threshold=0.6)
-    for _ in range(20):
-        c.record(True)
-    for _ in range(19):
-        c.record(True)
-    assert c.d_max == pytest.approx(2.0)
-    c.record(True)
-    assert c.d_max == pytest.approx(2.5)
-
-
-def test_curriculum_threshold_is_inclusive_and_capped():
-    c = rl_core.GoalCurriculum(d_min=1.0, d_start=1.5, d_cap=2.0, step=0.5, window=10, threshold=0.6)
-    for ok in [True] * 6 + [False] * 4:  # exactly 60 %
-        c.record(ok)
-    assert c.d_max == pytest.approx(2.0)
-    for _ in range(50):
-        c.record(True)
-    assert c.d_max == pytest.approx(2.0)
-
-
-def test_curriculum_below_threshold_does_not_raise():
-    c = rl_core.GoalCurriculum(d_min=1.0, d_start=1.5, d_cap=4.0, step=0.5, window=10, threshold=0.6)
-    for ok in [True] * 5 + [False] * 5:
-        c.record(ok)
-    assert c.d_max == pytest.approx(1.5)
-
-
-def test_curriculum_state_round_trip():
-    a = rl_core.GoalCurriculum(window=5)
-    for _ in range(5):
-        a.record(True)
-    a.record(False)
-    b = rl_core.GoalCurriculum(window=5)
-    b.load(a.state())
-    assert b.d_max == pytest.approx(a.d_max)
-    for _ in range(3):
-        b.record(True)
-    assert b.d_max == pytest.approx(a.d_max)  # F,T,T,T: window of 5 not full yet
-    b.record(True)  # F,T,T,T,T = 80 %: raises only if the False survived the reload
-    assert b.d_max > a.d_max
-
-
 # ---------------------------------------------------------------- training phase
 
 @pytest.mark.parametrize("t, want", [
@@ -226,14 +99,3 @@ def test_phase_for_step(t, want):
 def test_phase_with_no_demo_or_random_steps_is_rl():
     assert rl_core.phase_for_step(1, 0, 0) == "RL_POLICY"
 
-
-@pytest.mark.parametrize("phase, counts", [
-    ("EXPERT_DEMO", False),
-    ("RANDOM_EXPLORE", False),
-    ("EVAL", False),
-    ("RL_POLICY", True),
-    ("EXPERT_BASELINE", True),
-])
-def test_curriculum_counts_only_the_controller_being_measured(phase, counts):
-    # Demo/random episodes must not push goals out before the policy acts
-    assert rl_core.counts_for_curriculum(phase) is counts

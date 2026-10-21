@@ -184,7 +184,6 @@ def _start_parallel_runner_delayed(context):
         "--num_sims", str(num_sims),
         "--target", str(target),
         "--total_steps", str(total_steps),
-        "--goal_source", "topic",
         "--ckpt_dir", str(ckpt_dir),
         "--stagger_delay", str(stagger_delay),
         "--headless", str(headless),

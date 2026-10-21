@@ -34,12 +34,6 @@ def generate_launch_description():
             description="true = no RViz and no MuJoCo viewer (parallel / no display)",
         )
     )
-    ld.add_action(
-        DeclareLaunchArgument(
-            "goal_source", default_value="random", choices=["random", "topic"],
-            description="random: line-of-sight goals + curriculum; topic: <ns>/goal (SAM3 / RViz)",
-        )
-    )
     ld.add_action(DeclareLaunchArgument("seed", default_value="42"))
     ld.add_action(
         DeclareLaunchArgument(
@@ -53,7 +47,7 @@ def generate_launch_description():
             "use_cameras",
             default_value="false",
             choices=["true", "false"],
-            description="Cameras are only needed for SAM3 goals (goal_source:=topic)",
+            description="Cameras feed SAM3 (sam3_navigation.launch.py turns them on)",
         )
     )
     
@@ -207,7 +201,7 @@ def generate_launch_description():
             output="screen",
             arguments=[],
             remappings=[
-                # PoseStamped goals; the learner converts them (goal_source:=topic)
+                # PoseStamped goals; the learner converts them to PointStamped
                 ("/move_base_simple/goal", ["/", LaunchConfiguration("ns"), "/goal_pose"]),
                 ("/goal_pose", ["/", LaunchConfiguration("ns"), "/goal_pose"]),
             ],
@@ -272,8 +266,6 @@ def generate_launch_description():
             LaunchConfiguration("total_steps"),
             "--ckpt-dir",
             LaunchConfiguration("ckpt_dir"),
-            "--goal-source",
-            LaunchConfiguration("goal_source"),
             "--seed",
             LaunchConfiguration("seed"),
             "--load-ckpt",

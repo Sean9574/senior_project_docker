@@ -115,10 +115,7 @@ def generate_launch_description():
     ld.add_action(DeclareLaunchArgument(
         "ckpt_dir", default_value=os.path.expanduser("~/rl_checkpoints"),
     ))
-    ld.add_action(DeclareLaunchArgument(
-        "goal_source", default_value="topic", choices=["random", "topic"],
-        description="topic = learner follows the SAM3 goal generator (this file's purpose)",
-    ))
+
     ld.add_action(DeclareLaunchArgument("load_ckpt", default_value=""))
     ld.add_action(DeclareLaunchArgument("headless", default_value="false"))
 
@@ -267,7 +264,6 @@ def _configure_launch(context):
             "use_reward_monitor": LaunchConfiguration("use_reward_monitor"),
             "total_steps": LaunchConfiguration("total_steps"),
             "ckpt_dir": LaunchConfiguration("ckpt_dir"),
-            "goal_source": LaunchConfiguration("goal_source"),
             "load_ckpt": LaunchConfiguration("load_ckpt"),
             "headless": LaunchConfiguration("headless"),
         }.items(),

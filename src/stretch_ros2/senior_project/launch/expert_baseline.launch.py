@@ -36,7 +36,7 @@ from launch.actions import (
     TimerAction,
 )
 from launch.conditions import IfCondition
-from launch.substitutions import LaunchConfiguration, PythonExpression
+from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
 
@@ -234,8 +234,6 @@ def generate_launch_description():
             LaunchConfiguration("total_episodes"),
             "--total-steps",
             LaunchConfiguration("total_steps"),
-            "--goal-source",
-            PythonExpression(["'topic' if '", LaunchConfiguration("use_sam3"), "' == 'true' else 'random'"]),
         ],
         output="screen",
     )

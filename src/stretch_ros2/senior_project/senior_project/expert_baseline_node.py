@@ -117,8 +117,6 @@ def main():
     parser.add_argument("--total-steps", type=int, default=0,
                         help="Max steps (0 = no limit)")
     parser.add_argument("--seed", type=int, default=99)
-    parser.add_argument("--goal-source", choices=["random", "topic"], default="random",
-                        help="random: same LOS goals + curriculum as RL; topic: SAM3 goals")
 
     args = parser.parse_args()
 
@@ -136,8 +134,7 @@ def main():
     executor = SingleThreadedExecutor()
     executor.add_node(ros)
 
-    env = StretchExploreEnv(ros, goal_source=args.goal_source,
-                            rng=np.random.default_rng(args.seed))
+    env = StretchExploreEnv(ros)
     # Override the training phase so the reward monitor knows this is the baseline
     env._current_training_phase = "EXPERT_BASELINE"
     env._expert_avg_return = 0.0
