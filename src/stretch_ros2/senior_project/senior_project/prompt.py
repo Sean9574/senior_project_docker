@@ -43,6 +43,41 @@ def ask_target(argv: List[str], isatty: bool, input_fn: Callable[[str], str] = i
             return answer
 
 
+def count_from_argv(argv: List[str], key: str = "num_robots") -> Optional[int]:
+    """The integer value of a `num_robots:=N` launch argument, if valid."""
+    for arg in argv:
+        if arg.startswith(key + ":="):
+            try:
+                return int(arg[len(key) + 2:].strip())
+            except ValueError:
+                return None
+    return None
+
+
+def ask_count(argv: List[str], isatty: bool, input_fn: Callable[[str], str] = input,
+              default: int = 8, key: str = "num_robots", lo: int = 1, hi: int = 10) -> int:
+    """How many robots: `num_robots:=` from argv, else ask (Enter = default,
+    invalid answers are asked again). Non-interactive starts use the default."""
+    if "--show-args" in argv or "-s" in argv:
+        return default
+    given = count_from_argv(argv, key)
+    if given is not None:
+        if not lo <= given <= hi:
+            raise SystemExit(f"{key} must be between {lo} and {hi} (got {given})")
+        return given
+    if not isatty:
+        return default
+    while True:
+        try:
+            answer = input_fn(f"How many robots? [{default}]: ").strip()
+        except EOFError:
+            return default
+        if not answer:
+            return default
+        if answer.isdigit() and lo <= int(answer) <= hi:
+            return int(answer)
+
+
 def send_prompt(post_fn: Callable[[str], object], server_url: str, target: str,
                 timeout_s: float, sleep_fn: Callable[[float], None] = time.sleep,
                 now_fn: Callable[[], float] = time.monotonic, retry_s: float = 2.0) -> bool:

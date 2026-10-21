@@ -118,3 +118,46 @@ def test_send_prompt_gives_up_after_the_deadline():
 
     assert prompt.send_prompt(post, "http://s", "chair", 10, clock.sleep, clock.now) is False
     assert clock.t >= 10
+
+
+# ---------------------------------------------------------------- robot count
+
+def _answers(*items):
+    it = iter(items)
+    asked = []
+
+    def fake(text):
+        asked.append(text)
+        return next(it)
+    return fake, asked
+
+
+def test_count_from_launch_args():
+    assert prompt.count_from_argv(["ros2", "launch", "p", "f.py", "num_robots:=4"]) == 4
+    assert prompt.count_from_argv(["num_robots:=abc"]) is None
+    assert prompt.count_from_argv(["target:=chair"]) is None
+
+
+def test_enter_gives_the_default_of_eight():
+    fake, asked = _answers("")
+    assert prompt.ask_count([], isatty=True, input_fn=fake) == 8
+    assert "[8]" in asked[0]
+
+
+def test_invalid_or_out_of_range_answers_are_asked_again():
+    fake, asked = _answers("lots", "0", "11", " 6 ")
+    assert prompt.ask_count([], isatty=True, input_fn=fake) == 6
+    assert len(asked) == 4
+
+
+def test_launch_arg_skips_the_count_question():
+    assert prompt.ask_count(["num_robots:=3"], isatty=True, input_fn=_never_called) == 3
+
+
+def test_non_interactive_start_uses_the_default():
+    assert prompt.ask_count([], isatty=False, input_fn=_never_called) == 8
+
+
+def test_out_of_range_launch_arg_is_rejected():
+    with pytest.raises(SystemExit):
+        prompt.ask_count(["num_robots:=50"], isatty=True, input_fn=_never_called)
