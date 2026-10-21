@@ -126,6 +126,14 @@ def generate_launch_description():
     ))
 
     ld.add_action(DeclareLaunchArgument("load_ckpt", default_value=""))
+    ld.add_action(DeclareLaunchArgument(
+        "eval_episodes", default_value="0",
+        description="N > 0: evaluate the saved policy for N episodes instead of training",
+    ))
+    ld.add_action(DeclareLaunchArgument(
+        "random_spawn", default_value="true", choices=["true", "false"],
+        description="Spawn the robot at a random free pose every episode",
+    ))
     ld.add_action(DeclareLaunchArgument("headless", default_value="false"))
 
     # Camera topics
@@ -275,6 +283,8 @@ def _configure_launch(context):
             "ckpt_dir": LaunchConfiguration("ckpt_dir"),
             "load_ckpt": LaunchConfiguration("load_ckpt"),
             "headless": LaunchConfiguration("headless"),
+            "eval_episodes": LaunchConfiguration("eval_episodes"),
+            "random_spawn": LaunchConfiguration("random_spawn"),
         }.items(),
     )
     actions.append(TimerAction(period=5.0, actions=[rl_launch]))

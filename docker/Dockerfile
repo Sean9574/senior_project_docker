@@ -220,7 +220,10 @@ RUN mkdir -p $AMENT_WS/src && chown -R $USERNAME:$USERNAME /home/$USERNAME
 USER $USERNAME
 WORKDIR $AMENT_WS/src
 
-RUN git clone https://github.com/hello-robot/stretch_mujoco.git
+# Pinned: the driver relies on StretchMujocoSimulator(start_translation=,
+# start_rotation_quat=) for random spawns, and the sed patches below
+RUN git clone https://github.com/hello-robot/stretch_mujoco.git && \
+    git -C stretch_mujoco checkout c78d6a1cd79bb5ead1b679610299563c1a91124a
 
 # ROBOCASA FIX: Replace robocasa_gen.py with a stub (we use custom scene.xml)
 RUN echo '# Stub - robocasa kitchen generation disabled' > $AMENT_WS/src/stretch_mujoco/stretch_mujoco/robocasa_gen.py && \
@@ -273,10 +276,10 @@ RUN mkdir -p /home/stretch/logs && chown stretch:stretch /home/stretch/logs
 
 USER root
 
-# SAM3 is only needed for camera goals (goal_source:=topic). Random-goal RL
-# training does not use it, so it is opt-in: --build-arg WITH_SAM3=1 plus an
-# approved Hugging Face token passed as a BuildKit secret (see README).
-ARG WITH_SAM3=0
+# SAM3 turns the user's prompt into goals, so training needs it. It needs an
+# approved Hugging Face token passed as a BuildKit secret (see README);
+# --build-arg WITH_SAM3=0 builds a sim-only image without it.
+ARG WITH_SAM3=1
 
 # SAM3 server dependencies + runtime deps (sam3 itself --no-deps to avoid torch/CUDA conflicts)
 RUN if [ "$WITH_SAM3" = "1" ]; then \
@@ -295,6 +298,11 @@ USER stretch
 # Token is a BuildKit secret: available only during this RUN, never in image history
 RUN --mount=type=secret,id=hf_token,uid=1000 \
     if [ "$WITH_SAM3" = "1" ]; then \
+      if [ ! -s /run/secrets/hf_token ]; then \
+        echo "ERROR: SAM3 needs a Hugging Face token: build with docker/docker_run.sh" \
+             "(reads HF_TOKEN from ~/.hf.env) or --secret id=hf_token,env=HF_TOKEN;" \
+             "or --build-arg WITH_SAM3=0 for a sim-only image." ; exit 1 ; \
+      fi ; \
       HUGGINGFACE_HUB_TOKEN="$(cat /run/secrets/hf_token)" python3 -c "\
 from huggingface_hub import hf_hub_download; \
 path = hf_hub_download(repo_id='facebook/sam3', filename='sam3.pt'); \

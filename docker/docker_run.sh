@@ -15,12 +15,13 @@ fi
 #   CLEAN=1     -> disables build cache
 #   PULL=1      -> pulls latest base images
 #   DETACH=1    -> run in background (container stays running after exit)
-#   WITH_SAM3=1 -> include SAM3 camera goals (needs an approved HF token in ~/.hf.env)
+#   WITH_SAM3=0 -> sim-only image without SAM3 (default 1: SAM3 turns your prompt
+#                  into goals; needs an approved HF token in ~/.hf.env)
 #   DOMAIN=N    -> ROS_DOMAIN_ID inside the container (default 90, away from the host's 0)
 CLEAN="${CLEAN:-0}"
 PULL="${PULL:-0}"
 DETACH="${DETACH:-0}"
-WITH_SAM3="${WITH_SAM3:-0}"
+WITH_SAM3="${WITH_SAM3:-1}"
 DOMAIN="${DOMAIN:-90}"
 HF_ENV_FILE="$HOME/.hf.env"
 
@@ -35,11 +36,14 @@ if [ "$WITH_SAM3" = "1" ]; then
   # Token goes in as a BuildKit secret, so it never lands in the image history
   HF_TOKEN=$(grep -E "^(HUGGINGFACE_HUB_TOKEN|HF_TOKEN)=" "$HF_ENV_FILE" 2>/dev/null | head -1 | cut -d'=' -f2 || true)
   if [ -z "$HF_TOKEN" ]; then
-    echo "ERROR: WITH_SAM3=1 needs HF_TOKEN=... in $HF_ENV_FILE (approved access to facebook/sam3)"
+    echo "ERROR: SAM3 needs HF_TOKEN=... in $HF_ENV_FILE (approved access to facebook/sam3)."
+    echo "       Or run WITH_SAM3=0 $0 for a sim-only image."
     exit 1
   fi
   export HF_TOKEN
   BUILD_FLAGS+=(--build-arg WITH_SAM3=1 --secret id=hf_token,env=HF_TOKEN)
+else
+  BUILD_FLAGS+=(--build-arg WITH_SAM3=0)
 fi
 
 echo "Building Docker image..."
