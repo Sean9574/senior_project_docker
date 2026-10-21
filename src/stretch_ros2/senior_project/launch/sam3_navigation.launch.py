@@ -211,31 +211,12 @@ def _configure_launch(context):
 
         actions.append(sam3_server)
 
-        # Set SAM3 prompt after server starts
-        target_val = LaunchConfiguration("target").perform(context)
-        set_prompt = ExecuteProcess(
-            cmd=[
-                "bash", "-c",
-                f"sleep 15 && curl -sS -X POST '{sam3_url}/prompt/{target_val}'"
-            ],
-            output="screen",
-        )
-        actions.append(LogInfo(msg="  [15s] SAM3 prompt being set"))
-        actions.append(set_prompt)
+        # The goal generator sets the prompt and waits for the server to confirm it
 
     else:
         actions.append(LogInfo(msg=f"  [---] Using shared SAM3 server at {sam3_url}"))
 
-        # Still set prompt on shared server
-        target_val = LaunchConfiguration("target").perform(context)
-        set_prompt = ExecuteProcess(
-            cmd=[
-                "bash", "-c",
-                f"sleep 5 && curl -sS -X POST '{sam3_url}/prompt/{target_val}'"
-            ],
-            output="screen",
-        )
-        actions.append(set_prompt)
+        # The goal generator sets the prompt and waits for the server to confirm it
 
     # ===================== MONO DEPTH SERVER =====================
 

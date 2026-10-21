@@ -27,7 +27,9 @@ from nav_msgs.msg import Odometry
 from rclpy.node import Node
 from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import CameraInfo, Image
-from std_msgs.msg import String
+from std_msgs.msg import Empty, String
+
+from senior_project.prompt import send_prompt
 from tf2_ros import Buffer, TransformException, TransformListener
 from tf_transformations import euler_from_quaternion, quaternion_matrix
 from visualization_msgs.msg import Marker
@@ -299,6 +301,9 @@ class SAM3GoalGeneratorV2(Node):
         self.create_subscription(CameraInfo, camera_info_topic, self.camera_info_callback, qos)
         self.create_subscription(Odometry, f'/{self.ns}/odom', self.odom_callback, 10)
         self.create_subscription(String, '~/set_target', self.target_callback, 10)
+        # Learner signals a new episode (robot respawned): forget the old goal
+        self._episode_epoch = 0
+        self.create_subscription(Empty, f'/{self.ns}/episode_reset', self.episode_reset_callback, 10)
 
         # ==================== Publishers ====================
         self.goal_pub = self.create_publisher(PointStamped, f'/{self.ns}/goal', 10)
@@ -315,7 +320,9 @@ class SAM3GoalGeneratorV2(Node):
         self._sam3_busy = False
 
         # ==================== Initialize ====================
-        self.set_sam3_prompt(self.target)
+        # Wait for the server (it may still be loading the model) so the
+        # first episode already searches for the user's prompt
+        self.set_sam3_prompt(self.target, timeout_s=180.0)
         self.check_mono_depth_server()
         self._init_gui()
         
@@ -472,15 +479,19 @@ class SAM3GoalGeneratorV2(Node):
 
     # ==================== Server Communication ====================
 
-    def set_sam3_prompt(self, target: str):
-        try:
-            self.session.post(
-                f"{self.server_url}/prompt/{target.replace(' ', '%20')}",
-                timeout=5
+    def set_sam3_prompt(self, target: str, timeout_s: float = 15.0):
+        """Send the prompt and confirm the server echoes it back; retries while
+        the server is starting. Logs an error (not a fake success) on failure."""
+        self.get_logger().info(f'Setting SAM3 prompt to "{target}" (waiting up to {timeout_s:.0f}s for the server)')
+        ok = send_prompt(lambda url: self.session.post(url, timeout=5), self.server_url, target, timeout_s)
+        if ok:
+            self.get_logger().info(f'SAM3 server confirmed prompt: "{target}"')
+        else:
+            self.get_logger().error(
+                f'SAM3 server at {self.server_url} never confirmed prompt "{target}" — '
+                f'it is NOT searching for it. Is the server running?'
             )
-            self.get_logger().info(f'SAM3 prompt set to: "{target}"')
-        except Exception as e:
-            self.get_logger().warn(f'Could not set SAM3 prompt: {e}')
+        return ok
 
     def check_mono_depth_server(self):
         try:
@@ -533,8 +544,25 @@ class SAM3GoalGeneratorV2(Node):
         self._goal_published_this_detection = False
         self._locked_goal = None  # Clear locked goal for new target
         self._locked_goal_object_pos = None
-        self.set_sam3_prompt(self.target)
+        # Off the executor thread: confirmation can take a few seconds
+        threading.Thread(target=self.set_sam3_prompt, args=(self.target,), daemon=True).start()
         self.get_logger().info(f'Target changed to: "{self.target}"')
+
+    def episode_reset_callback(self, msg: Empty):
+        """New episode: the robot respawned somewhere else and must find the
+        target again, so drop the locked goal, the cached frame and any SAM3
+        result computed from before the reset."""
+        self._episode_epoch += 1
+        self.goal_sent = False
+        self._goal_published_this_detection = False
+        self._locked_goal = None
+        self._locked_goal_object_pos = None
+        self._locked_goal_sam3_id = None
+        with self.lock:
+            self.latest_rgb = None
+        with self._sam3_lock:
+            self._last_sam3_result = None
+        self.get_logger().info('[RESET] New episode: goal lock cleared')
     
     def goal_reached_callback(self, msg: PointStamped):
         """Called when learner node reports goal reached - cycle to next target."""
@@ -925,6 +953,8 @@ class SAM3GoalGeneratorV2(Node):
         _, buf = cv2.imencode('.jpg', rgb_for_sam3, [cv2.IMWRITE_JPEG_QUALITY, self.sam3_jpeg_quality])
         img_b64 = base64.b64encode(buf).decode()
 
+        epoch = self._episode_epoch
+
         def run_sam3():
             self._sam3_busy = True
             try:
@@ -937,6 +967,8 @@ class SAM3GoalGeneratorV2(Node):
                 # Store scale factor with result for coordinate adjustment
                 result['_scale_factor'] = scale_factor
                 with self._sam3_lock:
+                    if epoch != self._episode_epoch:
+                        return  # image is from before the respawn
                     self._last_sam3_result = result
                     self._sam3_result_counter += 1
             except Exception as e:

@@ -5,6 +5,8 @@ starts. Used by the launch files and parallel_runner; stdlib only so it is
 unit-tested without ROS (test/test_prompt.py).
 """
 
+import time
+import urllib.parse
 from typing import Callable, List, Optional
 
 QUESTION = "What should the robot go to? (e.g. chair, potted plant, blue cylinder): "
@@ -39,3 +41,23 @@ def ask_target(argv: List[str], isatty: bool, input_fn: Callable[[str], str] = i
             raise SystemExit("No target given. Pass one, e.g.  target:=chair")
         if answer:
             return answer
+
+
+def send_prompt(post_fn: Callable[[str], object], server_url: str, target: str,
+                timeout_s: float, sleep_fn: Callable[[float], None] = time.sleep,
+                now_fn: Callable[[], float] = time.monotonic, retry_s: float = 2.0) -> bool:
+    """POST the prompt to the SAM3 server until it answers 200 and echoes the
+    same prompt (it may still be loading the model). False after timeout_s, so
+    callers can say so instead of silently searching for the server's default."""
+    url = f"{server_url}/prompt/{urllib.parse.quote(target, safe='')}"
+    deadline = now_fn() + timeout_s
+    while True:
+        try:
+            r = post_fn(url)
+            if r.status_code == 200 and r.json().get("prompt") == target:
+                return True
+        except Exception:
+            pass
+        if now_fn() + retry_s > deadline:
+            return False
+        sleep_fn(retry_s)

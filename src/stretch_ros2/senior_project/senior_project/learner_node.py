@@ -47,7 +47,7 @@ from rclpy.executors import SingleThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import Imu, LaserScan
-from std_msgs.msg import Float32
+from std_msgs.msg import Empty, Float32
 from std_msgs.msg import String as StringMsg
 from std_srvs.srv import Trigger
 from visualization_msgs.msg import Marker, MarkerArray
@@ -1035,6 +1035,8 @@ class StretchRosInterface(Node):
         self.frontier_pub = self.create_publisher(MarkerArray, "/frontiers", 10)
         self.safety_zone_pub = self.create_publisher(Marker, "/safety_zone", 10)
         self.goal_reached_pub = self.create_publisher(PointStamped, f"/{ns}/goal_reached", 10)
+        # Tells the SAM3 goal generator to drop its locked goal (robot respawns)
+        self.episode_reset_pub = self.create_publisher(Empty, make_topic("episode_reset"), 10)
         self.goal_marker_pub = self.create_publisher(Marker, "/goal_marker", 10)
         self.last_known_marker_pub = self.create_publisher(Marker, "/last_known_marker", 10)
 
@@ -1149,7 +1151,9 @@ class StretchRosInterface(Node):
         msg.angular.z = float(w)
         self.cmd_pub.publish(msg)
 
-    def reset_simulation(self, timeout: float = 5.0) -> bool:
+    def reset_simulation(self, timeout: float = 20.0) -> bool:
+        # 20 s: with random spawn every reset restarts the simulator process
+        self.episode_reset_pub.publish(Empty())
         for _ in range(10):
             self.send_cmd(0.0, 0.0)
             rclpy.spin_once(self, timeout_sec=0.01)
