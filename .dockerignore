@@ -37,3 +37,15 @@ Thumbs.db
 *.zip
 *.7z
 *.iso
+
+# Nested training outputs (patterns above only match the repo root)
+**/runs/
+**/parallel_training/
+**/*.pt
+**/*.npz
+**/*.ckpt
+# ...but keep the camera calibration the SAM3 nodes load
+!src/stretch_ros2/senior_project/senior_project/camera_calib.npz
+
+# Plan / agent scratch
+.superpowers/

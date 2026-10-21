@@ -247,12 +247,9 @@ RUN sed -i 's/ctrlrange="-6 6"/ctrlrange="-15 15"/g' \
 
 RUN git clone https://github.com/hello-robot/stretch_urdf.git
 
-ARG CACHEBUST=1
-RUN echo "Cache busting: $CACHEBUST"
-# Clone your repo and move src contents
-RUN git clone https://github.com/Sean9574/senior_project_docker.git /tmp/senior_project && \
-    cp -r /tmp/senior_project/src/* . && \
-    rm -rf /tmp/senior_project
+# NOTE: this repo's src/ is COPYed from the build context further down (after
+# all pip/model layers), so the image always contains the code you build from
+# and code edits don't invalidate the heavy layers.
 
 
 # =============================================================================
@@ -276,37 +273,33 @@ RUN mkdir -p /home/stretch/logs && chown stretch:stretch /home/stretch/logs
 
 USER root
 
-# SAM3 server dependencies
-RUN pip3 install  uvicorn fastapi pydantic ftfy huggingface_hub iopath regex timm
-RUN pip3 install --no-deps git+https://github.com/facebookresearch/sam3.git
+# SAM3 is only needed for camera goals (goal_source:=topic). Random-goal RL
+# training does not use it, so it is opt-in: --build-arg WITH_SAM3=1 plus an
+# approved Hugging Face token passed as a BuildKit secret (see README).
+ARG WITH_SAM3=0
 
-# SAM3 runtime deps (since we install sam3 with --no-deps to avoid torch/CUDA conflicts)
-RUN pip3 install --no-cache-dir \
-    einops \
-    fastapi \
-    uvicorn \
-    pillow \
-    pydantic \
-    decord \
-    pycocotools \
-    urchin \
-    pyquaternion \
-    requests
+# SAM3 server dependencies + runtime deps (sam3 itself --no-deps to avoid torch/CUDA conflicts)
+RUN if [ "$WITH_SAM3" = "1" ]; then \
+      pip3 install uvicorn fastapi pydantic ftfy huggingface_hub iopath regex timm && \
+      pip3 install --no-deps git+https://github.com/facebookresearch/sam3.git && \
+      pip3 install --no-cache-dir einops fastapi uvicorn pillow pydantic decord \
+        pycocotools urchin pyquaternion requests ; \
+    fi
 
-# Pre-download SAM3 model as stretch user (so cache is in right place)
-# Pre-download SAM3 model weights only (no GPU needed)
-ARG HF_TOKEN=""
+# Pre-download SAM3 model weights as the stretch user (no GPU needed)
 ENV HF_HOME=/home/stretch/.cache/huggingface
 RUN mkdir -p /home/stretch/.cache/huggingface && \
     chown -R stretch:stretch /home/stretch/.cache
 
 USER stretch
-RUN HUGGINGFACE_HUB_TOKEN=$HF_TOKEN python3 -c "\
+# Token is a BuildKit secret: available only during this RUN, never in image history
+RUN --mount=type=secret,id=hf_token,uid=1000 \
+    if [ "$WITH_SAM3" = "1" ]; then \
+      HUGGINGFACE_HUB_TOKEN="$(cat /run/secrets/hf_token)" python3 -c "\
 from huggingface_hub import hf_hub_download; \
-import os; \
-os.makedirs('/home/stretch/.cache/huggingface', exist_ok=True); \
 path = hf_hub_download(repo_id='facebook/sam3', filename='sam3.pt'); \
-print(f'Downloaded SAM3 to: {path}')"
+print(f'Downloaded SAM3 to: {path}')" ; \
+    fi
 
 USER root
 
@@ -351,6 +344,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       llvmlite==0.42.0 \
       numba==0.59.1
 
+# This repo's workspace sources (filtered by .dockerignore)
+COPY --chown=stretch:stretch src/ $AMENT_WS/src/
+
 RUN chown -R $USERNAME:$USERNAME $AMENT_WS
 RUN chown -R $USERNAME:$USERNAME /home/$USERNAME
 
@@ -383,12 +379,16 @@ RUN /bin/bash -c "source /opt/ros/humble/setup.bash && \
 # Copy URDF file to expected location
 RUN mkdir -p $AMENT_WS/install/stretch_description/share/stretch_description/urdf && \
     cp $AMENT_WS/src/stretch_urdf/stretch_urdf/RE2V0/stretch_description_RE2V0_eoa_wrist_dw3_tool_sg3.urdf \
-       $AMENT_WS/install/stretch_description/share/stretch_description/urdf/stretch.urdf || true
+       $AMENT_WS/install/stretch_description/share/stretch_description/urdf/stretch.urdf
 
 
-# Copy custom MuJoCo scene (10x10m arena with obstacles)
+# Copy custom MuJoCo worlds next to stretch.xml (they include it relatively).
+# scene.xml (10x10 m arena) replaces the default world every launch file uses;
+# explore_arena.xml (30x30 m) is selectable with mujoco_xml:=<models>/explore_arena.xml
 RUN cp $AMENT_WS/src/stretch_ros2/senior_project/config/scene.xml \
-       $AMENT_WS/src/stretch_mujoco/stretch_mujoco/models/scene.xml
+       $AMENT_WS/src/stretch_mujoco/stretch_mujoco/models/scene.xml && \
+    cp $AMENT_WS/src/stretch_ros2/senior_project/map/map.xml \
+       $AMENT_WS/src/stretch_mujoco/stretch_mujoco/models/explore_arena.xml
 
 # =============================================================================
 # Environment Setup - PERFORMANCE OPTIMIZED
@@ -396,7 +396,7 @@ RUN cp $AMENT_WS/src/stretch_ros2/senior_project/config/scene.xml \
 
 RUN echo "source /opt/ros/humble/setup.bash" >> /home/$USERNAME/.bashrc
 RUN echo "source $AMENT_WS/install/setup.bash 2>/dev/null || true" >> /home/$USERNAME/.bashrc
-RUN echo "export ROS_DOMAIN_ID=0" >> /home/$USERNAME/.bashrc
+# ROS_DOMAIN_ID comes from `docker run -e` (90 by default, away from the host's 0)
 # USE CYCLONE DDS FOR BETTER DOCKER PERFORMANCE
 RUN echo "export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp" >> /home/$USERNAME/.bashrc
 RUN echo "export MUJOCO_GL=egl" >> /home/$USERNAME/.bashrc
