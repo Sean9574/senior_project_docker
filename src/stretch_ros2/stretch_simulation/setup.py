@@ -23,6 +23,7 @@ setup(
     entry_points={
         'console_scripts': [
             'stretch_mujoco_driver = stretch_mujoco_driver.stretch_mujoco_driver:main',
+            'arena_sim = stretch_mujoco_driver.arena_sim_node:main',
         ],
     },
 )

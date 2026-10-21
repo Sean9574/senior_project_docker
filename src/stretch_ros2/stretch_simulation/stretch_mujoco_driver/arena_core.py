@@ -120,10 +120,15 @@ class Arena:
         room = self.world.rooms[i]
         pose = sample_spawn_pose(self.rng, room.obstacles, room.bounds, clearance=self.clearance)
         x, y, yaw = pose if pose is not None else (0.0, 0.0, 0.0)
+        self.respawn_at(i, x, y, yaw)
+        return x, y, yaw
+
+    def respawn_at(self, i: int, x: float, y: float, yaw: float) -> None:
+        """Put robot i at (x, y, yaw) in its room frame, at rest."""
+        room = self.world.rooms[i]
         adr = room.qpos_adr
         self.data.qpos[adr:adr + 3] = [room.origin[0] + x, room.origin[1] + y, self.model.qpos0[adr + 2]]
         self.data.qpos[adr + 3:adr + 7] = yaw_to_quat(yaw)
         self.data.qvel[self._dofs[i]] = 0.0
         self.set_cmd(i, 0.0, 0.0)
         self._mj.mj_forward(self.model, self.data)
-        return x, y, yaw

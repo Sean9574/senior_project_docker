@@ -115,3 +115,15 @@ def test_ray_cast_scan_matches_the_models_own_rangefinders():
         both = (sensor > 0) & (sensor < 9.99) & (ours > 0)
         assert both.sum() > 300
         assert np.max(np.abs(sensor[both] - ours[both])) < 0.01
+
+
+@needs_mujoco
+def test_respawn_at_places_the_robot_at_rest_in_room_frame():
+    a = _arena(2)
+    a.set_cmd(1, 0.3, 0.0)
+    a.step(100)
+    a.respawn_at(1, 1.5, -2.0, math.pi / 2)
+    x, y, yaw, v, w = a.odom(1)
+    assert (x, y, yaw) == pytest.approx((1.5, -2.0, math.pi / 2), abs=1e-6)
+    assert v == pytest.approx(0.0, abs=1e-9) and w == pytest.approx(0.0, abs=1e-9)
+    assert a.cmd[1] == (0.0, 0.0)
