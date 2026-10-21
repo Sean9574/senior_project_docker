@@ -102,6 +102,8 @@ PROXIMITY_THRESHOLD = 0.65
 # =============================================================================
 
 CHECKPOINT_FILENAME = "td3_safe_rl_agent.pt"
+FEDERATED_UPDATE_FILENAME = "federated_update.pt"  # written by federated_sync.py
+REPLAY_SAVE_EVERY_EPISODES = 20
 AUTO_LOAD_CHECKPOINT = True
 
 EPISODE_SECONDS = 45.0
@@ -594,6 +596,7 @@ class PrioritizedReplayBuffer:
         self.tree = SumTree(self.size)
         for _ in range(self.count):
             self.tree.add(1.0)
+        self.tree.data_pointer = self.ptr  # new priorities must land on the slot add() writes
         return (
             torch.as_tensor(self.obs[indices], device=self.device),
             torch.as_tensor(self.acts[indices], device=self.device),
@@ -715,6 +718,7 @@ class PrioritizedReplayBuffer:
             self.tree = SumTree(self.size)
             for _ in range(n):
                 self.tree.add(1.0)
+            self.tree.data_pointer = self.ptr  # new priorities must land on the slot add() writes
             self.max_priority = 1.0
             return True
         except Exception:
@@ -1890,6 +1894,14 @@ class TD3AgentCNN:
             payload["training_state"] = extra_state
         torch.save(payload, path)
 
+    WEIGHT_KEYS = ("actor", "actor_targ", "critic1", "critic2", "critic1_targ", "critic2_targ")
+
+    def load_weights(self, path: str):
+        """Load network weights only (optimizers untouched), e.g. a federated merge."""
+        payload = torch.load(path, map_location=self.device)
+        for key in self.WEIGHT_KEYS:
+            getattr(self, key).load_state_dict(payload[key])
+
     def load(self, path: str, strict: bool = True) -> Optional[Dict]:
         payload = torch.load(path, map_location=self.device)
         self.actor.load_state_dict(payload["actor"], strict=strict)
@@ -1905,6 +1917,70 @@ class TD3AgentCNN:
         except Exception:
             pass
         return payload.get("training_state", None)
+
+
+# =============================================================================
+# Evaluation (frozen policy, fixed goal set)
+# =============================================================================
+
+EVAL_CSV_COLUMNS = ["episode", "success", "steps", "time_s", "start_goal_dist",
+                    "path_len", "spl", "bumps", "min_clearance"]
+
+
+def run_evaluation(env: "StretchExploreEnv", agent: "TD3AgentCNN", ros: StretchRosInterface,
+                   n_episodes: int, out_dir: str) -> Dict:
+    """Run n_episodes with no exploration noise and no learning; write one CSV
+    row per episode. SPL uses the straight-line distance to the goal region
+    (goals are line-of-sight), so it measures path efficiency of successes."""
+    import csv
+    out_path = os.path.join(out_dir, f"eval_{time.strftime('%Y%m%d_%H%M%S')}.csv")
+    rows = []
+    for ep in range(1, n_episodes + 1):
+        obs, _ = env.reset()
+        st = env._get_robot_state()
+        start_d = env._goal_distance()
+        last_xy = (st["x"], st["y"])
+        path_len, time_s, bumps, min_clear, steps = 0.0, 0.0, 0, LIDAR_MAX_RANGE, 0
+        success, done = False, False
+        while not done:
+            obs, _, term, trunc, info = env.step(agent.act(obs, noise_std=0.0))
+            st = env._get_robot_state()
+            path_len += math.hypot(st["x"] - last_xy[0], st["y"] - last_xy[1])
+            last_xy = (st["x"], st["y"])
+            time_s += info["dt"]
+            bumps += int("collision" in info["reward_terms"])
+            min_clear = min(min_clear, info["min_distance"])
+            steps += 1
+            success = info["success"]
+            done = term or trunc
+        shortest = max(start_d - GOAL_RADIUS, 0.0)
+        spl = (shortest / max(path_len, shortest)) if (success and shortest > 0) else 0.0
+        rows.append({
+            "episode": ep, "success": int(success), "steps": steps, "time_s": f"{time_s:.2f}",
+            "start_goal_dist": f"{start_d:.3f}", "path_len": f"{path_len:.3f}", "spl": f"{spl:.3f}",
+            "bumps": bumps, "min_clearance": f"{min_clear:.3f}",
+        })
+        ros.get_logger().info(
+            f"[EVAL {ep}/{n_episodes}] {'SUCCESS' if success else 'timeout'} "
+            f"d0={start_d:.2f}m path={path_len:.2f}m spl={spl:.2f} bumps={bumps}"
+        )
+    ros.send_cmd(0.0, 0.0)
+    with open(out_path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=EVAL_CSV_COLUMNS)
+        writer.writeheader()
+        writer.writerows(rows)
+    n = max(len(rows), 1)
+    summary = {
+        "success_rate": sum(r["success"] for r in rows) / n,
+        "mean_spl": sum(float(r["spl"]) for r in rows) / n,
+        "bumps_per_episode": sum(r["bumps"] for r in rows) / n,
+        "csv": out_path,
+    }
+    ros.get_logger().info(
+        f"[EVAL] success={summary['success_rate']:.0%} SPL={summary['mean_spl']:.2f} "
+        f"bumps/ep={summary['bumps_per_episode']:.2f} -> {out_path}"
+    )
+    return summary
 
 
 # =============================================================================
@@ -1931,24 +2007,27 @@ def main():
     parser.add_argument("--save-every", type=int, default=DEFAULT_SAVE_EVERY)
     parser.add_argument("--demo-steps", type=int, default=DEFAULT_DEMO_STEPS)
 
-    parser.add_argument("--ckpt-dir", type=str, default=os.path.expanduser("~/parallel_training"))
+    parser.add_argument("--ckpt-dir", type=str, default=os.path.expanduser("~/rl_checkpoints"))
+    parser.add_argument("--load-ckpt", type=str, default="",
+                        help="Checkpoint to load instead of <ckpt-dir>/" + CHECKPOINT_FILENAME)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--goal-source", choices=["random", "topic"], default="random",
+                        help="random: LOS goals + curriculum (training); topic: SAM3/RViz goal topic")
 
     parser.add_argument("--inference", action="store_true")
 
-    parser.add_argument("--rollout-steps", type=int, default=2048)
-    parser.add_argument("--load-ckpt", type=str, default="")
-    parser.add_argument("--use-obstacle", type=int, default=1)
-    parser.add_argument("--eval-every-steps", type=int, default=0)
-    parser.add_argument("--eval-episodes", type=int, default=0)
-    parser.add_argument("--episode-num", type=int, default=1)
-    parser.add_argument("--models-dir", type=str, default="./models")
+    parser.add_argument("--eval-episodes", type=int, default=0,
+                        help="N > 0: evaluate the frozen policy for N episodes, write a CSV, exit")
+    parser.add_argument("--eval-seed", type=int, default=1234)
+    parser.add_argument("--eval-max-dist", type=float, default=4.0)
 
     args = parser.parse_args()
     set_seed(args.seed)
 
     os.makedirs(args.ckpt_dir, exist_ok=True)
     ckpt_path = os.path.join(args.ckpt_dir, CHECKPOINT_FILENAME)
+    load_path = args.load_ckpt or ckpt_path
+    federated_path = os.path.join(args.ckpt_dir, FEDERATED_UPDATE_FILENAME)
 
     rclpy.init()
     ros = StretchRosInterface(
@@ -1964,10 +2043,16 @@ def main():
     obs_dim = NUM_LIDAR_BINS + 5 + 2 + 2 + 1 + grid_flat_size + 2 + 1
     act_dim = 2
 
-    env = StretchExploreEnv(ros)
+    eval_mode = args.eval_episodes > 0
+    curriculum = rl_core.GoalCurriculum()
+    if eval_mode:
+        # Fixed goal set: same seed + same distance range for every checkpoint
+        curriculum = rl_core.GoalCurriculum(d_start=args.eval_max_dist, d_cap=args.eval_max_dist)
+    goal_rng = np.random.default_rng(args.eval_seed if eval_mode else args.seed)
+    env = StretchExploreEnv(ros, goal_source=args.goal_source, rng=goal_rng, curriculum=curriculum)
 
     ros.get_logger().info(f"[AGENT] device={device} obs_dim={obs_dim} act_dim={act_dim}")
-    ros.get_logger().info(f"[AGENT] v5: explore_velocity={V_MIN_FORWARD}-{V_MAX}, goal_velocity=0-{V_MAX}")
+    ros.get_logger().info(f"[AGENT] v6: goal_source={args.goal_source}, explore_velocity={V_MIN_FORWARD}-{V_MAX}, goal_velocity=0-{V_MAX}, w_max={W_MAX}")
     ros.get_logger().info(f"[AGENT] Expert demo phase: {args.demo_steps} steps, then RL takes over")
     ros.get_logger().info(f"[AGENT] Collisions never terminate (bump={R_COLLISION}, cooldown={COLLISION_COOLDOWN_STEPS})")
     ros.get_logger().info(f"[AGENT] Explore: discovery({R_NEW_CELL}) + revisit({R_REVISIT}) + step({R_STEP_EXPLORE})")
@@ -1981,11 +2066,11 @@ def main():
     resume_step = 0
     replay_path = os.path.join(args.ckpt_dir, "replay_buffer.npz")
 
-    if AUTO_LOAD_CHECKPOINT and os.path.exists(ckpt_path):
-        file_size_mb = os.path.getsize(ckpt_path) / 1e6
-        ros.get_logger().info(f"[CKPT] Found checkpoint ({file_size_mb:.1f} MB) — loading...")
+    if (AUTO_LOAD_CHECKPOINT or args.load_ckpt) and os.path.exists(load_path):
+        file_size_mb = os.path.getsize(load_path) / 1e6
+        ros.get_logger().info(f"[CKPT] Found checkpoint {load_path} ({file_size_mb:.1f} MB) — loading...")
         try:
-            training_state = agent.load(ckpt_path, strict=False)
+            training_state = agent.load(load_path, strict=False)
             ros.get_logger().info(f"[CKPT] {G}✓ Network weights loaded{RST}")
 
             if training_state is not None:
@@ -1996,6 +2081,8 @@ def main():
                     env.obs_rms.mean = training_state["obs_rms_mean"]
                     env.obs_rms.var = training_state["obs_rms_var"]
                     env.obs_rms.count = training_state["obs_rms_count"]
+                if "curriculum" in training_state and not eval_mode:
+                    env.curriculum.load(training_state["curriculum"])
                 ros.get_logger().info(
                     f"[CKPT] {G}✓ Restored:{RST} step={resume_step}, "
                     f"episode={env.episode_index}"
@@ -2004,7 +2091,7 @@ def main():
                 ros.get_logger().warn(f"[CKPT] {Y}No training state — starting counters from 0{RST}")
 
             replay_loaded = False
-            for rp in [replay_path, replay_path + ".tmp.npz"]:
+            for rp in ([] if eval_mode else [replay_path, replay_path + ".tmp.npz"]):
                 if os.path.exists(rp) and replay.load(rp):
                     ros.get_logger().info(f"[CKPT] {G}✓ Replay: {replay.count} transitions{RST}")
                     if rp != replay_path:
@@ -2012,7 +2099,7 @@ def main():
                         except: pass
                     replay_loaded = True
                     break
-            if not replay_loaded:
+            if not replay_loaded and not eval_mode:
                 ros.get_logger().warn(f"[CKPT] {Y}No replay buffer — starting empty{RST}")
 
         except Exception as e:
@@ -2030,6 +2117,7 @@ def main():
             "obs_rms_mean": env.obs_rms.mean,
             "obs_rms_var": env.obs_rms.var,
             "obs_rms_count": env.obs_rms.count,
+            "curriculum": env.curriculum.state(),
         }
         try:
             agent.save(ckpt_path + ".tmp", extra_state=training_state)
@@ -2068,6 +2156,24 @@ def main():
         except: pass
         sys.exit(0)
 
+    def shutdown_without_saving(signum=None, frame=None):
+        try: ros.send_cmd(0.0, 0.0)
+        except: pass
+        try:
+            executor.shutdown()
+            ros.destroy_node()
+            rclpy.shutdown()
+        except: pass
+        sys.exit(0)
+
+    if eval_mode:
+        signal.signal(signal.SIGINT, shutdown_without_saving)
+        signal.signal(signal.SIGTERM, shutdown_without_saving)
+        env._current_training_phase = "EVAL"
+        ros.get_logger().info(f"[MODE] EVAL: {args.eval_episodes} episodes, goals <= {args.eval_max_dist} m, seed {args.eval_seed}")
+        run_evaluation(env, agent, ros, args.eval_episodes, args.ckpt_dir)
+        shutdown_without_saving()
+
     signal.signal(signal.SIGINT, shutdown_and_save)
     signal.signal(signal.SIGTERM, shutdown_and_save)
 
@@ -2105,8 +2211,12 @@ def main():
     if not demo_already_done:
         expert.reset_episode()
 
+    rl_returns: deque = deque(maxlen=100)
+    episodes_since_replay_save = 0
+
     for t in range(start_step, args.total_steps + 1):
         shutdown_and_save._current_step = t
+        env._current_training_phase = rl_core.phase_for_step(t, demo_steps, args.start_steps)
 
         # === Phase 1: Expert state machine drives (first demo_steps steps) ===
         if t <= demo_steps:
@@ -2136,12 +2246,16 @@ def main():
         if t <= demo_steps:
             expert.track_reward(reward, success=info.get("success", False))
 
-        replay.add(
-            obs, act,
-            np.array([reward], dtype=np.float32),
-            next_obs,
-            np.array([1.0 if done else 0.0], dtype=np.float32),
-        )
+        # Only true terminal states stop bootstrapping; a timeout is not one
+        if np.isfinite(reward) and np.all(np.isfinite(obs)) and np.all(np.isfinite(next_obs)):
+            replay.add(
+                obs, act,
+                np.array([reward], dtype=np.float32),
+                next_obs,
+                np.array([1.0 if terminated else 0.0], dtype=np.float32),
+            )
+        else:
+            ros.get_logger().error(f"{R}[REPLAY] Non-finite transition dropped at step {t} (reward={reward}){RST}")
         obs = next_obs
 
         if done:
@@ -2157,14 +2271,15 @@ def main():
                     f"state={expert.state.value}"
                 )
                 expert.reset_episode()
-            elif t > demo_steps and expert.total_episodes > 0:
+            elif t > demo_steps:
+                rl_returns.append(env.episode_return)
                 # After expert phase, log RL vs expert baseline periodically
-                if env.episode_index % 10 == 0:
+                if expert.total_episodes > 0 and env.episode_index % 10 == 0:
                     expert_avg = expert.get_avg_return()
-                    rl_avg = env.episode_return  # current episode return
+                    rl_avg = float(np.mean(rl_returns))  # rolling mean of last 100 RL episodes
                     ros.get_logger().info(
                         f"{B}[COMPARE]{RST} Expert baseline avg: {Y}{expert_avg:+.1f}{RST} | "
-                        f"RL episode return: {G if rl_avg > expert_avg else R}{rl_avg:+.1f}{RST} | "
+                        f"RL avg return (last {len(rl_returns)}): {G if rl_avg > expert_avg else R}{rl_avg:+.1f}{RST} | "
                         f"{'RL WINNING' if rl_avg > expert_avg else 'Expert still better'}"
                     )
 
@@ -2172,10 +2287,21 @@ def main():
             if t <= demo_steps:
                 expert.reset_episode()
 
+            if os.path.exists(federated_path):
+                try:
+                    agent.load_weights(federated_path)
+                    os.remove(federated_path)
+                    ros.get_logger().info(f"{B}[FED]{RST} merged weights loaded from {federated_path}")
+                except Exception as e:
+                    ros.get_logger().warn(f"{Y}[FED] could not load {federated_path}: {e}{RST}")
+
             save_weights_only(t, label="episode")
-            if t - last_replay_save_step >= args.save_every:
+            episodes_since_replay_save += 1
+            if (t - last_replay_save_step >= args.save_every
+                    or episodes_since_replay_save >= REPLAY_SAVE_EVERY_EPISODES):
                 save_replay_buffer()
                 last_replay_save_step = t
+                episodes_since_replay_save = 0
                 ros.get_logger().info(
                     f"[CKPT] {G}✓ replay buffer saved{RST} step={t} count={replay.count}"
                 )
@@ -2184,7 +2310,6 @@ def main():
         if t == demo_steps:
             expert_avg = expert.get_avg_return()
             env._expert_avg_return = expert_avg
-            env._current_training_phase = "RANDOM_EXPLORE"
             ros.get_logger().info(
                 f"\n{G}{'='*50}\n  EXPERT DEMO PHASE COMPLETE\n{'='*50}{RST}\n"
                 f"  Expert episodes: {expert.total_episodes}\n"
@@ -2195,7 +2320,6 @@ def main():
                 f"{G}{'='*50}{RST}"
             )
         elif t == demo_steps + args.start_steps:
-            env._current_training_phase = "RL_POLICY"
             ros.get_logger().info(
                 f"\n{G}{'='*50}\n  RL POLICY NOW ACTIVE\n{'='*50}{RST}\n"
                 f"  Expert baseline avg return: {expert.get_avg_return():+.1f}\n"

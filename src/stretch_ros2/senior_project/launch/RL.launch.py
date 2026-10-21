@@ -125,7 +125,10 @@ def generate_launch_description():
         DeclareLaunchArgument("eval_every_steps", default_value="3000")
     )
     ld.add_action(
-        DeclareLaunchArgument("eval_episodes", default_value="10")
+        DeclareLaunchArgument(
+            "eval_episodes", default_value="0",
+            description="N > 0: evaluate the saved policy for N episodes instead of training",
+        )
     )
 
     # --- Sim args ---
@@ -292,8 +295,6 @@ def generate_launch_description():
             LaunchConfiguration("ns"),
             "--total-steps",
             LaunchConfiguration("total_steps"),
-            "--rollout-steps",
-            LaunchConfiguration("rollout_steps"),
             "--ckpt-dir",
             LaunchConfiguration("ckpt_dir"),
             "--load-ckpt",
@@ -306,19 +307,10 @@ def generate_launch_description():
             LaunchConfiguration("lidar_topic"),
             "--imu-topic",
             LaunchConfiguration("imu_topic"),
-            "--use-obstacle",
-            LaunchConfiguration("use_obstacle"),
             "--goal-topic",
             LaunchConfiguration("goal_topic"),
-            "--eval-every-steps",
-            LaunchConfiguration("eval_every_steps"),
             "--eval-episodes",
             LaunchConfiguration("eval_episodes"),
-            # NEW: Pass hard reset arguments
-            "--episode-num",
-            LaunchConfiguration("episode_num"),
-            "--models-dir",
-            LaunchConfiguration("models_dir"),
         ],
         output="screen",
         condition=IfCondition(LaunchConfiguration("run_rl")),
