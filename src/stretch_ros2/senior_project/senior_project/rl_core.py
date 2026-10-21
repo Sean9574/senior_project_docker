@@ -171,6 +171,16 @@ class GoalCurriculum:
 # Training phase
 # =============================================================================
 
+# Episodes that move the goal curriculum: the controller being measured.
+# Expert-demo and random-exploration episodes must not push goals out before
+# the policy acts; eval runs pin the curriculum.
+CURRICULUM_PHASES = ("RL_POLICY", "EXPERT_BASELINE")
+
+
+def counts_for_curriculum(phase: str) -> bool:
+    return phase in CURRICULUM_PHASES
+
+
 def phase_for_step(t: int, demo_steps: int, start_steps: int) -> str:
     """Phase label for global step t (also correct for resumed runs)."""
     if t <= demo_steps:

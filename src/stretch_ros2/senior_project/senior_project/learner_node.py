@@ -40,7 +40,7 @@ import rclpy
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from geometry_msgs.msg import Point, PointStamped, Twist
+from geometry_msgs.msg import Point, PointStamped, PoseStamped, Twist
 from gymnasium import spaces
 from nav_msgs.msg import OccupancyGrid, Odometry
 from rclpy.executors import SingleThreadedExecutor
@@ -1023,6 +1023,9 @@ class StretchRosInterface(Node):
         self.create_subscription(LaserScan, scan_name, self._scan_cb, qos_profile_sensor_data)
         self.create_subscription(Imu, imu_name, self._imu_cb, 10)
         self.create_subscription(PointStamped, goal_name, self._goal_cb, 10)
+        # RViz "2D Goal Pose" publishes PoseStamped; RL.launch remaps it here
+        goal_pose_name = make_topic("goal_pose")
+        self.create_subscription(PoseStamped, goal_pose_name, self._goal_pose_cb, 10)
 
         self.cmd_pub = self.create_publisher(Twist, cmd_name, 10)
         self.reward_pub = self.create_publisher(Float32, "/reward", 10)
@@ -1116,6 +1119,14 @@ class StretchRosInterface(Node):
         )
 
     def _imu_cb(self, msg): self.last_imu = msg
+
+    def _goal_pose_cb(self, msg: PoseStamped):
+        goal = PointStamped()
+        goal.header = msg.header
+        goal.point.x = msg.pose.position.x
+        goal.point.y = msg.pose.position.y
+        self._goal_cb(goal)
+
     def _goal_cb(self, msg):
         if not self.accept_topic_goals:
             return
@@ -1442,7 +1453,8 @@ class StretchExploreEnv(gym.Env):
         done = terminated or truncated
         outcome = ("success" if success else "timeout") if done else ""
 
-        if done and self.goal_source == "random":
+        if (done and self.goal_source == "random"
+                and rl_core.counts_for_curriculum(self._current_training_phase)):
             self.curriculum.record(success)
 
         info = {
@@ -2064,6 +2076,7 @@ def main():
     G = "\033[92m"; R = "\033[91m"; Y = "\033[93m"; B = "\033[94m"; W = "\033[97m"; RST = "\033[0m"
 
     resume_step = 0
+    weights_loaded = False
     replay_path = os.path.join(args.ckpt_dir, "replay_buffer.npz")
 
     if (AUTO_LOAD_CHECKPOINT or args.load_ckpt) and os.path.exists(load_path):
@@ -2071,6 +2084,7 @@ def main():
         ros.get_logger().info(f"[CKPT] Found checkpoint {load_path} ({file_size_mb:.1f} MB) — loading...")
         try:
             training_state = agent.load(load_path, strict=False)
+            weights_loaded = True
             ros.get_logger().info(f"[CKPT] {G}✓ Network weights loaded{RST}")
 
             if training_state is not None:
@@ -2165,6 +2179,13 @@ def main():
             rclpy.shutdown()
         except: pass
         sys.exit(0)
+
+    if eval_mode and not weights_loaded:
+        # Evaluating random weights would write a plausible-looking CSV
+        ros.get_logger().error(f"{R}[EVAL] No trained weights at {load_path} — refusing to evaluate{RST}")
+        try: ros.send_cmd(0.0, 0.0)
+        except: pass
+        sys.exit(1)
 
     if eval_mode:
         signal.signal(signal.SIGINT, shutdown_without_saving)

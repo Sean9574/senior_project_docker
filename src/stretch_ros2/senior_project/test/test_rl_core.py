@@ -225,3 +225,15 @@ def test_phase_for_step(t, want):
 
 def test_phase_with_no_demo_or_random_steps_is_rl():
     assert rl_core.phase_for_step(1, 0, 0) == "RL_POLICY"
+
+
+@pytest.mark.parametrize("phase, counts", [
+    ("EXPERT_DEMO", False),
+    ("RANDOM_EXPLORE", False),
+    ("EVAL", False),
+    ("RL_POLICY", True),
+    ("EXPERT_BASELINE", True),
+])
+def test_curriculum_counts_only_the_controller_being_measured(phase, counts):
+    # Demo/random episodes must not push goals out before the policy acts
+    assert rl_core.counts_for_curriculum(phase) is counts

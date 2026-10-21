@@ -207,8 +207,9 @@ def generate_launch_description():
             output="screen",
             arguments=[],
             remappings=[
-                ("/move_base_simple/goal", ["/", LaunchConfiguration("ns"), "/goal"]),
-                ("/goal_pose", ["/", LaunchConfiguration("ns"), "/goal"]),
+                # PoseStamped goals; the learner converts them (goal_source:=topic)
+                ("/move_base_simple/goal", ["/", LaunchConfiguration("ns"), "/goal_pose"]),
+                ("/goal_pose", ["/", LaunchConfiguration("ns"), "/goal_pose"]),
             ],
             condition=IfCondition(PythonExpression([
                 "'", LaunchConfiguration("use_rviz"), "' == 'true' and '",

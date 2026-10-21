@@ -79,6 +79,17 @@ SYNC_CSV_COLUMNS = [
 EXPERT_PHASES = ("EXPERT_DEMO", "EXPERT_BASELINE")
 NON_RL_PHASES = EXPERT_PHASES + ("EVAL",)
 
+def domains_to_scan(start: int, end: int, env_domain: Optional[str]) -> List[int]:
+    """Scan range plus the monitor's own ROS_DOMAIN_ID (unset = 0), so a run on
+    a domain outside the range still shows up instead of an empty dashboard."""
+    try:
+        own = int(env_domain) if env_domain else 0
+    except ValueError:
+        own = 0
+    domains = list(range(start, end + 1))
+    return domains if own in domains else [own] + domains
+
+
 def _open_csv_append(path: str, columns: List[str]):
     """Open a CSV for appending; write the header only if the file is new/empty."""
     new_file = not os.path.exists(path) or os.path.getsize(path) == 0
@@ -717,7 +728,8 @@ class MultiDomainManager:
     def discover_domains(self, start: int, end: int) -> List[int]:
         discovered = []
         with ThreadPoolExecutor(max_workers=10) as ex:
-            results = list(ex.map(self._scan_domain_topics, range(start, end + 1)))
+            results = list(ex.map(self._scan_domain_topics,
+                                  domains_to_scan(start, end, os.environ.get("ROS_DOMAIN_ID"))))
         for did, has_reward, image_topics in results:
             if image_topics:
                 self.domain_image_topics[did] = image_topics

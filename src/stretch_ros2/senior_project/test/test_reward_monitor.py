@@ -124,3 +124,10 @@ def test_sync_monitor_reads_status_json_without_torch(tmp_path):
     with open(exp_dir / "sync_events.csv", newline="") as f:
         rows = list(csv.DictReader(f))
     assert [r["sim_steps"] for r in rows] == ["[500, 700]"]
+
+
+def test_monitor_always_scans_its_own_domain():
+    assert rm.domains_to_scan(90, 100, "5") == [5] + list(range(90, 101))
+    assert rm.domains_to_scan(90, 100, "95") == list(range(90, 101))
+    assert rm.domains_to_scan(90, 100, None) == [0] + list(range(90, 101))
+    assert rm.domains_to_scan(90, 100, "") == [0] + list(range(90, 101))
