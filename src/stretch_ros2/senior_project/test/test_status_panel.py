@@ -102,3 +102,17 @@ def test_summary_is_a_single_line():
     s.on_breakdown(_bd(done=True, success=True, goal_seen=True), 1.0)
     line = summary_line(s, 2.0)
     assert "\n" not in line and "RL_POLICY" in line and "success" in line
+
+
+def test_colour_codes_in_node_logs_do_not_reach_the_panel():
+    s = _state()
+    s.on_log(30, "learner", "\x1b[93mNo replay buffer\x1b[0m", 1.0)
+    out = _text(s, 2.0)
+    assert "\x1b" not in out and "No replay buffer" in out
+
+
+def test_learner_that_never_reports_gets_a_hint():
+    s = _state()  # started_at=0
+    assert "crashed" not in _text(s, 30.0)
+    out = _text(s, 120.0)
+    assert "2m00s" in out and "crashed" in out

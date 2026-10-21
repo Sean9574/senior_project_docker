@@ -9,10 +9,13 @@ from launch.actions import (
     DeclareLaunchArgument,
     ExecuteProcess,
     OpaqueFunction,
+    RegisterEventHandler,
+    Shutdown,
     LogInfo,
     TimerAction,
 )
 from launch.conditions import IfCondition
+from launch.event_handlers import OnProcessExit
 from launch.substitutions import LaunchConfiguration, PathJoinSubstitution, PythonExpression
 from launch_ros.actions import Node
 
@@ -168,7 +171,8 @@ def _launch_setup(context):
     # other process writes to its log file under $ROS_LOG_DIR instead
     panel = (LaunchConfiguration("status_panel").perform(context) == "true"
              and LaunchConfiguration("run_rl").perform(context) == "true")
-    out = "log" if panel else "screen"
+    # dict form: plain "log" still sends stderr (where ROS logs go) to the screen
+    out = {"both": "log"} if panel else "screen"
 
     # --- Load URDF and rewrite mesh paths ---
     robot_description_file = Path(
@@ -344,6 +348,12 @@ def _launch_setup(context):
     )
 
     if panel:
+        # Learner gone (crashed or finished): stop the launch so its exit
+        # message stays on screen instead of being wiped by the next redraw
+        actions.append(RegisterEventHandler(OnProcessExit(
+            target_action=learner_proc,
+            on_exit=[Shutdown(reason="learner exited -- full node logs are in $ROS_LOG_DIR")],
+        )))
         actions.append(
             ExecuteProcess(
                 cmd=[

@@ -176,7 +176,8 @@ def _configure_launch(context):
 
     actions = []
     # With the status panel on, these processes log to files instead of the terminal
-    out = "log" if LaunchConfiguration("status_panel").perform(context) == "true" else "screen"
+    # dict form: plain "log" still sends stderr (where ROS logs go) to the screen
+    out = {"both": "log"} if LaunchConfiguration("status_panel").perform(context) == "true" else "screen"
 
     # URLs
     sam3_url = f"http://{sam3_host}:{sam3_port}"

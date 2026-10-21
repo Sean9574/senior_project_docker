@@ -483,6 +483,7 @@ class SAM3GoalGeneratorV2(Node):
     def set_sam3_prompt(self, target: str, timeout_s: float = 15.0):
         """Send the prompt and confirm the server echoes it back; retries while
         the server is starting. Logs an error (not a fake success) on failure."""
+        self._prompt_confirmed = False  # panel shows the new prompt as unconfirmed until echoed
         self.get_logger().info(f'Setting SAM3 prompt to "{target}" (waiting up to {timeout_s:.0f}s for the server)')
         ok = send_prompt(lambda url: self.session.post(url, timeout=5), self.server_url, target, timeout_s)
         self._prompt_confirmed = ok

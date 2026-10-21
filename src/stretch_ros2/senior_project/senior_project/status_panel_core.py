@@ -6,6 +6,7 @@ status_panel.py feeds it ROS messages; this module only keeps the numbers and
 turns them into text, so it is unit-tested without ROS (test/test_status_panel.py).
 """
 
+import re
 import time
 from collections import deque
 from typing import Deque, List, Optional, Tuple
@@ -16,6 +17,8 @@ WINDOW_EPISODES = 20      # success / seen / return statistics
 MAX_ALERTS = 3
 
 LEVEL_NAMES = {30: "WARN", 40: "ERROR", 50: "FATAL"}  # rcl_interfaces/Log levels
+NO_DATA_HINT_AFTER_S = 90.0   # learner never reported -> probably crashed at startup
+ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 
 
 def _duration(seconds: float) -> str:
@@ -104,6 +107,7 @@ class PanelState:
     def on_log(self, level: int, node: str, msg: str, now: float) -> None:
         if level < 30:
             return
+        msg = ANSI.sub("", msg)  # node colour codes would bleed through the panel
         for alert in self.alerts:
             if alert[2] == node and alert[3] == msg:
                 alert[0], alert[4] = now, alert[4] + 1
@@ -159,7 +163,10 @@ def render(state: PanelState, now: float, width: int = 80) -> List[str]:
              f"up {_clock(now - state.started_at)}", rule]
 
     if state.last_breakdown_t is None:
-        lines.append(" Phase    waiting for the learner to start...")
+        waited = now - state.started_at
+        lines.append(f" Phase    waiting for the learner to start... {_duration(waited)}")
+        if waited > NO_DATA_HINT_AFTER_S:
+            lines.append(" !!       no data yet -- the learner may have crashed, check the logs")
     else:
         lines.append(f" Phase    {state.phase or '?':<11} {_progress(state)}")
         lines.append(f"          {_eta(state)}")
