@@ -1,31 +1,24 @@
 #!/usr/bin/env python3
 """
-Stretch Robot RL Environment + Learner — v5 (NEVER TERMINATE ON COLLISION)
+Stretch Robot RL Environment + Learner — v6 (LEARNABLE GOAL-REACHING)
 
-KEY INSIGHT: termination on collision teaches the agent that NOT MOVING is safest.
-The expected value of spinning (no collision risk) exceeds the expected value of
-exploring (collision risk → episode ends → lose all future reward).
+Collisions still never terminate (v5 insight: terminating on collision teaches
+the agent that not moving is safest). v6 makes the task learnable:
 
-FIX: collisions NEVER terminate. They're just a -5 bump + cooldown. The agent
-bumps a wall, eats -5, and keeps exploring. Proximity penalty teaches gradual
-avoidance. Discovery reward (+5/cell) massively dominates all penalties.
-
-ACTION SPACE (context-aware):
-- Explore mode: a[0] maps V_MIN_FORWARD → V_MAX (always moving, can't spin)
-- Goal mode:    a[0] maps 0 → V_MAX (can stop at target)
-- a[1] = steering, coupled to speed via turn radius
-
-REWARDS (exploration-dominant):
-- Explore: discovery(+5/cell) + revisit(-2.0) + step(-0.3)  → exploring >> spinning
-- Avoid:   proximity(-3.0) + bump(-5.0 with cooldown)       → learn to steer away
-- Goal:    ratchet_progress(+400) + step(-2.5)               → shortest path
-- NEVER terminate on collision. Only goal_reached and timeout end episodes.
-
-MATH (per step):
-- Spinning:              -0.3 - 2.0           = -2.3/step
-- Exploring (5 cells):   -0.3 + 0 + 25.0      = +24.7/step
-- Wall-stuck:            -0.3 - 2.0 - 3.0 - 0.6 = -5.9/step
-- Explore w/ 20% crash:  0.8*(+24.7)+0.2*(-5) = +18.8/step >> spinning
+- GOALS: by default every episode gets a random goal the lidar can see
+  (rl_core.sample_goal), 1 m to curriculum.d_max away. d_max grows 1.5 m -> 4 m
+  as the success rate rises (rl_core.GoalCurriculum). --goal-source topic keeps
+  the SAM3 / RViz goal topic instead.
+- REWARDS are O(1) so TD targets stay small:
+    goal:     +10 on arrival, +1 per metre of progress (signed, potential-based),
+              -0.01 per step
+    avoid:    -1 bump (cooldown), proximity down to -0.05 per step at contact
+    explore:  discovery(+0.05/cell) + revisit(-0.02) + step(-0.003)
+  No timeout penalty, and timeouts are NOT terminal in the replay buffer.
+- MOTION matches the real Stretch base: v <= 0.3 m/s, |w| <= 1.0 rad/s.
+  Goal mode can stop and pivot; explore mode always moves forward.
+- LIDAR: MuJoCo misses (-1) read as max range, real contact reads as
+  range_min (not 20 m), self-hit beams are masked at the reset pose.
 """
 
 import argparse
@@ -59,6 +52,8 @@ from std_msgs.msg import String as StringMsg
 from std_srvs.srv import Trigger
 from visualization_msgs.msg import Marker, MarkerArray
 
+from senior_project import rl_core
+
 # =============================================================================
 # ROBOT PHYSICAL PARAMETERS
 # =============================================================================
@@ -79,28 +74,27 @@ ZONE_DANGER = 0.45
 ZONE_EMERGENCY = 0.30
 
 # =============================================================================
-# REWARD SYSTEM — v5 (NEVER TERMINATE ON COLLISION)
+# REWARD SYSTEM — v6 (O(1) SCALE, NEVER TERMINATE ON COLLISION)
 # =============================================================================
 
 # --- Collision (NEVER terminates) ---
-R_COLLISION = -5.0
+R_COLLISION = -1.0
 COLLISION_COOLDOWN_STEPS = 8
 
-R_GOAL = 2000.0
-R_TIMEOUT = -50.0
+R_GOAL = 10.0
 GOAL_RADIUS = 0.45
 
-# --- Goal-seeking ---
-PROGRESS_SCALE = 400.0
-STEP_COST_GOAL = -2.5
+# --- Goal-seeking (potential-based progress, per metre) ---
+PROGRESS_SCALE = 1.0
+STEP_COST_GOAL = -0.01
 
 # --- Exploration (discovery-dominant) ---
-R_NEW_CELL = 5.0
-R_STEP_EXPLORE = -0.3
-R_REVISIT = -2.0
+R_NEW_CELL = 0.05
+R_STEP_EXPLORE = -0.003
+R_REVISIT = -0.02
 
 # --- Obstacle avoidance (continuous, never terminates) ---
-R_PROXIMITY = -3.0
+R_PROXIMITY = -0.05
 PROXIMITY_THRESHOLD = 0.65
 
 # =============================================================================
@@ -117,15 +111,20 @@ GRID_SIZE = 16
 GRID_RESOLUTION = 0.75
 GRID_MAX_RANGE = 12.0
 
-# Movement Limits — MINIMUM VELOCITY
-V_MAX = 1.0
-V_MIN_FORWARD = 0.15
-W_MAX = 3.0
-V_MIN_REVERSE = -0.05
-MIN_TURN_RADIUS = 0.40
+# Movement limits live in rl_core (real Stretch base limits)
+V_MAX = rl_core.V_MAX
+W_MAX = rl_core.W_MAX
+V_MIN_FORWARD = rl_core.V_MIN_FORWARD
+MIN_TURN_RADIUS = rl_core.MIN_TURN_RADIUS
 
 # Velocity smoothing
 CMD_SMOOTHING_ALPHA = 0.75
+
+# Step timing: after control_dt, wait up to this long for post-command sensor data
+FRESH_DATA_TIMEOUT = 0.3
+
+# A topic goal that jumps farther than this re-baselines progress
+GOAL_MOVED_RESET_M = 0.5
 
 # PER Config
 PER_ALPHA = 0.6
@@ -141,6 +140,7 @@ NOVELTY_RADIUS = 1.0
 LIDAR_FORWARD_OFFSET_RAD = math.pi
 NUM_LIDAR_BINS = 36
 LIDAR_MAX_RANGE = 20.0
+LIDAR_OBS_RANGE = 4.0  # observation scale: near field matters, far field saturates
 
 # Training defaults
 DEFAULT_START_STEPS = 5000
@@ -322,7 +322,9 @@ class ExpertStateMachine:
       TURN_TO_GOAL   — goal visible, steer toward it
       AVOID_LEFT     — obstacle on right or ahead, turn left
       AVOID_RIGHT    — obstacle on left or ahead, turn right
-      BACK_UP        — too close everywhere, reverse briefly
+      BACK_UP        — too close: pivot toward open space (the action space has
+                       no reverse, so a[0] = -1 means "stop" in goal mode and
+                       "slowest forward" in explore mode)
     
     The state machine's rewards are tracked separately so you can compare
     when the RL agent surpasses the expert baseline.
@@ -421,10 +423,9 @@ class ExpertStateMachine:
 
         # --- Action generation ---
         if self.state == self.State.BACK_UP:
-            # Reverse slowly, turn toward open space
-            a_vel = -1.0  # maps to minimum/reverse velocity
-            turn = 0.5 if left > right else -0.5
-            a_steer = np.clip(turn, -1.0, 1.0)
+            # Pivot hard toward open space at minimum speed
+            a_vel = -1.0
+            a_steer = 1.0 if left > right else -1.0
 
         elif self.state == self.State.AVOID_LEFT:
             # Slow down, turn left (positive steering)
@@ -887,7 +888,12 @@ class EgoOccupancyGrid:
         }
 
     def reset(self):
+        # Full reset each episode: discovery/revisit rewards must depend only on
+        # this episode, otherwise the same state pays differently per episode.
         self.grid.fill(0.0)
+        self.world_grid.clear()
+        self.visit_counts.clear()
+        self.total_cells_discovered = 0
         self.cells_discovered_this_step = 0
 
     def get_occupancy_grid_msg(self, frame_id: str = "odom") -> OccupancyGrid:
@@ -991,6 +997,9 @@ class StretchRosInterface(Node):
         self._target_was_lost: bool = False
         self._lost_time: float = 0.0
         self.last_imu: Optional[Imu] = None
+        self.accept_topic_goals: bool = True
+        self.self_mask: Optional[np.ndarray] = None
+        self._last_raw_ranges: Optional[np.ndarray] = None
 
         def make_topic(topic: str) -> str:
             if topic.startswith("/"): return topic
@@ -1078,9 +1087,34 @@ class StretchRosInterface(Node):
         self.safety_zone_pub.publish(marker)
 
     def _odom_cb(self, msg): self.last_odom = msg
-    def _scan_cb(self, msg): self.last_scan = msg
+    def _scan_cb(self, msg):
+        # Clean once at the source so every consumer sees ranges in
+        # [range_min, range_max]: miss -> max, contact -> range_min, self-hit -> max.
+        self._last_raw_ranges = np.array(msg.ranges, dtype=np.float32)
+        msg.ranges = rl_core.clean_ranges(
+            self._last_raw_ranges, msg.range_min, msg.range_max, self.self_mask
+        ).tolist()
+        self.last_scan = msg
+
+    def calibrate_self_mask(self, timeout: float = 2.0):
+        """Mask beams that hit the robot's own body. Call at the reset pose,
+        where no obstacle can be closer than range_min."""
+        old_scan = self.last_scan
+        start = time.time()
+        while self.last_scan is old_scan and time.time() - start < timeout:
+            rclpy.spin_once(self, timeout_sec=0.05)
+        if self._last_raw_ranges is None or self.last_scan is None:
+            self.get_logger().warn("[LIDAR] No scan for self-mask calibration")
+            return
+        self.self_mask = rl_core.compute_self_mask(self._last_raw_ranges, self.last_scan.range_min)
+        self.get_logger().info(
+            f"[LIDAR] Self-mask: {int(self.self_mask.sum())}/{len(self.self_mask)} beams hit the robot body"
+        )
+
     def _imu_cb(self, msg): self.last_imu = msg
     def _goal_cb(self, msg):
+        if not self.accept_topic_goals:
+            return
         if self._target_was_lost and self.last_goal is None:
             self._target_was_lost = False
         self.last_goal = msg
@@ -1152,10 +1186,17 @@ class StretchExploreEnv(gym.Env):
     Simplified observation, simplified rewards, cached expensive computations.
     """
 
-    def __init__(self, ros: StretchRosInterface, control_dt: float = 0.1):
+    def __init__(self, ros: StretchRosInterface, control_dt: float = 0.1,
+                 goal_source: str = "random", rng: Optional[np.random.Generator] = None,
+                 curriculum: Optional[rl_core.GoalCurriculum] = None):
         super().__init__()
         self.ros = ros
         self.control_dt = control_dt
+        self.goal_source = goal_source
+        self.rng = rng if rng is not None else np.random.default_rng()
+        self.curriculum = curriculum if curriculum is not None else rl_core.GoalCurriculum()
+        self.ros.accept_topic_goals = (goal_source == "topic")
+        self._self_mask_calibrated = False
 
         self.navigator = DynamicNavigator(num_sectors=36)
         self.occ_grid = EgoOccupancyGrid()
@@ -1180,8 +1221,13 @@ class StretchExploreEnv(gym.Env):
         self._cached_frontier_angle = 0.0
         self._cached_new_cells = 0
 
-        # Ratchet progress for goal-seeking
-        self._best_goal_dist = float('inf')
+        # Goal tracking: progress is measured from the first step a goal exists
+        self._goal_tracked = False
+        self._last_goal_xy: Optional[Tuple[float, float]] = None
+
+        # Wall-clock step timing (sim runs asynchronously from the learner)
+        self._last_step_wall: Optional[float] = None
+        self._dt_hist: deque = deque(maxlen=DEBUG_EVERY_N)
 
         # Training phase tracking (published in reward breakdown)
         self._current_training_phase = "EXPERT_DEMO"
@@ -1224,14 +1270,16 @@ class StretchExploreEnv(gym.Env):
         self._collision_cooldown = 0
         self._cached_frontier_angle = 0.0
         self._cached_new_cells = 0
-        self._best_goal_dist = float('inf')
+        self._last_step_wall = None
+
+        if not self._self_mask_calibrated:
+            self.ros.calibrate_self_mask()
+            self._self_mask_calibrated = True
 
         st = self._get_robot_state()
         self._last_pos = (st["x"], st["y"])
 
         self.occ_grid.reset()
-        if not sim_was_reset:
-            self.occ_grid.decay_visits()
 
         self._goals_reached_this_episode = 0
         self.ros.last_goal = None
@@ -1242,8 +1290,11 @@ class StretchExploreEnv(gym.Env):
         self.ros._last_known_target_time = 0.0
         self.ros.path_history.clear()
 
+        if self.goal_source == "random":
+            self._spawn_random_goal()
+        self._goal_tracked = self.ros.last_goal is not None
+        self._last_goal_xy = self._current_goal_xy()
         self.prev_goal_dist = self._goal_distance()
-        self._best_goal_dist = self.prev_goal_dist if self.prev_goal_dist > 0 else float('inf')
 
         if self.ros.last_scan is not None:
             self.last_nav_state = self.navigator.analyze_scan(self.ros.last_scan)
@@ -1258,25 +1309,27 @@ class StretchExploreEnv(gym.Env):
         a = np.clip(action, -1.0, 1.0)
 
         has_goal_for_velocity = self.ros.last_goal is not None
-        if has_goal_for_velocity:
-            rl_v = (float(a[0]) + 1.0) * 0.5 * V_MAX
-        else:
-            rl_v = V_MIN_FORWARD + (float(a[0]) + 1.0) * 0.5 * (V_MAX - V_MIN_FORWARD)
-
-        if rl_v > 0.05:
-            w_limit = min(rl_v / MIN_TURN_RADIUS, W_MAX)
-        else:
-            w_limit = 0.5
-        rl_w = float(a[1]) * w_limit
+        rl_v, rl_w = rl_core.map_action(a, has_goal_for_velocity)
 
         self._smooth_v = CMD_SMOOTHING_ALPHA * rl_v + (1.0 - CMD_SMOOTHING_ALPHA) * self._smooth_v
         self._smooth_w = CMD_SMOOTHING_ALPHA * rl_w + (1.0 - CMD_SMOOTHING_ALPHA) * self._smooth_w
 
         self.ros.send_cmd(self._smooth_v, self._smooth_w)
+        cmd_odom, cmd_scan = self.ros.last_odom, self.ros.last_scan
 
         t_end = time.time() + self.control_dt
         while time.time() < t_end:
             rclpy.spin_once(self.ros, timeout_sec=0.01)
+        # Don't act on readings from before the command: wait (bounded) for new ones
+        t_fresh = time.time() + FRESH_DATA_TIMEOUT
+        while ((self.ros.last_odom is cmd_odom or self.ros.last_scan is cmd_scan)
+               and time.time() < t_fresh):
+            rclpy.spin_once(self.ros, timeout_sec=0.01)
+
+        now = time.time()
+        dt = (now - self._last_step_wall) if self._last_step_wall is not None else self.control_dt
+        self._last_step_wall = now
+        self._dt_hist.append(dt)
 
         st = self._get_robot_state()
         scan = self.ros.last_scan
@@ -1320,6 +1373,14 @@ class StretchExploreEnv(gym.Env):
         has_goal = self.ros.last_goal is not None
         d_goal = self._goal_distance()
 
+        # Topic goals can appear or jump mid-episode: re-baseline progress then,
+        # so the first step after a new goal earns 0 progress (no inf / spikes).
+        goal_xy = self._current_goal_xy()
+        if has_goal and (not self._goal_tracked or self._goal_moved(goal_xy)):
+            self.prev_goal_dist = d_goal
+            self._goal_tracked = True
+        self._last_goal_xy = goal_xy
+
         if has_goal and d_goal <= GOAL_RADIUS and not terminated:
             terminated = True
             success = True
@@ -1335,10 +1396,9 @@ class StretchExploreEnv(gym.Env):
             reached_msg.point.z = 0.0
             self.ros.goal_reached_pub.publish(reached_msg)
 
+        # Timeout is a time limit, not a failure state: no penalty, and the
+        # learner bootstraps through it (only `terminated` is stored as done).
         truncated = self.step_count >= self.max_steps
-        if truncated and not terminated:
-            reward += R_TIMEOUT
-            reward_terms["timeout"] = R_TIMEOUT
 
         if not terminated and not truncated:
             self._last_pos = (st["x"], st["y"])
@@ -1350,12 +1410,7 @@ class StretchExploreEnv(gym.Env):
                 reward_terms["proximity"] = r_proximity
 
             if has_goal:
-                if d_goal < self._best_goal_dist:
-                    ratchet_progress = self._best_goal_dist - d_goal
-                    r_progress = PROGRESS_SCALE * ratchet_progress
-                    self._best_goal_dist = d_goal
-                else:
-                    r_progress = 0.0
+                r_progress = rl_core.goal_progress_reward(self.prev_goal_dist, d_goal, PROGRESS_SCALE)
 
                 reward_terms["progress"] = r_progress
                 reward += r_progress
@@ -1381,8 +1436,15 @@ class StretchExploreEnv(gym.Env):
         self.step_count += 1
 
         done = terminated or truncated
+        outcome = ("success" if success else "timeout") if done else ""
+
+        if done and self.goal_source == "random":
+            self.curriculum.record(success)
 
         info = {
+            "done": done,
+            "outcome": outcome,
+            "dt": dt,
             "collision": collision,
             "success": success,
             "exploring": not has_goal,
@@ -1408,8 +1470,8 @@ class StretchExploreEnv(gym.Env):
                 f"Return {ret_color}{self.episode_return:+.1f}\033[0m | Steps {self.step_count} | "
                 f"Cells {stats['total_discovered']} | Goals {self._goals_reached_this_episode} | "
                 f"MinDist {min_dist:.2f}m"
+                + (f" | GoalMax {self.curriculum.d_max:.1f}m" if self.goal_source == "random" else "")
             )
-            self.episode_index += 1
         elif collision and self._collision_cooldown == COLLISION_COOLDOWN_STEPS:
             self.ros.get_logger().info(
                 f"\033[93m[BUMP]\033[0m step={self.step_count} min_d={min_dist:.2f}m "
@@ -1419,12 +1481,18 @@ class StretchExploreEnv(gym.Env):
         if self.step_count % DEBUG_EVERY_N == 0:
             mode = "GOAL" if has_goal else "EXPLORE"
             goal_info = f"goal_dist={d_goal:.2f}m " if has_goal else ""
+            dts = np.array(self._dt_hist) if self._dt_hist else np.array([dt])
             self.ros.get_logger().info(
                 f"[{mode}] step={self.step_count} min_d={min_dist:.2f}m "
-                f"{goal_info}cmd=[{self._smooth_v:.2f},{self._smooth_w:.2f}] r={reward:.2f}"
+                f"{goal_info}cmd=[{self._smooth_v:.2f},{self._smooth_w:.2f}] r={reward:.2f} "
+                f"dt_mean={dts.mean():.3f}s dt_max={dts.max():.3f}s"
             )
 
+        # Publish BEFORE advancing the episode index so the terminal step is
+        # reported under the episode it ended (the monitor relies on this).
         self._publish_reward_breakdown(reward, info, has_goal)
+        if done:
+            self.episode_index += 1
 
         if PUBLISH_MAP and self.step_count % PUBLISH_MAP_EVERY_N == 0:
             self._publish_visualization(st, nav_state)
@@ -1478,7 +1546,7 @@ class StretchExploreEnv(gym.Env):
         goal = self.ros.last_goal
 
         lidar_bins = self._get_lidar_bins()
-        lidar_norm = np.clip(lidar_bins / LIDAR_MAX_RANGE, 0.0, 1.0)
+        lidar_norm = np.clip(lidar_bins / LIDAR_OBS_RANGE, 0.0, 1.0)
 
         if goal is not None:
             dx = goal.point.x - st["x"]
@@ -1566,6 +1634,44 @@ class StretchExploreEnv(gym.Env):
         ang_world = math.atan2(goal.point.y - st["y"], goal.point.x - st["x"])
         return wrap_to_pi(ang_world - st["yaw"])
 
+    def _current_goal_xy(self) -> Optional[Tuple[float, float]]:
+        goal = self.ros.last_goal
+        return (goal.point.x, goal.point.y) if goal is not None else None
+
+    def _goal_moved(self, goal_xy: Optional[Tuple[float, float]]) -> bool:
+        if goal_xy is None or self._last_goal_xy is None:
+            return False
+        return math.hypot(goal_xy[0] - self._last_goal_xy[0],
+                          goal_xy[1] - self._last_goal_xy[1]) > GOAL_MOVED_RESET_M
+
+    def _spawn_random_goal(self):
+        """Random goal the lidar can see, curriculum-limited distance (odom frame)."""
+        scan = self.ros.last_scan
+        st = self._get_robot_state()
+        if scan is not None and len(scan.ranges) > 0:
+            ranges = np.asarray(scan.ranges, dtype=np.float32)
+            angle_min, angle_inc = scan.angle_min, scan.angle_increment
+        else:
+            ranges = np.full(360, LIDAR_MAX_RANGE, dtype=np.float32)
+            angle_min, angle_inc = 0.0, 2 * math.pi / 360
+        gx, gy, dist = rl_core.sample_goal(
+            self.rng, ranges, angle_min, angle_inc, LIDAR_FORWARD_OFFSET_RAD,
+            st["x"], st["y"], st["yaw"],
+            d_min=self.curriculum.d_min, d_max=self.curriculum.d_max,
+        )
+        goal = PointStamped()
+        goal.header.stamp = self.ros.get_clock().now().to_msg()
+        goal.header.frame_id = "odom"
+        goal.point.x = float(gx)
+        goal.point.y = float(gy)
+        self.ros.last_goal = goal
+        self.ros._last_goal_time = time.time()
+        self.ros._last_known_target_pos = (float(gx), float(gy))
+        self.ros._last_known_target_time = time.time()
+        self.ros.get_logger().info(
+            f"[GOAL] ({gx:+.2f}, {gy:+.2f}) dist={dist:.2f}m (curriculum max {self.curriculum.d_max:.1f}m)"
+        )
+
     def _publish_reward_breakdown(self, reward: float, info: Dict, has_goal: bool):
         self.ros.reward_pub.publish(Float32(data=float(reward)))
         st = self._get_robot_state()
@@ -1575,6 +1681,10 @@ class StretchExploreEnv(gym.Env):
             "mode": "goal" if has_goal else "explore",
             "reward": float(reward),
             "reward_terms": info.get("reward_terms", {}),
+            "done": info.get("done", False),
+            "outcome": info.get("outcome", ""),
+            "dt": info.get("dt", self.control_dt),
+            "curriculum_d_max": self.curriculum.d_max,
             "collision": info.get("collision", False),
             "success": info.get("success", False),
             "goals_reached": self._goals_reached_this_episode,
