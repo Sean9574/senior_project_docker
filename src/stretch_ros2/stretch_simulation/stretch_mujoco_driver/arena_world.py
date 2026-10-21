@@ -61,7 +61,7 @@ class ArenaWorld:
     gap: float
 
 
-def _robot_spec(robot_xml: str):
+def _robot_spec(robot_xml: str, keep_rangefinders: bool = False):
     import mujoco
     text = open(robot_xml).read()
     # Keyframes don't survive a prefixed attach (MuJoCo warns and mangles them)
@@ -70,9 +70,10 @@ def _robot_spec(robot_xml: str):
     assets = os.path.join(os.path.dirname(os.path.abspath(robot_xml)), "assets")
     spec.meshdir = assets
     spec.texturedir = assets
-    for sensor in list(spec.sensors):
-        if sensor.type == mujoco.mjtSensor.mjSENS_RANGEFINDER:
-            sensor.delete()
+    if not keep_rangefinders:  # kept only to check the ray-cast scan against them
+        for sensor in list(spec.sensors):
+            if sensor.type == mujoco.mjtSensor.mjSENS_RANGEFINDER:
+                sensor.delete()
     return spec
 
 
@@ -130,9 +131,10 @@ def _room_footprints(model, data, geoms, origin):
 
 
 def build_arena(robot_xml: str, room_xml: str, n: int, room_size: float = 10.0,
-                gap: float = 2.0, wall_height: float = 2.5) -> ArenaWorld:
+                gap: float = 2.0, wall_height: float = 2.5,
+                keep_rangefinders: bool = False) -> ArenaWorld:
     import mujoco
-    robot = _robot_spec(robot_xml)
+    robot = _robot_spec(robot_xml, keep_rangefinders)
     room = _room_spec(room_xml, wall_height)
 
     arena = mujoco.MjSpec()
