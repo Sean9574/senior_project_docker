@@ -30,7 +30,6 @@ import cv2
 import rclpy
 from cv_bridge import CvBridge
 from flask import Flask, Response, jsonify, render_template_string, request
-from flask_cors import CORS
 from flask_socketio import SocketIO
 from rclpy.context import Context
 from rclpy.executors import SingleThreadedExecutor
@@ -46,8 +45,8 @@ from std_msgs.msg import String as StringMsg
 DEFAULT_PORT = 5555
 MAX_HISTORY_LENGTH = 1000
 UPDATE_RATE_HZ = 5
-DEFAULT_SCAN_START = 0
-DEFAULT_SCAN_END = 50
+DEFAULT_SCAN_START = 90   # Docker training domains: 90-99 sims, 100 expert baseline
+DEFAULT_SCAN_END = 100
 DEFAULT_SCAN_INTERVAL = 15.0
 
 DEFAULT_CAMERA_FPS = 15.0
@@ -75,6 +74,34 @@ EPISODE_CSV_COLUMNS = [
 SYNC_CSV_COLUMNS = [
     "wall_clock", "sync_number", "sim_steps", "weighted",
 ]
+
+# Phases that are not RL training data: excluded from the RL learning curves
+EXPERT_PHASES = ("EXPERT_DEMO", "EXPERT_BASELINE")
+NON_RL_PHASES = EXPERT_PHASES + ("EVAL",)
+
+def _open_csv_append(path: str, columns: List[str]):
+    """Open a CSV for appending; write the header only if the file is new/empty."""
+    new_file = not os.path.exists(path) or os.path.getsize(path) == 0
+    f = open(path, "a", newline="")
+    writer = csv.DictWriter(f, fieldnames=columns)
+    if new_file:
+        writer.writeheader()
+    return f, writer
+
+
+def safe_subpath(root: str, candidate: str) -> Optional[str]:
+    """Resolve candidate (absolute, or relative to root) and return it only if
+    it stays inside root; None otherwise. Used to keep dashboard requests from
+    reading or writing outside the experiment directory."""
+    if not root:
+        return None
+    root_real = os.path.realpath(root)
+    path = candidate if os.path.isabs(candidate) else os.path.join(root_real, candidate)
+    path_real = os.path.realpath(path)
+    if os.path.commonpath([root_real, path_real]) != root_real:
+        return None
+    return path_real
+
 
 # =============================================================================
 # Data Structures
@@ -105,6 +132,9 @@ class DomainStats:
     timeouts: int = 0
     bumps: int = 0            # Mid-episode collision bumps (never terminate)
     _last_success: bool = False
+    # v6 learners publish "done" on the terminal step; then the breakdown stream
+    # (not the separate /reward topic) owns per-episode accounting.
+    _done_protocol: bool = False
 
     # Min distance tracking
     min_distances: deque = field(default_factory=lambda: deque(maxlen=MAX_HISTORY_LENGTH))
@@ -143,30 +173,48 @@ class DomainStats:
         sim_dir = os.path.join(experiment_dir, f"sim_{sim_id}")
         os.makedirs(sim_dir, exist_ok=True)
 
-        self._csv_steps_file = open(os.path.join(sim_dir, "steps.csv"), "w", newline="")
-        self._csv_steps_writer = csv.DictWriter(self._csv_steps_file, fieldnames=STEP_CSV_COLUMNS)
-        self._csv_steps_writer.writeheader()
-
-        self._csv_episodes_file = open(os.path.join(sim_dir, "episodes.csv"), "w", newline="")
-        self._csv_episodes_writer = csv.DictWriter(self._csv_episodes_file, fieldnames=EPISODE_CSV_COLUMNS)
-        self._csv_episodes_writer.writeheader()
+        # Append (header only for a new file) so restarting the monitor with the
+        # same --experiment directory never wipes earlier data.
+        self._csv_steps_file, self._csv_steps_writer = _open_csv_append(
+            os.path.join(sim_dir, "steps.csv"), STEP_CSV_COLUMNS)
+        self._csv_episodes_file, self._csv_episodes_writer = _open_csv_append(
+            os.path.join(sim_dir, "episodes.csv"), EPISODE_CSV_COLUMNS)
 
     def close_csv(self):
-        """Flush final episode and close CSV files."""
+        """Flush the unfinished episode (as 'incomplete') and close CSV files."""
         if self._csv_episodes_writer and self.current_episode_steps > 0:
-            self._flush_csv_episode(time.time() - self._csv_start_time, success=False)
+            self._flush_csv_episode(time.time() - self._csv_start_time, outcome="incomplete")
         if self._csv_steps_file:
             self._csv_steps_file.close()
         if self._csv_episodes_file:
             self._csv_episodes_file.close()
+        self._csv_steps_writer = None
+        self._csv_episodes_writer = None
 
     def add_reward(self, reward: float, timestamp: float):
         self.rewards.append(reward)
         self.timestamps.append(timestamp)
-        self.current_episode_return += reward
-        self.current_episode_steps += 1
+        if not self._done_protocol:
+            self.current_episode_return += reward
+            self.current_episode_steps += 1
         self.total_steps += 1
         self.last_update = time.time()
+
+    def _close_episode(self, success: bool):
+        """Record the episode that just ended and reset per-episode accumulators."""
+        if self.current_episode_steps > 0:
+            self.episode_returns.append(self.current_episode_return)
+            self.episode_count += 1
+            if success:
+                self.successes += 1
+            else:
+                self.timeouts += 1
+            if self._csv_episodes_writer:
+                now = time.time() - self._csv_start_time
+                self._flush_csv_episode(now, success=success)
+        self.current_episode_return = 0.0
+        self.current_episode_steps = 0
+        self.goals_reached = 0
 
     def add_breakdown(self, breakdown: Dict):
         timestamp = time.time()
@@ -212,22 +260,21 @@ class DomainStats:
             self.bumps += 1
 
         episode_num = breakdown.get("episode", 0)
-        if episode_num > self.last_episode_num and self.last_episode_num > 0:
-            if self.current_episode_steps > 0:
-                self.episode_returns.append(self.current_episode_return)
-                self.episode_count += 1
-                # Record how the PREVIOUS episode ended (only goal or timeout in v5)
-                if self._last_success:
-                    self.successes += 1
-                else:
-                    self.timeouts += 1
-                # Flush CSV episode row
-                if self._csv_episodes_writer:
-                    now = time.time() - self._csv_start_time
-                    self._flush_csv_episode(now, success=self._last_success)
-            self.current_episode_return = 0.0
-            self.current_episode_steps = 0
-            self.goals_reached = 0
+        if "done" in breakdown:
+            # v6: this message is one step of `episode_num`; the terminal step
+            # carries done=True and closes the episode below.
+            if not self._done_protocol:
+                # Drop anything the /reward topic counted before the first
+                # breakdown arrived: from here on the breakdown owns the totals.
+                self.current_episode_return = 0.0
+                self.current_episode_steps = 0
+                self._done_protocol = True
+            self.current_episode_return += float(breakdown.get("reward", 0.0))
+            self.current_episode_steps += 1
+        elif episode_num > self.last_episode_num and self.last_episode_num > 0:
+            # Legacy learners: the episode number advanced, so the PREVIOUS
+            # episode ended with the previous message's success flag.
+            self._close_episode(self._last_success)
         self.last_episode_num = episode_num
 
         # Remember flags for next episode boundary
@@ -284,7 +331,11 @@ class DomainStats:
             self._csv_episode_cells = explore_stats.get("total_discovered", 0)
             self._csv_episode_goals = breakdown.get("goals_reached", 0)
 
-    def _flush_csv_episode(self, wall_clock: float, success: bool = False):
+        if breakdown.get("done"):
+            self._close_episode(bool(success))
+
+    def _flush_csv_episode(self, wall_clock: float, success: bool = False,
+                           outcome: Optional[str] = None):
         """Write one episode summary row to CSV."""
         if not self._csv_episodes_writer:
             return
@@ -303,7 +354,7 @@ class DomainStats:
             "total_steps_at_end": self.total_steps,
             "episode_steps": self.current_episode_steps,
             "episode_return": f"{self.current_episode_return:.2f}",
-            "outcome": "goal_reached" if success else "timeout",
+            "outcome": outcome or ("goal_reached" if success else "timeout"),
             "goals_reached": self._csv_episode_goals,
             "cells_discovered": self._csv_episode_cells,
             "avg_min_distance": f"{avg_min_d:.4f}",
@@ -948,6 +999,8 @@ function updatePhaseBadge(phase) {
   if (!el) return;
   const map = {
     'EXPERT_DEMO': ['EXPERT DEMO', 'expert'],
+    'EXPERT_BASELINE': ['EXPERT BASELINE', 'expert'],
+    'EVAL': ['EVAL', 'rl'],
     'RANDOM_EXPLORE': ['RANDOM EXPLORE', 'random'],
     'RL_POLICY': ['RL POLICY', 'rl'],
   };
@@ -1412,11 +1465,13 @@ def generate_experiment_graphs(experiment_dirs: List[str], output_dir: str, wind
     def rolling(values, w):
         return pd.Series(values).rolling(window=w, min_periods=1).mean().values
 
-    def aggregate(exp):
+    def aggregate(exp, rl_only=True):
         frames = list(exp["sim_episodes"].values())
         if not frames:
             return pd.DataFrame()
         df = pd.concat(frames, ignore_index=True).sort_values("wall_clock").reset_index(drop=True)
+        if rl_only and "training_phase" in df.columns:
+            df = df[~df["training_phase"].isin(NON_RL_PHASES)].reset_index(drop=True)
         return df
 
     def sim_label(exp):
@@ -1631,11 +1686,11 @@ def generate_experiment_graphs(experiment_dirs: List[str], output_dir: str, wind
 
     # --- Fig 10: Expert State Machine vs RL Policy convergence ---
     for exp in experiments:
-        eps = aggregate(exp)
+        eps = aggregate(exp, rl_only=False)
         if eps.empty or "training_phase" not in eps.columns:
             continue
 
-        expert_eps = eps[eps["training_phase"] == "EXPERT_DEMO"]
+        expert_eps = eps[eps["training_phase"].isin(EXPERT_PHASES)]
         rl_eps = eps[eps["training_phase"] == "RL_POLICY"]
 
         if expert_eps.empty and rl_eps.empty:
@@ -1766,9 +1821,9 @@ def generate_experiment_graphs(experiment_dirs: List[str], output_dir: str, wind
 
 def create_app(stats: Dict[str, DomainStats], mgr: MultiDomainManager, experiment_dir: str = ""):
     app = Flask(__name__)
-    app.config["SECRET_KEY"] = "rl_monitor"
-    CORS(app)
-    sio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
+    app.config["SECRET_KEY"] = os.urandom(24)
+    # Dashboard and API are served from this app: same-origin only, no CORS
+    sio = SocketIO(app, async_mode="threading")
 
     @app.route("/")
     def index():
@@ -1788,11 +1843,14 @@ def create_app(stats: Dict[str, DomainStats], mgr: MultiDomainManager, experimen
         {"dirs": ["path1", "path2"], "output": "figures/", "window": 20}
         If no dirs given, uses the current experiment_dir."""
         data = request.get_json(silent=True) or {}
-        dirs = data.get("dirs", [experiment_dir] if experiment_dir else [])
-        out = data.get("output", os.path.join(experiment_dir, "figures") if experiment_dir else "./figures")
+        if not experiment_dir:
+            return jsonify({"error": "No experiment directory configured (start with --experiment)"}), 400
+        # Every path must resolve inside the experiment directory
+        dirs = [safe_subpath(experiment_dir, d) for d in data.get("dirs", [experiment_dir])]
+        out = safe_subpath(experiment_dir, data.get("output", "figures"))
         w = data.get("window", 20)
-        if not dirs:
-            return jsonify({"error": "No experiment directories configured"}), 400
+        if not dirs or out is None or any(d is None for d in dirs):
+            return jsonify({"error": "dirs and output must be inside the experiment directory"}), 400
         try:
             files = generate_experiment_graphs(dirs, out, window=w)
             return jsonify({"success": True, "figures": files, "output_dir": out})
@@ -1871,6 +1929,8 @@ Examples:
         """,
     )
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
+    parser.add_argument("--host", type=str, default="127.0.0.1",
+                        help="Bind address (0.0.0.0 exposes the dashboard to the network)")
     parser.add_argument("--scan-start", type=int, default=DEFAULT_SCAN_START)
     parser.add_argument("--scan-end", type=int, default=DEFAULT_SCAN_END)
     parser.add_argument("--scan-interval", type=float, default=DEFAULT_SCAN_INTERVAL)
@@ -1986,7 +2046,8 @@ Examples:
         threading.Thread(target=sync_loop, daemon=True).start()
 
     def shutdown(*_):
-        # Close CSV files
+        # Stop collectors first so no callback writes to a closed CSV
+        mgr.stop_all()
         for ds in stats.values():
             ds.close_csv()
         if sync_monitor:
@@ -2020,7 +2081,6 @@ Examples:
             print(f"    --graph-dirs {experiment_dir} <other_experiment_dir> \\")
             print(f"    --graph-output ./figures\n")
 
-        mgr.stop_all()
         sys.exit(0)
 
     signal.signal(signal.SIGINT, shutdown)
@@ -2029,7 +2089,7 @@ Examples:
     logging.getLogger("werkzeug").setLevel(logging.ERROR)
 
     try:
-        sio.run(app, host="0.0.0.0", port=args.port, debug=False, use_reloader=False, log_output=False, allow_unsafe_werkzeug=True)
+        sio.run(app, host=args.host, port=args.port, debug=False, use_reloader=False, log_output=False, allow_unsafe_werkzeug=True)
     except:
         shutdown()
 
