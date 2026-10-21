@@ -242,9 +242,10 @@ RUN echo '# Stub - robocasa kitchen generation disabled' > $AMENT_WS/src/stretch
 RUN sed -i 's/width=424/width=212/g; s/height=240/height=120/g' \
     $AMENT_WS/src/stretch_mujoco/stretch_mujoco/enums/stretch_cameras.py
 
-# VELOCITY PATCH: Raise MuJoCo wheel actuator limit from ±6 to ±15 rad/s
-# (ctrlrange="-6 6" caps the robot at ~0.9 m/s regardless of cmd_vel values)
-RUN sed -i 's/ctrlrange="-6 6"/ctrlrange="-15 15"/g' \
+# VELOCITY PATCH: raise the wheel actuator limit from ±6 to ±30. The drivers
+# send gear (3) x wheel speed, and a full-speed turn (0.3 m/s + 1.0 rad/s)
+# needs about 27; ±6 would cap the robot far below cmd_vel
+RUN sed -i 's/ctrlrange="-6 6"/ctrlrange="-30 30"/g' \
     $AMENT_WS/src/stretch_mujoco/stretch_mujoco/models/stretch.xml \
     $AMENT_WS/src/stretch_mujoco/stretch_mujoco/models/stretch_mj_3.3.0.xml
 

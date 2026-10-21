@@ -160,3 +160,21 @@ def test_camera_optical_frame_matches_mujoco_camera_axes():
     assert np.allclose(r_opt[:, 0], r_cam[:, 0], atol=1e-6)
     assert np.allclose(r_opt[:, 1], -r_cam[:, 1], atol=1e-6)
     assert np.allclose(r_opt[:, 2], -r_cam[:, 2], atol=1e-6)
+
+
+@needs_mujoco
+def test_commanded_speed_is_the_real_speed():
+    # The wheel actuators have gear 3: the command must be scaled by it, or the
+    # robot drives at a third of the requested speed (0.089 m/s for 0.3 m/s)
+    a = _arena(1)
+    a.set_cmd(0, 0.3, 0.0)
+    a.step(int(2.0 / a.model.opt.timestep))
+    assert a.odom(0)[3] == pytest.approx(0.3, rel=0.15)
+
+
+@needs_mujoco
+def test_commanded_turn_rate_is_the_real_turn_rate():
+    a = _arena(1)
+    a.set_cmd(0, 0.0, 1.0)
+    a.step(int(2.0 / a.model.opt.timestep))
+    assert a.odom(0)[4] == pytest.approx(1.0, rel=0.15)

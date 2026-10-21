@@ -240,6 +240,14 @@ class StretchMujocoDriver(Node):
 
         self.sim = sim
         self._sim_model = model            # Keep reference for hard reset
+        # Wheel velocity actuators act on gear * joint velocity (gear 3 in
+        # stretch.xml). stretch_mujoco's set_base_velocity and its odometry both
+        # ignore the gear, so commands are scaled up by it and odometry speeds
+        # scaled down; without this the robot drives at 1/3 of cmd_vel while
+        # odometry reports the commanded speed.
+        import mujoco
+        wheel = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_ACTUATOR, "left_wheel_vel")
+        self._wheel_gear = float(model.actuator_gear[wheel][0]) if wheel >= 0 else 1.0
         self._use_cameras = use_cameras
         self._use_mujoco_viewer = use_mujoco_viewer
 
@@ -419,7 +427,8 @@ class StretchMujocoDriver(Node):
             time_since_last_twist = self.get_clock().now() - self.last_twist_time
             if time_since_last_twist < self.timeout:
                 self.sim.set_base_velocity(
-                    self.linear_velocity_mps, self.angular_velocity_radps
+                    self.linear_velocity_mps * self._wheel_gear,
+                    self.angular_velocity_radps * self._wheel_gear,
                 )
             elif time_since_last_twist < Duration(seconds=self.timeout_s + 1.0):  # type: ignore
                 # self.sim.set_base_velocity(0.0, 0.0)
@@ -447,11 +456,12 @@ class StretchMujocoDriver(Node):
         x = base_status.x
         y = base_status.y
         theta = base_status.theta
-        x_vel = base_status.x_vel
+        # stretch_mujoco computes these from actuator (= gear * wheel) velocities
+        x_vel = base_status.x_vel / self._wheel_gear
         # y_vel = base_status.y_vel #TODO: implement y_vel in base_status
-        y_vel = base_status.x_vel
+        y_vel = base_status.x_vel / self._wheel_gear
 
-        theta_vel = base_status.theta_vel
+        theta_vel = base_status.theta_vel / self._wheel_gear
 
         q = quaternion_from_euler(0.0, 0.0, theta)
 

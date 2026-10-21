@@ -79,8 +79,11 @@ class Arena:
         self.cmd[i] = (v, w)
         left, right = wheel_speeds(v, w)
         acts = self.world.rooms[i].actuators
-        self.data.ctrl[acts["left_wheel_vel"]] = left
-        self.data.ctrl[acts["right_wheel_vel"]] = right
+        # Velocity actuators act on gear * joint velocity: scale by the gear,
+        # or the robot drives at 1/gear of the commanded speed
+        for name, speed in (("left_wheel_vel", left), ("right_wheel_vel", right)):
+            a = acts[name]
+            self.data.ctrl[a] = speed * self.model.actuator_gear[a][0]
 
     def step(self, n: int = 1) -> None:
         for _ in range(n):
