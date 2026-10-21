@@ -7,10 +7,15 @@ depth estimation methods:
   1. SAM3 server (object detection/segmentation) - OPTIONAL, can use shared server
   2. Mono depth server (optional, for RGB-only depth estimation)
   3. SAM3 goal generator  (supports depth camera, mono depth, or bbox heuristic)
-  4. RL simulation + learner
+  4. RL simulation + learner (robot spawns at a random free pose every episode)
+
+Asks "What should the robot go to?" before starting, unless target:= is given:
+  ros2 launch senior_project sam3_navigation.launch.py
+  ros2 launch senior_project sam3_navigation.launch.py target:=chair
 """
 
 import os
+import sys
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
@@ -25,6 +30,7 @@ from launch.actions import (
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
+from senior_project.prompt import ask_target
 
 
 def generate_launch_description():
@@ -56,10 +62,13 @@ def generate_launch_description():
         description="SAM3 server port"
     ))
 
+    # Ask what to go to before anything starts (skipped when target:= is given)
+    target_prompt = ask_target(sys.argv, sys.stdin.isatty())
+
     # SAM3 args
     ld.add_action(DeclareLaunchArgument(
-        "target", default_value="person",
-        description="Object to find and navigate to"
+        "target", default_value=target_prompt,
+        description="Object to find and navigate to (asked in the terminal if not given)"
     ))
     ld.add_action(DeclareLaunchArgument(
         "confidence_threshold", default_value="0.2",

@@ -7,12 +7,13 @@ This launch file starts:
   2. Multiple parallel simulations, each in their own domain with dedicated SAM3 server
 
 Usage:
-  ros2 launch senior_project sam3_navigation_parallel.launch.py
+  ros2 launch senior_project sam3_navigation_parallel.launch.py            # asks what to go to
   ros2 launch senior_project sam3_navigation_parallel.launch.py num_sims:=4 target:=cup headless:=true
   ros2 launch senior_project sam3_navigation_parallel.launch.py sam3_mode:=shared  # Fall back to single shared server
 """
 
 import os
+import sys
 
 from launch.actions import (
     DeclareLaunchArgument,
@@ -24,6 +25,7 @@ from launch.actions import (
 from launch.substitutions import LaunchConfiguration
 
 from launch import LaunchDescription
+from senior_project.prompt import ask_target
 
 
 def generate_launch_description():
@@ -72,9 +74,11 @@ def generate_launch_description():
         "num_sims", default_value="1",
         description="Number of parallel simulations"
     ))
+    # Ask what to go to before anything starts (skipped when target:= is given)
+    target_prompt = ask_target(sys.argv, sys.stdin.isatty())
     ld.add_action(DeclareLaunchArgument(
-        "target", default_value="person",
-        description="Target object to navigate to"
+        "target", default_value=target_prompt,
+        description="Target object to navigate to (asked in the terminal if not given)"
     ))
     ld.add_action(DeclareLaunchArgument(
         "total_steps", default_value="200000",

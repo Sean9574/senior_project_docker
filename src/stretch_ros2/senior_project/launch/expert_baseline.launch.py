@@ -14,7 +14,7 @@ Usage:
 
     # With SAM3 goal generator (for goal-seeking comparison)
     ROS_DOMAIN_ID=100 ros2 launch senior_project expert_baseline.launch.py \
-        use_sam3:=true target:=person
+        target:=person
 
     # Headless, no RViz (for parallel benchmarking)
     ROS_DOMAIN_ID=100 ros2 launch senior_project expert_baseline.launch.py \
@@ -25,6 +25,7 @@ Usage:
 """
 
 import os
+import sys
 from pathlib import Path
 
 from ament_index_python.packages import get_package_share_directory
@@ -38,6 +39,7 @@ from launch.actions import (
 from launch.conditions import IfCondition
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
+from senior_project.prompt import ask_target
 
 
 def generate_launch_description():
@@ -56,8 +58,8 @@ def generate_launch_description():
         "use_mujoco_viewer", default_value="false", choices=["true", "false"],
     ))
     ld.add_action(DeclareLaunchArgument(
-        "use_cameras", default_value="false", choices=["true", "false"],
-        description="Cameras are only needed for SAM3 goals (use_sam3:=true)",
+        "use_cameras", default_value="true", choices=["true", "false"],
+        description="Cameras feed SAM3 (needed while use_sam3:=true)",
     ))
     ld.add_action(DeclareLaunchArgument(
         "mujoco_xml", default_value="",
@@ -95,10 +97,16 @@ def generate_launch_description():
 
     # SAM3 goal generator (optional — for goal-seeking comparison)
     ld.add_action(DeclareLaunchArgument(
-        "use_sam3", default_value="false", choices=["true", "false"],
+        "use_sam3", default_value="true", choices=["true", "false"],
         description="Start SAM3 goal generator for goal-seeking tasks",
     ))
-    ld.add_action(DeclareLaunchArgument("target", default_value="person"))
+    # Same prompt question as the RL launch (skipped with target:= or use_sam3:=false)
+    target_prompt = "" if "use_sam3:=false" in sys.argv else ask_target(sys.argv, sys.stdin.isatty())
+    ld.add_action(DeclareLaunchArgument("target", default_value=target_prompt))
+    ld.add_action(DeclareLaunchArgument(
+        "random_spawn", default_value="true", choices=["true", "false"],
+        description="Spawn at a random free pose every episode (same as RL)",
+    ))
     ld.add_action(DeclareLaunchArgument("sam3_server_port", default_value="8100"))
     ld.add_action(DeclareLaunchArgument("confidence_threshold", default_value="0.2"))
 
@@ -186,6 +194,7 @@ def generate_launch_description():
             "mode": LaunchConfiguration("mode"),
             "use_mujoco_viewer": LaunchConfiguration("use_mujoco_viewer"),
             "use_cameras": LaunchConfiguration("use_cameras"),
+            "random_spawn": LaunchConfiguration("random_spawn"),
             "mujoco_xml": LaunchConfiguration("mujoco_xml"),
             "use_robocasa": False,
             "robocasa_task": LaunchConfiguration("robocasa_task"),

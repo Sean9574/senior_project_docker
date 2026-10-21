@@ -36,6 +36,7 @@ def generate_launch_description():
         PythonLaunchDescriptionSource(rl_launch),
         launch_arguments={
             "run_rl": "false",
+            "random_spawn": "false",
             "use_reward_monitor": "false",
             "mode": LaunchConfiguration("mode"),
             "use_rviz": LaunchConfiguration("use_rviz"),

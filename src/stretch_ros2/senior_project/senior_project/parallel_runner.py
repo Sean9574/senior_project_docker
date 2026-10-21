@@ -32,6 +32,8 @@ import time
 from datetime import datetime
 from typing import Dict, List, Optional
 
+from senior_project.prompt import ask_target
+
 
 def _str2bool(v: str) -> bool:
     return str(v).strip().lower() in ("1", "true", "t", "yes", "y", "on")
@@ -402,8 +404,8 @@ def main():
         help="Number of parallel simulations (default: 4)"
     )
     parser.add_argument(
-        "--target", "-t", type=str, default="person",
-        help="Target object to navigate to (default: person)"
+        "--target", "-t", type=str, default=None,
+        help="Object every sim should go to (asked in the terminal if not given)"
     )
     parser.add_argument(
         "--total_steps", type=int, default=200000,
@@ -475,9 +477,11 @@ def main():
             key, value = item.split("=", 1)
             extra_args[key] = value
 
+    target = args.target or ask_target([], sys.stdin.isatty())
+
     runner = ParallelRunner(
         num_sims=args.num_sims,
-        target=args.target,
+        target=target,
         total_steps=args.total_steps,
         base_ckpt_dir=args.ckpt_dir,
         launch_file=args.launch_file,

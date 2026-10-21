@@ -37,6 +37,12 @@ def generate_launch_description():
     ld.add_action(DeclareLaunchArgument("seed", default_value="42"))
     ld.add_action(
         DeclareLaunchArgument(
+            "random_spawn", default_value="true", choices=["true", "false"],
+            description="Spawn the robot at a random free pose every episode",
+        )
+    )
+    ld.add_action(
+        DeclareLaunchArgument(
             "use_mujoco_viewer",
             default_value="false",
             choices=["true", "false"],
@@ -228,6 +234,7 @@ def generate_launch_description():
             ]),
             "use_cameras": LaunchConfiguration("use_cameras"),
             "mujoco_xml": LaunchConfiguration("mujoco_xml"),
+            "random_spawn": LaunchConfiguration("random_spawn"),
 
             # Robocasa off
             "use_robocasa": False,
