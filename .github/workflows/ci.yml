@@ -1,0 +1,21 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  unit-tests:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        # 3.10 = ROS 2 Humble (Docker image), 3.12 = ROS 2 Jazzy
+        python-version: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: pip install "numpy>=1.26,<2" pytest
+      # torch-dependent tests skip themselves here (no torch installed)
+      - run: python -m pytest -q src/stretch_ros2/senior_project/test

@@ -40,3 +40,9 @@ Thumbs.db
 .env
 *.key
 *.pem
+
+# RL checkpoints / replay buffers (publish trained models as release assets)
+parallel_training/
+rl_checkpoints/
+*.pt
+replay_buffer*.npz
