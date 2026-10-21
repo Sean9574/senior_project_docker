@@ -7,13 +7,13 @@ federated averaging (weight averaging).
 
 Usage:
     # Basic merge (finds all sim_* directories)
-    python merge_checkpoints.py --input_dir ~/ament_ws/src/stretch_ros2/senior_project/parallel_training --output merged.pt
+    python merge_checkpoints.py --input_dir ~/rl_checkpoints --output merged.pt
     
     # Merge specific checkpoint files
     python merge_checkpoints.py --checkpoints sim_0/agent.pt sim_1/agent.pt --output merged.pt
     
     # Weighted merge (if some sims trained longer)
-    python merge_checkpoints.py --input_dir ./parallel_training --output merged.pt --weighted
+    python merge_checkpoints.py --input_dir ~/rl_checkpoints --output merged.pt --weighted
 
 Supports:
     - Simple averaging: (w1 + w2 + ... + wN) / N
@@ -168,7 +168,9 @@ def merge_td3_checkpoints(
         'actor', 'actor_state_dict', 'policy', 'policy_state_dict',
         'critic', 'critic_state_dict', 'q1', 'q2',
         'actor_target', 'critic_target', 'target_actor', 'target_critic',
-        'actor_optimizer', 'critic_optimizer', 'optimizer',
+        # learner_node.TD3AgentCNN.save() keys
+        'actor_targ', 'critic1', 'critic2', 'critic1_targ', 'critic2_targ',
+        'actor_optimizer', 'critic_optimizer', 'optimizer', 'actor_opt', 'critic_opt',
     ]
     
     for key in network_keys:

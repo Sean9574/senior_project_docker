@@ -1,25 +1,27 @@
 #!/usr/bin/env python3
 """
-Parallel Simulation Runner for SAM3 Navigation
+Parallel Simulation Runner
 
 Spawns multiple simulations in parallel, each with its own:
-  - ROS_DOMAIN_ID (sim_base_domain + sim_id)
-  - Server ports (with offsets)
-  - Checkpoint directory
+  - ROS_DOMAIN_ID (sim_base_domain + sim_id, default 90, 91, ...)
+  - Checkpoint directory (<ckpt_dir>/sim_N)
+and runs federated_sync.py to share weights between them.
 
-Supports two SAM3 server modes:
-  - dedicated: Each sim gets its own SAM3 server (ports 8100, 8101, 8102, ...)
-  - shared: All sims share one SAM3 server (port 8100)
+Goal sources:
+  - random (default): line-of-sight goals + curriculum, launched via RL.launch.py
+  - topic: SAM3 camera goals via sam3_navigation.launch.py. SAM3 servers are
+    NOT started by this runner: start one on 8100 (shared, default) or one per
+    sim on 8100+N (dedicated) first.
 
 Usage:
-    # Run 4 parallel sims with dedicated SAM3 servers (recommended for multi-GPU)
-    python parallel_runner.py --num_sims 4 --target "cup" --sam3_mode dedicated
+    # 4 parallel sims learning random goals
+    python parallel_runner.py --num_sims 4
 
-    # Run 4 parallel sims with shared SAM3 server (lower memory usage)
-    python parallel_runner.py --num_sims 4 --target "cup" --sam3_mode shared
+    # 4 parallel sims chasing a SAM3 target through one shared server
+    python parallel_runner.py --num_sims 4 --goal_source topic --target "cup"
 
     # Run and merge on completion
-    python parallel_runner.py --num_sims 4 --target "cup" --merge_on_exit
+    python parallel_runner.py --num_sims 4 --merge_on_exit
 """
 
 import argparse
@@ -42,26 +44,28 @@ class ParallelRunner:
         num_sims: int,
         target: str = "person",
         total_steps: int = 200000,
-        rollout_steps: int = 2048,
         base_ckpt_dir: str = "~/rl_checkpoints",
-        launch_file: str = "sam3_navigation.launch.py",
+        launch_file: Optional[str] = None,
         package: str = "senior_project",
         extra_args: Optional[Dict[str, str]] = None,
         merge_on_exit: bool = False,
         stagger_delay: float = 10.0,
         headless: bool = True,
         sam3_domain: int = 0,
-        sim_base_domain: int = 10,
-        sam3_mode: str = "dedicated",
+        sim_base_domain: int = 90,
+        sam3_mode: str = "shared",
         sam3_base_port: int = 8100,
         sync_every: int = 300,
+        goal_source: str = "random",
     ):
         self.num_sims = num_sims
         self.target = target
         self.total_steps = total_steps
-        self.rollout_steps = rollout_steps
         self.base_ckpt_dir = os.path.expanduser(base_ckpt_dir)
-        self.launch_file = launch_file
+        self.goal_source = goal_source
+        # random goals need no camera pipeline: train straight through RL.launch
+        self.launch_file = launch_file or (
+            "RL.launch.py" if goal_source == "random" else "sam3_navigation.launch.py")
         self.package = package
         self.extra_args = extra_args or {}
         self.merge_on_exit = merge_on_exit
@@ -77,6 +81,7 @@ class ParallelRunner:
         self.sync_process: Optional[subprocess.Popen] = None
         self.start_time: Optional[datetime] = None
         self._shutdown_requested = False
+        self._stopped = False
 
         # Setup signal handlers
         signal.signal(signal.SIGINT, self._signal_handler)
@@ -108,6 +113,19 @@ class ParallelRunner:
     def _build_launch_command(self, sim_id: int) -> List[str]:
         """Build the ros2 launch command for a simulation."""
         ckpt_dir = os.path.join(self.base_ckpt_dir, f"sim_{sim_id}")
+        common = [
+            f"total_steps:={self.total_steps}",
+            f"ckpt_dir:={ckpt_dir}",
+            f"goal_source:={self.goal_source}",
+            "use_rviz:=false",
+            # One dashboard (sim 0) scans every sim's domain
+            f"use_reward_monitor:={'true' if sim_id == 0 else 'false'}",
+        ]
+
+        if self.goal_source == "random":
+            cmd = ["ros2", "launch", self.package, self.launch_file, *common,
+                   "use_cameras:=false"]
+            return self._with_extra_args(cmd)
 
         # Determine SAM3 port based on mode
         if self.sam3_mode == "dedicated":
@@ -122,11 +140,9 @@ class ParallelRunner:
 
         cmd = [
             "ros2", "launch", self.package, self.launch_file,
+            *common,
             f"sim_id:={sim_id}",
             f"target:={self.target}",
-            f"total_steps:={self.total_steps}",
-            f"rollout_steps:={self.rollout_steps}",
-            f"ckpt_dir:={ckpt_dir}",
             f"headless:={str(self.headless).lower()}",
             # Tell child simulations NOT to start their own SAM3 server
             "start_sam3_server:=false",
@@ -138,7 +154,9 @@ class ParallelRunner:
             # Pass the SAM3 domain for reference (though HTTP is domain-agnostic)
             f"sam3_domain:={self.sam3_domain}",
         ]
+        return self._with_extra_args(cmd)
 
+    def _with_extra_args(self, cmd: List[str]) -> List[str]:
         # Add any extra arguments (but never allow extra to override critical settings)
         forbidden_keys = {"headless", "sam3_domain", "start_sam3_server", 
                           "sam3_server_port", "start_mono_depth_server", "sim_id"}
@@ -200,20 +218,21 @@ class ParallelRunner:
         self.start_time = datetime.now()
 
         print(f"\n{'='*60}")
-        print(f"  Parallel SAM3 Training - {self.num_sims} Simulations")
+        print(f"  Parallel TD3 Training - {self.num_sims} Simulations")
         print(f"{'='*60}")
-        print(f"  Target: {self.target}")
+        print(f"  Goal Source: {self.goal_source} ({self.launch_file})")
         print(f"  Total Steps: {self.total_steps}")
-        print(f"  Rollout Steps: {self.rollout_steps}")
         print(f"  Headless: {self.headless}")
         print(f"  Checkpoint Dir: {self.base_ckpt_dir}")
         print(f"  Merge on Exit: {self.merge_on_exit}")
-        if self.sam3_mode == "dedicated":
-            print(f"  SAM3 Server Mode: DEDICATED (ports {self.sam3_base_port}-{self.sam3_base_port + self.num_sims - 1})")
-        else:
-            print(f"  SAM3 Server Mode: SHARED (port {self.sam3_base_port})")
+        if self.goal_source == "topic":
+            print(f"  Target: {self.target}")
+            if self.sam3_mode == "dedicated":
+                print(f"  SAM3 Server Mode: DEDICATED (ports {self.sam3_base_port}-"
+                      f"{self.sam3_base_port + self.num_sims - 1}; start one server per port yourself)")
+            else:
+                print(f"  SAM3 Server Mode: SHARED (port {self.sam3_base_port}; start it yourself)")
         print(f"  Sim Domains: {self.sim_base_domain} - {self.sim_base_domain + self.num_sims - 1}")
-        print(f"  NOTE: All sims use SHARED SAM3 server (not starting their own)")
         if self.sync_every > 0 and self.num_sims > 1:
             print(f"  Federated Sync: every {self.sync_every}s")
         else:
@@ -254,7 +273,10 @@ class ParallelRunner:
         print("[Runner] Press Ctrl+C to stop all simulations\n")
 
     def stop_all(self):
-        """Stop all simulations gracefully."""
+        """Stop all simulations gracefully (safe to call more than once)."""
+        if self._stopped:
+            return
+        self._stopped = True
         print("[Runner] Stopping all simulations.")
 
         # Stop federated sync first
@@ -278,7 +300,8 @@ class ParallelRunner:
                 print(f"[Runner] Could not stop sim {i}: {e}")
 
         # Wait a bit for graceful shutdown
-        time.sleep(3)
+        if self.processes:
+            time.sleep(3)
 
         # Force kill any remaining
         for i, proc in enumerate(self.processes):
@@ -373,10 +396,7 @@ class ParallelRunner:
         print(f"  Total Time: {elapsed/60:.1f} minutes")
         print(f"  Simulations: {self.num_sims}")
         print(f"  Headless: {self.headless}")
-        if self.sam3_mode == "dedicated":
-            print(f"  SAM3 Server Mode: DEDICATED")
-        else:
-            print(f"  SAM3 Server Mode: SHARED")
+        print(f"  Goal Source: {self.goal_source}")
         print(f"  Sim Domains: {self.sim_base_domain} - {self.sim_base_domain + self.num_sims - 1}")
         print(f"  Checkpoints: {self.base_ckpt_dir}/sim_*/")
         if self.merge_on_exit:
@@ -386,7 +406,7 @@ class ParallelRunner:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Run parallel SAM3 navigation training",
+        description="Run parallel TD3 navigation training (random goals by default)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
 
@@ -403,8 +423,9 @@ def main():
         help="Total training steps per simulation (default: 200000)"
     )
     parser.add_argument(
-        "--rollout_steps", type=int, default=2048,
-        help="Rollout steps per update (default: 2048)"
+        "--goal_source", type=str, default="random", choices=["random", "topic"],
+        help="random: line-of-sight goals + curriculum via RL.launch.py (default); "
+             "topic: SAM3 camera goals via sam3_navigation.launch.py"
     )
     parser.add_argument(
         "--ckpt_dir", type=str,
@@ -424,8 +445,9 @@ def main():
         help="Delay between launching simulations in seconds (default: 10.0)"
     )
     parser.add_argument(
-        "--launch_file", type=str, default="sam3_navigation.launch.py",
-        help="Launch file to use for each simulation"
+        "--launch_file", type=str, default=None,
+        help="Launch file per simulation (default: RL.launch.py for random goals, "
+             "sam3_navigation.launch.py for topic goals)"
     )
     parser.add_argument(
         "--package", type=str, default="senior_project",
@@ -442,13 +464,13 @@ def main():
         help="ROS_DOMAIN_ID where the SAM3 server(s) are running (default: 0)"
     )
     parser.add_argument(
-        "--sim_base_domain", type=int, default=10,
-        help="Base ROS_DOMAIN_ID for simulations; sim N uses base + N (default: 10)"
+        "--sim_base_domain", type=int, default=90,
+        help="Base ROS_DOMAIN_ID for simulations; sim N uses base + N (default: 90, max 10 sims)"
     )
     
     # SAM3 server configuration
     parser.add_argument(
-        "--sam3_mode", type=str, default="dedicated",
+        "--sam3_mode", type=str, default="shared",
         choices=["dedicated", "shared"],
         help="SAM3 server mode: 'dedicated' (one per sim) or 'shared' (single server)"
     )
@@ -476,7 +498,6 @@ def main():
         num_sims=args.num_sims,
         target=args.target,
         total_steps=args.total_steps,
-        rollout_steps=args.rollout_steps,
         base_ckpt_dir=args.ckpt_dir,
         launch_file=args.launch_file,
         package=args.package,
@@ -489,6 +510,7 @@ def main():
         sam3_mode=args.sam3_mode,
         sam3_base_port=args.sam3_base_port,
         sync_every=args.sync_every,
+        goal_source=args.goal_source,
     )
 
     runner.start_all()

@@ -10,8 +10,9 @@ Runs alongside parallel_runner.py and periodically:
 This means each sim benefits from ALL sims' exploration,
 effectively multiplying the experience gathering rate by num_sims.
 
-The learner_node auto-loads checkpoints, so the next time each sim
-saves and the training loop checks, it picks up the merged weights.
+Merged weights go to sim_i/federated_update.pt (never over the learner's own
+checkpoint, which it rewrites every episode). The learner loads that file at
+its next episode end and deletes it. sync_status.json records each sync.
 
 NOTE: This does NOT merge replay buffers — each sim keeps its own.
 The speedup comes from shared weight updates, not shared experience.
@@ -29,6 +30,7 @@ Usage:
 
 import argparse
 import copy
+import json
 import os
 import shutil
 import signal
@@ -49,6 +51,11 @@ import torch
 
 CHECKPOINT_FILENAME = "td3_safe_rl_agent.pt"
 REPLAY_FILENAME = "replay_buffer.npz"
+FEDERATED_UPDATE_FILENAME = "federated_update.pt"  # read + deleted by learner_node
+SYNC_STATUS_FILENAME = "sync_status.json"           # read by reward_monitor SyncMonitor
+
+# Network keys TD3AgentCNN.save() writes (learner_node.py)
+NETWORK_KEYS = ["actor", "actor_targ", "critic1", "critic2", "critic1_targ", "critic2_targ"]
 
 
 def load_checkpoint(path: str) -> Optional[Dict]:
@@ -143,57 +150,38 @@ def merge_and_redistribute(
         weights = None
         print(f"  Equal-weight merge")
 
-    # --- Average each network component ---
-    # TD3 checkpoints have: actor, actor_target, critic, critic_target, rnd_predictor, rnd_target
-    network_keys = [
-        "actor", "actor_target",
-        "critic", "critic_target",
-    ]
-    # Optionally merge RND networks too
-    rnd_keys = ["rnd_predictor"]  # Don't merge rnd_target (it's fixed)
-
-    merged_parts = {}
-
-    for key in network_keys + rnd_keys:
-        dicts = [ckpt[key] for ckpt in checkpoints if key in ckpt]
-        if len(dicts) == num_sims:
-            merged_parts[key] = average_state_dicts(dicts, weights)
-            print(f"  ✓ Merged: {key} ({len(dicts)} sources)")
-        elif len(dicts) > 0:
-            print(f"  ⚠ {key}: only {len(dicts)}/{num_sims} have it, skipping")
-
-    if not merged_parts:
-        print("  [SKIP] No network weights to merge")
+    # --- Average each network (all six, or nothing: a partial merge would
+    # pair an averaged actor with unaveraged critics) ---
+    missing = [k for k in NETWORK_KEYS if not all(k in ckpt for ckpt in checkpoints)]
+    if missing:
+        print(f"  [SKIP] Networks missing from some sims: {missing}")
         return False
+    merged_parts = {k: average_state_dicts([ckpt[k] for ckpt in checkpoints], weights)
+                    for k in NETWORK_KEYS}
+    print(f"  ✓ Merged: {', '.join(NETWORK_KEYS)} ({num_sims} sources)")
 
-    # --- Write merged weights back to each sim ---
-    for i, (sim_dir, ckpt) in enumerate(zip(sim_dirs, checkpoints)):
-        # Update network weights with merged values
-        for key, merged_sd in merged_parts.items():
-            ckpt[key] = merged_sd
+    sync_meta = {
+        "time": datetime.now().isoformat(),
+        "steps_at_sync": steps,
+        "weighted": weighted,
+    }
 
-        # Keep each sim's own training_state, optimizer, and replay buffer
-        # (we only replace the network weights)
-
-        # Add sync metadata
-        ckpt["_last_sync"] = {
-            "time": datetime.now().isoformat(),
-            "steps_at_sync": steps,
-            "weighted": weighted,
-        }
-
-        # Atomic save
-        out_path = os.path.join(sim_dir, CHECKPOINT_FILENAME)
+    # --- Hand merged weights to each sim (each keeps its own optimizer,
+    # training_state and replay buffer) ---
+    for i, sim_dir in enumerate(sim_dirs):
+        out_path = os.path.join(sim_dir, FEDERATED_UPDATE_FILENAME)
         tmp_path = out_path + ".sync_tmp"
         try:
-            torch.save(ckpt, tmp_path)
+            torch.save({**merged_parts, "_last_sync": sync_meta}, tmp_path)
             os.replace(tmp_path, out_path)
-            print(f"  ✓ Wrote merged weights to sim_{i} (step {steps[i]})")
+            print(f"  ✓ Wrote merged weights to sim_{i}/{FEDERATED_UPDATE_FILENAME} (step {steps[i]})")
         except Exception as e:
             print(f"  ✗ Failed to write sim_{i}: {e}")
-            # Clean up temp file
             if os.path.exists(tmp_path):
                 os.remove(tmp_path)
+
+    with open(os.path.join(ckpt_dir, SYNC_STATUS_FILENAME), "w") as f:
+        json.dump(sync_meta, f)
 
     return True
 

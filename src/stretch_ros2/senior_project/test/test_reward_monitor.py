@@ -107,3 +107,20 @@ def test_safe_subpath_stays_inside_root(tmp_path):
     assert rm.safe_subpath(str(root), "/etc") is None
     assert rm.safe_subpath(str(root), "../outside") is None
     assert rm.safe_subpath("", "graphs") is None
+
+
+def test_sync_monitor_reads_status_json_without_torch(tmp_path):
+    ckpt_dir = tmp_path / "ckpt"
+    exp_dir = tmp_path / "exp"
+    ckpt_dir.mkdir()
+    exp_dir.mkdir()
+    (ckpt_dir / "sync_status.json").write_text(
+        '{"time": "2026-10-21T12:00:00", "steps_at_sync": [500, 700], "weighted": false}')
+    mon = rm.SyncMonitor(str(ckpt_dir), 2, str(exp_dir), 0.0)
+    mon.check()
+    mon.check()  # same sync seen twice: counted once
+    mon.close()
+    assert mon.sync_count == 1
+    with open(exp_dir / "sync_events.csv", newline="") as f:
+        rows = list(csv.DictReader(f))
+    assert [r["sim_steps"] for r in rows] == ["[500, 700]"]

@@ -1335,7 +1335,7 @@ function row(label, value, cls) {
 # =============================================================================
 
 class SyncMonitor:
-    """Watches checkpoint dirs for _last_sync metadata changes."""
+    """Watches <ckpt_dir>/sync_status.json (written by federated_sync.py)."""
 
     def __init__(self, ckpt_dir: str, num_sims: int, experiment_dir: str, start_time: float):
         self.ckpt_dir = ckpt_dir
@@ -1344,24 +1344,17 @@ class SyncMonitor:
         self.last_sync_time_str = None
         self.sync_count = 0
 
-        self.sync_file = open(os.path.join(experiment_dir, "sync_events.csv"), "w", newline="")
-        self.sync_writer = csv.DictWriter(self.sync_file, fieldnames=SYNC_CSV_COLUMNS)
-        self.sync_writer.writeheader()
+        self.sync_file, self.sync_writer = _open_csv_append(
+            os.path.join(experiment_dir, "sync_events.csv"), SYNC_CSV_COLUMNS)
 
     def check(self):
-        """Check if a new sync happened by reading checkpoint metadata."""
-        try:
-            import torch
-        except ImportError:
-            return
-        ckpt_path = os.path.join(self.ckpt_dir, "sim_0", "td3_safe_rl_agent.pt")
-        if not os.path.exists(ckpt_path):
+        """Check if a new sync happened by reading sync_status.json."""
+        status_path = os.path.join(self.ckpt_dir, "sync_status.json")
+        if not os.path.exists(status_path):
             return
         try:
-            ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-            sync_meta = ckpt.get("_last_sync")
-            if sync_meta is None:
-                return
+            with open(status_path) as f:
+                sync_meta = json.load(f)
             sync_time_str = sync_meta.get("time", "")
             if sync_time_str == self.last_sync_time_str:
                 return
@@ -1377,7 +1370,7 @@ class SyncMonitor:
             self.sync_file.flush()
             print(f"  [SYNC] #{self.sync_count} detected at {now:.0f}s")
         except Exception:
-            pass  # Checkpoint might be mid-write
+            pass  # Status file might be mid-write
 
     def close(self):
         self.sync_file.close()
