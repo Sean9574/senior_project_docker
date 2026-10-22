@@ -69,6 +69,27 @@ def test_room_obstacles_are_room_local_and_walls_are_tall(world8):
 
 
 @needs_mujoco
+def test_target_is_a_real_size_soda_can_standing_on_the_table(world8):
+    import mujoco
+    m = world8.model
+    d = mujoco.MjData(m)
+    mujoco.mj_forward(m, d)
+    gid = lambda name: mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_GEOM, name)
+    assert gid("room0_blue_target") < 0
+    can, top = gid("room0_can_body"), gid("room0_table_top")
+    assert can >= 0 and top >= 0
+    # 12 oz can: 66 mm across, 122 mm tall including the lids
+    assert m.geom_size[can][0] == pytest.approx(0.033, abs=1e-3)
+    lids = [gid("room0_can_top"), gid("room0_can_bottom")]
+    tallest = max(d.geom_xpos[g][2] + m.geom_size[g][1] for g in [can] + lids)
+    lowest = min(d.geom_xpos[g][2] - m.geom_size[g][1] for g in [can] + lids)
+    assert tallest - lowest == pytest.approx(0.122, abs=2e-3)
+    table_surface = d.geom_xpos[top][2] + m.geom_size[top][2]
+    assert lowest == pytest.approx(table_surface, abs=1e-3)
+    assert d.geom_xpos[can][:2] == pytest.approx(d.geom_xpos[top][:2], abs=1e-6)
+
+
+@needs_mujoco
 def test_robots_start_at_their_room_origins(world8):
     import mujoco
     d = mujoco.MjData(world8.model)

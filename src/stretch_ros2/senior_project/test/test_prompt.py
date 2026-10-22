@@ -18,7 +18,7 @@ def _never_called(_):
 
 def test_target_from_launch_args():
     assert prompt.target_from_argv(["ros2", "launch", "pkg", "f.launch.py", "target:=chair"]) == "chair"
-    assert prompt.target_from_argv(["target:=blue cylinder"]) == "blue cylinder"
+    assert prompt.target_from_argv(["target:=soda can"]) == "soda can"
     assert prompt.target_from_argv(["use_rviz:=false"]) is None
     assert prompt.target_from_argv(["target:="]) is None
 
@@ -27,31 +27,35 @@ def test_given_target_is_used_without_asking():
     assert prompt.ask_target(["target:=chair"], isatty=True, input_fn=_never_called) == "chair"
 
 
-def test_asks_until_it_gets_an_answer():
-    answers = iter(["", "   ", " potted plant "])
+def test_typed_answer_is_the_target():
     asked = []
 
     def fake_input(text):
         asked.append(text)
-        return next(answers)
+        return " potted plant "
 
     assert prompt.ask_target([], isatty=True, input_fn=fake_input) == "potted plant"
-    assert len(asked) == 3
-    assert "go to" in asked[0]
+    assert "go to" in asked[0] and "[soda can]" in asked[0]
 
 
-def test_non_interactive_start_without_target_exits_with_help():
-    with pytest.raises(SystemExit) as exc:
-        prompt.ask_target([], isatty=False, input_fn=_never_called)
-    assert "target:=" in str(exc.value)
+def test_enter_picks_the_soda_can_on_the_table():
+    answers = iter(["   "])
+
+    def enter_once(_):
+        return next(answers, None) or _never_called(_)  # must not ask twice
+
+    assert prompt.ask_target([], isatty=True, input_fn=enter_once) == "soda can"
 
 
-def test_closed_input_exits_instead_of_hanging():
+def test_non_interactive_start_uses_the_soda_can():
+    assert prompt.ask_target([], isatty=False, input_fn=_never_called) == "soda can"
+
+
+def test_closed_input_uses_the_soda_can_instead_of_hanging():
     def eof(_):
         raise EOFError
 
-    with pytest.raises(SystemExit):
-        prompt.ask_target([], isatty=True, input_fn=eof)
+    assert prompt.ask_target([], isatty=True, input_fn=eof) == "soda can"
 
 
 def test_show_args_never_asks():

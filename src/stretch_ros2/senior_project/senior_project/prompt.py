@@ -9,7 +9,8 @@ import time
 import urllib.parse
 from typing import Callable, List, Optional
 
-QUESTION = "What should the robot go to? (e.g. chair, potted plant, blue cylinder): "
+DEFAULT_TARGET = "soda can"  # the can on the table in config/scene.xml
+QUESTION = f"What should the robot go to? (e.g. chair, potted plant) [{DEFAULT_TARGET}]: "
 
 
 def target_from_argv(argv: List[str]) -> Optional[str]:
@@ -23,24 +24,19 @@ def target_from_argv(argv: List[str]) -> Optional[str]:
 
 def ask_target(argv: List[str], isatty: bool, input_fn: Callable[[str], str] = input) -> str:
     """Return the prompt: `target:=` from argv if given, otherwise ask in the
-    terminal until a non-empty answer. Never blocks a non-interactive process."""
+    terminal (Enter = the soda can). Non-interactive starts use the soda can."""
     if "--show-args" in argv or "-s" in argv:
         return ""
     given = target_from_argv(argv)
     if given:
         return given
     if not isatty:
-        raise SystemExit(
-            "No target given and no terminal to ask in. "
-            "Pass one, e.g.  target:=chair"
-        )
-    while True:
-        try:
-            answer = input_fn(QUESTION).strip()
-        except EOFError:
-            raise SystemExit("No target given. Pass one, e.g.  target:=chair")
-        if answer:
-            return answer
+        return DEFAULT_TARGET
+    try:
+        answer = input_fn(QUESTION).strip()
+    except EOFError:
+        return DEFAULT_TARGET
+    return answer or DEFAULT_TARGET
 
 
 def count_from_argv(argv: List[str], key: str = "num_robots") -> Optional[int]:

@@ -51,11 +51,12 @@ ros2 launch senior_project sam3_navigation.launch.py
 ```
 
 ```
-What should the robot go to? (e.g. chair, potted plant, blue cylinder): chair
+What should the robot go to? (e.g. chair, potted plant) [soda can]: chair
 ```
 
-Pass `target:=chair` to skip the question (needed when there is no terminal to
-ask in). The answer is kept for every episode, so training runs unattended. To
+Press Enter for the soda can on the table. Pass `target:=chair` to skip the
+question; with no terminal to ask in, the soda can is used. The answer is kept
+for every episode, so training runs unattended. To
 switch targets mid-run:
 
 ```bash
@@ -96,7 +97,7 @@ What happens each episode:
 3. Once SAM3 sees it, the goal appears and the robot is rewarded for closing the distance.
 4. The episode ends when the robot is within 0.45 m of the goal, or after 45 s.
 
-Objects in the default 10 × 10 m world: blue cylinder on a table, chair,
+Objects in the default 10 × 10 m world: a real-size soda can on a table, chair,
 bookshelf, potted plant, stool, trash can, coffee table, storage box.
 
 Training runs in three phases: 10,000 steps of a scripted expert, 5,000 random
@@ -154,7 +155,7 @@ ros2 launch senior_project grid_navigation.launch.py
 ```
 
 ```
-What should the robot go to? (e.g. chair, potted plant, blue cylinder): chair
+What should the robot go to? (e.g. chair, potted plant) [soda can]: chair
 How many robots? [8]:
 ```
 

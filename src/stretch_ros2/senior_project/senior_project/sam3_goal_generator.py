@@ -96,6 +96,7 @@ DEFAULT_OBJECT_SIZES: Dict[str, Tuple[float, float]] = {
     "potted plant": (0.3, 0.5),
     "teddy bear": (0.3, 0.4),
     # MuJoCo simulation objects
+    "soda can": (0.066, 0.122),  # the target on the table in config/scene.xml
     "cylinder": (0.1, 0.3),
     "blue cylinder": (0.1, 0.3),
     "red cylinder": (0.1, 0.3),
