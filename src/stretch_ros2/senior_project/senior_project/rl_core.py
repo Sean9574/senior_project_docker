@@ -121,3 +121,43 @@ def vector_transitions(prev_obs: list, actions: list, results: list, reset_fn) -
         else:
             next_obs.append(obs)
     return transitions, next_obs, finished
+
+
+def pooled_mean(groups) -> float:
+    """Mean over every value of every group (e.g. each robot's expert episode
+    returns): one baseline for the whole arena. 0.0 while all are empty."""
+    values = [v for g in groups for v in g]
+    return float(sum(values) / len(values)) if values else 0.0
+
+
+def drop_non_finite(transitions: list) -> Tuple[list, int]:
+    """Keep transitions (obs, act, reward, next_obs, terminated) whose reward
+    and observations are all finite; return (kept, number dropped)."""
+    kept = [tr for tr in transitions
+            if np.isfinite(tr[2]) and np.all(np.isfinite(tr[0])) and np.all(np.isfinite(tr[3]))]
+    return kept, len(transitions) - len(kept)
+
+
+# =============================================================================
+# Log rate limiting
+# =============================================================================
+
+class LogThrottle:
+    """Count repeated events and report them at most once per period, so a
+    flood prints one summary line instead of one line per event."""
+
+    def __init__(self, period_s: float):
+        self.period_s = period_s
+        self.pending = 0
+        self._last_report: Optional[float] = None
+
+    def add(self, now: float, n: int = 1) -> int:
+        """Record n events at time `now` (n=0 just polls). Returns how many
+        to report now, or 0 to stay quiet."""
+        self.pending += n
+        if self.pending == 0:
+            return 0
+        if self._last_report is not None and now - self._last_report < self.period_s:
+            return 0
+        count, self.pending, self._last_report = self.pending, 0, now
+        return count

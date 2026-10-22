@@ -131,3 +131,51 @@ def test_one_robot_finishing_does_not_disturb_the_others():
                            ("o2", "a2", -0.1, "n2", False)]  # timeout is not terminal
     assert next_obs == ["n0", "reset1", "reset2"]
     assert finished == [1, 2] and resets == [1, 2]
+
+
+def test_expert_avg_return_pools_every_robots_episodes():
+    # r0 ran 2 episodes, r1 none yet, r2 one: (1 + 3 + 8) / 3, not a mean of means
+    assert rl_core.pooled_mean([[1.0, 3.0], [], [8.0]]) == pytest.approx(4.0)
+
+
+def test_expert_avg_return_is_zero_before_any_episode():
+    assert rl_core.pooled_mean([[], []]) == 0.0
+
+
+def test_non_finite_transitions_are_dropped_and_counted():
+    ok = np.zeros(3)
+    good = (ok, "a", 0.5, ok, False)
+    transitions = [good,
+                   (np.array([0.0, np.nan, 0.0]), "a", 0.1, ok, False),  # bad obs
+                   (ok, "a", float("inf"), ok, True),                    # bad reward
+                   (ok, "a", 1.0, np.array([np.inf, 0.0, 0.0]), False)]  # bad next obs
+    kept, dropped = rl_core.drop_non_finite(transitions)
+    assert kept == [good] and dropped == 3
+
+
+# ---------------------------------------------------------------- log rate limit
+
+def test_first_event_is_reported_at_once():
+    assert rl_core.LogThrottle(30.0).add(100.0) == 1
+
+
+def test_flood_is_summed_into_one_report_per_period():
+    th = rl_core.LogThrottle(30.0)
+    assert th.add(100.0) == 1
+    assert th.add(110.0) == 0
+    assert th.add(120.0, 3) == 0
+    assert th.add(135.0) == 5     # 1 + 3 + 1 since the last report
+
+
+def test_held_count_is_released_by_a_quiet_poll():
+    th = rl_core.LogThrottle(30.0)
+    th.add(100.0)
+    th.add(101.0)
+    assert th.add(140.0, 0) == 1  # the flood stopped: still reported
+    assert th.add(200.0, 0) == 0  # nothing left
+
+
+def test_quiet_polls_do_not_delay_the_first_event():
+    th = rl_core.LogThrottle(30.0)
+    assert th.add(100.0, 0) == 0
+    assert th.add(101.0) == 1

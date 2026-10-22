@@ -125,6 +125,11 @@ CMD_SMOOTHING_ALPHA = 0.75
 # Step timing: after control_dt, wait up to this long for post-command sensor data
 FRESH_DATA_TIMEOUT = 0.3
 
+# Grid arena: warn when one robot's reset holds the others up longer than this.
+# Repeated warnings and dropped-transition counts print at most once per LOG_THROTTLE_S
+RESET_STALL_WARN_S = 1.0
+LOG_THROTTLE_S = 30.0
+
 # A topic goal that jumps farther than this re-baselines progress
 GOAL_MOVED_RESET_M = 0.5
 
@@ -2161,6 +2166,20 @@ def run_vector(args) -> None:
     obs = [env.reset()[0] for env in envs]
     carry, finished_since_replay_save, last_weights_save = 0, 0, time.time()
     demo_steps, start_steps = args.demo_steps, args.start_steps
+    drop_log, stall_log = rl_core.LogThrottle(LOG_THROTTLE_S), rl_core.LogThrottle(LOG_THROTTLE_S)
+
+    def reset_robot(i: int) -> np.ndarray:
+        """Reset robot i mid-run; the other robots wait for it, so warn if slow."""
+        start = time.time()
+        first_obs = envs[i].reset()[0]
+        took = time.time() - start
+        if took > RESET_STALL_WARN_S:
+            count = stall_log.add(time.time())
+            if count:
+                more = f" ({count - 1} more since the last warning)" if count > 1 else ""
+                log.warn(f"[ARENA] r{i} reset took {took:.1f}s, the other robots waited{more}")
+        return first_obs
+
     while t < args.total_steps:
         phase = rl_core.phase_for_step(t + 1, demo_steps, start_steps)
         actions = []
@@ -2181,18 +2200,29 @@ def run_vector(args) -> None:
         if phase == "EXPERT_DEMO":
             for i, (_, reward, _, _, info) in enumerate(results):
                 experts[i].track_reward(reward, success=info.get("success", False))
-        transitions, obs, finished = rl_core.vector_transitions(
-            obs, actions, results, lambda i: envs[i].reset()[0])
-        for o, a, r, o2, terminated in transitions:
-            if np.isfinite(r) and np.all(np.isfinite(o)) and np.all(np.isfinite(o2)):
-                replay.add(o, a, np.array([r], dtype=np.float32), o2,
-                           np.array([1.0 if terminated else 0.0], dtype=np.float32))
+        transitions, obs, finished = rl_core.vector_transitions(obs, actions, results, reset_robot)
+        kept, dropped = rl_core.drop_non_finite(transitions)
+        for o, a, r, o2, terminated in kept:
+            replay.add(o, a, np.array([r], dtype=np.float32), o2,
+                       np.array([1.0 if terminated else 0.0], dtype=np.float32))
         t += n
+        to_report = drop_log.add(time.time(), dropped)
+        if to_report:
+            log.error(f"[REPLAY] {to_report} non-finite transition(s) dropped (step {t:,}; "
+                      f"summed, at most one line per {LOG_THROTTLE_S:.0f}s)")
 
         if finished:
             if phase == "EXPERT_DEMO":
                 for i in finished:
+                    ret = experts[i].episode_return
                     experts[i].reset_episode()
+                    # One baseline for the arena: every robot's expert episodes pooled
+                    expert_avg = rl_core.pooled_mean([e.episode_returns for e in experts])
+                    for env in envs:
+                        env._expert_avg_return = expert_avg
+                    log.info(f"[EXPERT] r{i} ep={sum(e.total_episodes for e in experts)} "
+                             f"return={ret:+.1f} avg_return={expert_avg:+.1f} "
+                             f"goals={sum(e.total_goals_reached for e in experts)}")
             finished_since_replay_save += len(finished)
             if time.time() - last_weights_save > 30.0:
                 save_weights()
@@ -2200,6 +2230,11 @@ def run_vector(args) -> None:
             if finished_since_replay_save >= REPLAY_SAVE_EVERY_EPISODES:
                 save_replay()
                 finished_since_replay_save = 0
+
+        if phase == "EXPERT_DEMO" and rl_core.phase_for_step(t + 1, demo_steps, start_steps) != phase:
+            log.info(f"[EXPERT] demo phase complete: {sum(e.total_episodes for e in experts)} episodes, "
+                     f"avg_return={rl_core.pooled_mean([e.episode_returns for e in experts]):+.1f}, "
+                     f"goals={sum(e.total_goals_reached for e in experts)}, replay {replay.count:,}")
 
         if t >= min(args.update_after, demo_steps) and replay.count >= args.batch_size:
             updates, carry = rl_core.vector_update_count(n, args.update_every, carry)
