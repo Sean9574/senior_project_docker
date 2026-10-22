@@ -2479,6 +2479,7 @@ def main():
 
     rl_returns: deque = deque(maxlen=100)
     episodes_since_replay_save = 0
+    drop_log = rl_core.LogThrottle(LOG_THROTTLE_S)
 
     for t in range(start_step, args.total_steps + 1):
         shutdown_and_save._current_step = t
@@ -2513,15 +2514,18 @@ def main():
             expert.track_reward(reward, success=info.get("success", False))
 
         # Only true terminal states stop bootstrapping; a timeout is not one
-        if np.isfinite(reward) and np.all(np.isfinite(obs)) and np.all(np.isfinite(next_obs)):
+        kept, dropped = rl_core.drop_non_finite([(obs, act, reward, next_obs, terminated)])
+        for o, a, r, o2, term in kept:
             replay.add(
-                obs, act,
-                np.array([reward], dtype=np.float32),
-                next_obs,
-                np.array([1.0 if terminated else 0.0], dtype=np.float32),
+                o, a,
+                np.array([r], dtype=np.float32),
+                o2,
+                np.array([1.0 if term else 0.0], dtype=np.float32),
             )
-        else:
-            ros.get_logger().error(f"{R}[REPLAY] Non-finite transition dropped at step {t} (reward={reward}){RST}")
+        to_report = drop_log.add(time.time(), dropped)
+        if to_report:
+            ros.get_logger().error(f"{R}[REPLAY] {to_report} non-finite transition(s) dropped (step {t:,}; "
+                                   f"summed, at most one line per {LOG_THROTTLE_S:.0f}s){RST}")
         obs = next_obs
 
         if done:

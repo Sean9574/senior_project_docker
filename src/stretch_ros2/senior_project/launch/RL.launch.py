@@ -216,7 +216,8 @@ def _launch_setup(context):
             executable="joint_state_publisher",
             name="joint_state_publisher",
             namespace=LaunchConfiguration("ns"),
-            output="log",
+            # Panel on: stderr (its errors) to the log file too, not over the panel
+            output=out if panel else "log",
             parameters=[
                 {"source_list": ["/stretch/joint_states"]},
                 {"rate": 30.0},
