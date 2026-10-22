@@ -3,7 +3,8 @@ Physics core of the grid arena (no ROS): one MjModel/MjData for N robots.
 
 Per robot: wheel commands (same differential-drive conversion and limits as
 the single-robot driver), a 360-beam lidar ray-cast from the model's own lidar
-sites, room-frame odometry, and an in-place respawn that moves only that robot.
+sites, room-frame odometry, and an in-place respawn that moves only that robot
+and puts its arm and head back in the home pose.
 """
 
 import math
@@ -63,6 +64,7 @@ class Arena:
         self.rng = rng if rng is not None else np.random.default_rng()
         self.clearance = clearance
         self.cmd: List[Tuple[float, float]] = [(0.0, 0.0)] * len(world.rooms)
+        self.spawn_fallback = False  # last respawn found no free spot
 
         # every velocity DOF of each robot, zeroed on respawn
         self._dofs = []
@@ -75,11 +77,41 @@ class Arena:
                     dofs.extend(range(self.model.jnt_dofadr[j], self.model.jnt_dofadr[j] + n))
             self._dofs.append(np.array(dofs, dtype=int))
 
+        # home pose of each robot's arm and head (actuator targets and the
+        # joint positions that meet them), restored on every respawn
+        self._home_ctrl, self._home_qpos = [], []
         for room in world.rooms:
+            ctrl, qpos = [], []
             for name, value in HOME_CTRL.items():
                 if name in room.actuators:
-                    self.data.ctrl[room.actuators[name]] = head_tilt if name == "head_tilt" else value
+                    a = room.actuators[name]
+                    value = head_tilt if name == "head_tilt" else value
+                    ctrl.append((a, value))
+                    qpos.extend(self._target_qpos(a, value))
+            self._home_ctrl.append(ctrl)
+            self._home_qpos.append(qpos)
+        for i in range(len(world.rooms)):
+            self._go_home(i)
         mujoco.mj_forward(self.model, self.data)
+
+    def _target_qpos(self, a: int, value: float) -> List[Tuple[int, float]]:
+        """(qpos address, value) pairs that put actuator a's joint at its
+        target; a fixed tendon (the telescoping arm) is split over its joints."""
+        m, trn = self.model, int(self.model.actuator_trnid[a][0])
+        if m.actuator_trntype[a] == self._mj.mjtTrn.mjTRN_JOINT:
+            return [(int(m.jnt_qposadr[trn]), value)]
+        if m.actuator_trntype[a] == self._mj.mjtTrn.mjTRN_TENDON:
+            wraps = range(m.tendon_adr[trn], m.tendon_adr[trn] + m.tendon_num[trn])
+            coef = {int(m.wrap_objid[w]): float(m.wrap_prm[w]) for w in wraps}
+            norm = sum(c * c for c in coef.values())
+            return [(int(m.jnt_qposadr[j]), value * c / norm) for j, c in coef.items()]
+        return []
+
+    def _go_home(self, i: int) -> None:
+        for a, value in self._home_ctrl[i]:
+            self.data.ctrl[a] = value
+        for adr, value in self._home_qpos[i]:
+            self.data.qpos[adr] = value
 
     # ------------------------------------------------------------ control
     def set_cmd(self, i: int, v: float, w: float) -> None:
@@ -144,19 +176,23 @@ class Arena:
     # ------------------------------------------------------------ episodes
     def respawn(self, i: int) -> Tuple[float, float, float]:
         """Move robot i to a random collision-free pose in its room (room
-        frame), at rest. No other robot is touched."""
+        frame), at rest. No other robot is touched. If no free spot is found
+        it goes to the room centre and spawn_fallback is set."""
         room = self.world.rooms[i]
         pose = sample_spawn_pose(self.rng, room.obstacles, room.bounds, clearance=self.clearance)
+        self.spawn_fallback = pose is None
         x, y, yaw = pose if pose is not None else (0.0, 0.0, 0.0)
         self.respawn_at(i, x, y, yaw)
         return x, y, yaw
 
     def respawn_at(self, i: int, x: float, y: float, yaw: float) -> None:
-        """Put robot i at (x, y, yaw) in its room frame, at rest."""
+        """Put robot i at (x, y, yaw) in its room frame, at rest, arm and
+        head in the home pose."""
         room = self.world.rooms[i]
         adr = room.qpos_adr
         self.data.qpos[adr:adr + 3] = [room.origin[0] + x, room.origin[1] + y, self.model.qpos0[adr + 2]]
         self.data.qpos[adr + 3:adr + 7] = yaw_to_quat(yaw)
         self.data.qvel[self._dofs[i]] = 0.0
+        self._go_home(i)
         self.set_cmd(i, 0.0, 0.0)
         self._mj.mj_forward(self.model, self.data)

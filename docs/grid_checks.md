@@ -42,6 +42,9 @@ Watch the status panel for 2 minutes. Healthy looks like:
 - `SAM3 ok 2/2 "chair"`
 - `step` about 0.10-0.15 s
 - no `learner silent`
+- no `[ARENA] physics behind wall time` warning in the arena log in
+  `~/rl_checkpoints/logs` (physics is keeping real time)
+- no `[SPAWN] ... no collision-free spot found` warnings there either
 
 Then repeat with `num_robots:=8`. If anything goes wrong, the full logs are
 in `~/rl_checkpoints/logs` on the host.

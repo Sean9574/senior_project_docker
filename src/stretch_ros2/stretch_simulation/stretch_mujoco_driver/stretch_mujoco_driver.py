@@ -458,8 +458,9 @@ class StretchMujocoDriver(Node):
         theta = base_status.theta
         # stretch_mujoco computes these from actuator (= gear * wheel) velocities
         x_vel = base_status.x_vel / self._wheel_gear
-        # y_vel = base_status.y_vel #TODO: implement y_vel in base_status
-        y_vel = base_status.x_vel / self._wheel_gear
+        # Differential drive: no sideways velocity in the base frame (upstream
+        # copied x_vel here, reporting a sideways speed equal to the forward one)
+        y_vel = 0.0
 
         theta_vel = base_status.theta_vel / self._wheel_gear
 

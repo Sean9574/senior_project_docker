@@ -79,6 +79,7 @@ class ArenaSimNode(Node):
         if random_spawn:
             for i in range(self.n):
                 self.arena.respawn(i)
+                self._warn_if_fallback(i)
         self.get_logger().info(
             f"[ARENA] {self.n} robots in {self.n} rooms built in {time.time() - t0:.1f}s "
             f"(timestep {world.model.opt.timestep * 1000:.1f} ms, random_spawn={random_spawn})")
@@ -114,6 +115,7 @@ class ArenaSimNode(Node):
         with self.lock:
             if self.random_spawn:
                 x, y, yaw = self.arena.respawn(i)
+                self._warn_if_fallback(i)
             else:
                 x, y, yaw = 0.0, 0.0, 0.0
                 self.arena.respawn_at(i, x, y, yaw)
@@ -121,6 +123,11 @@ class ArenaSimNode(Node):
         response.success = True
         response.message = f"r{i} respawned at ({x:.2f}, {y:.2f}, {yaw:.2f})"
         return response
+
+    def _warn_if_fallback(self, i: int):
+        if self.arena.spawn_fallback:
+            self.get_logger().warn(
+                f"[SPAWN] r{i}: no collision-free spot found, using the room centre")
 
     # ------------------------------------------------------------ physics thread
     def _physics_loop(self):

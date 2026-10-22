@@ -129,6 +129,46 @@ def test_respawn_at_places_the_robot_at_rest_in_room_frame():
     assert a.cmd[1] == (0.0, 0.0)
 
 
+def _joint_qpos(a, name):
+    import mujoco
+    j = mujoco.mj_name2id(a.model, mujoco.mjtObj.mjOBJ_JOINT, name)
+    return a.data.qpos[a.model.jnt_qposadr[j]]
+
+
+def _set_joint_qpos(a, name, value):
+    import mujoco
+    j = mujoco.mj_name2id(a.model, mujoco.mjtObj.mjOBJ_JOINT, name)
+    a.data.qpos[a.model.jnt_qposadr[j]] = value
+
+
+@needs_mujoco
+def test_respawn_puts_arm_and_head_back_in_the_home_pose():
+    a = _arena(2)
+    # last episode left robot 0's lift low, arm in and head turned
+    for name, value in (("joint_lift", 0.1), ("joint_head_pan", 1.0), ("joint_head_tilt", -0.5),
+                        ("joint_arm_l0", 0.0), ("joint_arm_l1", 0.0)):
+        _set_joint_qpos(a, "r0_" + name, value)
+    _set_joint_qpos(a, "r1_joint_lift", 0.2)
+    a.respawn_at(0, 0.0, 0.0, 0.0)
+    home = arena_core.HOME_CTRL
+    assert _joint_qpos(a, "r0_joint_lift") == pytest.approx(home["lift"])
+    assert _joint_qpos(a, "r0_joint_head_pan") == pytest.approx(home["head_pan"])
+    assert _joint_qpos(a, "r0_joint_head_tilt") == pytest.approx(0.0)  # Arena head_tilt default
+    arm = sum(_joint_qpos(a, f"r0_joint_arm_l{k}") for k in range(4))
+    assert arm == pytest.approx(home["arm"])
+    assert _joint_qpos(a, "r1_joint_lift") == pytest.approx(0.2)  # other robot untouched
+
+
+@needs_mujoco
+def test_respawn_reports_when_it_falls_back_to_the_room_centre():
+    a = _arena(1)
+    a.respawn(0)
+    assert a.spawn_fallback is False
+    a.clearance = 100.0  # no spot in a 10 m room is 100 m from everything
+    assert a.respawn(0) == (0.0, 0.0, 0.0)
+    assert a.spawn_fallback is True
+
+
 def _quat_xyzw_to_mat(q):
     x, y, z, w = q
     return np.array([[1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
