@@ -6,6 +6,7 @@ status_panel.py feeds it ROS messages; this module only keeps the numbers and
 turns them into text, so it is unit-tested without ROS (test/test_status_panel.py).
 """
 
+import os
 import re
 import time
 from collections import deque
@@ -15,10 +16,13 @@ STALE_AFTER_S = 30.0      # learner silent this long -> flagged
 RATE_WINDOW_S = 60.0      # steps/s measured over this window
 WINDOW_EPISODES = 20      # success / seen / return statistics
 MAX_ALERTS = 3
+MIN_WIDTH = 40            # narrower than this and the rows stop making sense
 
 LEVEL_NAMES = {30: "WARN", 40: "ERROR", 50: "FATAL"}  # rcl_interfaces/Log levels
 NO_DATA_HINT_AFTER_S = 90.0   # learner never reported -> probably crashed at startup
+NO_CAMERA_AFTER_S = 10.0      # goal generator without a camera frame this long -> "no camera"
 ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+HOME, CLEAR_EOL, CLEAR_BELOW = "\x1b[H", "\x1b[K", "\x1b[J"
 
 
 def _duration(seconds: float) -> str:
@@ -26,6 +30,22 @@ def _duration(seconds: float) -> str:
     h, rem = divmod(seconds, 3600)
     m, s = divmod(rem, 60)
     return f"{h}h{m:02d}m" if h else (f"{m}m{s:02d}s" if m else f"{s}s")
+
+
+def terminal_width(tty: str = "/dev/tty") -> int:
+    """Columns of the terminal the launch runs in (80 if unknown), at least MIN_WIDTH.
+
+    Asks the controlling terminal, not stdout: under ros2 launch stdout is the
+    pty that emulate_tty creates, which has no size (0x0), so it always said 80."""
+    try:
+        fd = os.open(tty, os.O_RDONLY | os.O_NOCTTY)
+        try:
+            columns = os.get_terminal_size(fd).columns
+        finally:
+            os.close(fd)
+    except OSError:  # no controlling terminal (nohup, docker without -t)
+        columns = 0
+    return max(columns or 80, MIN_WIDTH)
 
 
 def _clock(seconds: float) -> str:
@@ -66,6 +86,8 @@ class PanelState:
 
         self.sam3_confirmed: Optional[bool] = None
         self.sam3_target = ""
+        # Camera frames reaching the goal generator, per robot (key None = single robot)
+        self.camera_ok: dict = {}
 
         # Grid arena: latest numbers per robot (key None = single-robot run)
         self.robots: dict = {}
@@ -138,6 +160,8 @@ class PanelState:
         return any(k is not None for k in self.robots)
 
     def on_generator_status(self, d: dict, now: float, robot: Optional[int] = None) -> None:
+        if "frame_age_s" in d:  # seconds since the generator's last camera frame
+            self.camera_ok[robot] = float(d["frame_age_s"]) <= NO_CAMERA_AFTER_S
         if robot is not None:
             if "prompt_confirmed" in d:
                 self.robot_sam3[robot] = bool(d["prompt_confirmed"])
@@ -183,9 +207,10 @@ def _progress(state: PanelState) -> str:
     return f"{state.global_step:,} / {state.total_steps:,}  [{bar}] {int(frac * 100)}%"
 
 
-def _eta(state: PanelState) -> str:
+def _eta(state: PanelState, now: float) -> str:
     rate = state.steps_per_sec()
-    if rate <= 0 or state.total_steps <= 0:
+    # silent learner: the last rate says nothing about the remaining time
+    if rate <= 0 or state.total_steps <= 0 or state.silent_for(now) is not None:
         return "ETA --"
     return f"ETA {_duration((state.total_steps - state.global_step) / rate)}   ~{rate:.0f} steps/s"
 
@@ -193,10 +218,15 @@ def _eta(state: PanelState) -> str:
 def _sam3(state: PanelState) -> str:
     target = state.sam3_target or state.target
     if state.robot_sam3:
+        blind = sorted(r for r, ok in state.camera_ok.items() if not ok)
+        if blind:
+            return "no camera: " + ", ".join(f"r{r}" for r in blind)
         bad = sorted(r for r, ok in state.robot_sam3.items() if not ok)
         if bad:
             return "SAM3 NOT CONFIRMED: " + ", ".join(f"r{r}" for r in bad)
         return f'SAM3 ok {len(state.robot_sam3)}/{len(state.robots) or len(state.robot_sam3)} "{target}"'
+    if state.camera_ok.get(None) is False:  # SAM3 has nothing to look at
+        return f'no camera frames (SAM3 "{target}")'
     if state.sam3_confirmed is None:
         return f'SAM3 waiting for "{target}"'
     if not state.sam3_confirmed:
@@ -217,7 +247,7 @@ def render(state: PanelState, now: float, width: int = 80) -> List[str]:
             lines.append(" !!       no data yet -- the learner may have crashed, check the logs")
     else:
         lines.append(f" Phase    {state.phase or '?':<11} {_progress(state)}")
-        lines.append(f"          {_eta(state)}")
+        lines.append(f"          {_eta(state, now)}")
         if state.is_arena:
             for robot in sorted(k for k in state.robots if k is not None):
                 row = state.robots[robot]
@@ -269,6 +299,12 @@ def render(state: PanelState, now: float, width: int = 80) -> List[str]:
     lines.append("")
     lines.append(f" logs: {state.log_dir}   (Ctrl+C stops training)")
     return [line[:width] for line in lines]
+
+
+def frame(lines: List[str]) -> str:
+    """One redraw, written at once: overwrite the old panel in place (clearing the
+    whole screen first flashes it blank -> flicker), then wipe whatever is below."""
+    return HOME + "\n".join(line + CLEAR_EOL for line in lines) + CLEAR_BELOW + "\n"
 
 
 def summary_line(state: PanelState, now: float) -> str:

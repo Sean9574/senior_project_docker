@@ -81,7 +81,9 @@ The terminal turns into a live status panel (redrawn every half second):
 
 - **Last 20:** `+` reached the object, `-` timed out. *seen* is how often SAM3 spotted it at all.
 - **Health:** `SAM3 NOT CONFIRMED` means the server never accepted your prompt. If the
-  learner stops reporting for 30 s, a `learner silent` line appears.
+  learner stops reporting for 30 s, a `learner silent` line appears and the ETA
+  shows `ETA --`. `no camera frames` (`no camera: r1` in the grid) means SAM3 has
+  had no image for 10 s, so it has nothing to look for the object in.
 - **Alerts:** the latest warnings and errors from any node; repeats are counted (`x3`), not repeated.
 - **Logs:** full node output goes to `~/rl_checkpoints/logs` on the host. Add
   `status_panel:=false` to get the old scrolling output instead. When output is

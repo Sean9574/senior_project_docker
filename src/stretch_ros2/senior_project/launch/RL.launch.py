@@ -199,7 +199,8 @@ def _launch_setup(context):
             executable="robot_state_publisher",
             name="robot_state_publisher",
             namespace=LaunchConfiguration("ns"),
-            output=out,
+            # Panel off: screen and the launch log file, as before the panel
+            output=out if panel else "both",
             parameters=[
                 {"robot_description": robot_description_content},
                 {"publish_frequency": 30.0},
@@ -317,6 +318,7 @@ def _launch_setup(context):
             LaunchConfiguration("eval_episodes"),
         ],
         output=out,
+        name="learner",
         condition=IfCondition(LaunchConfiguration("run_rl")),
         
     )
@@ -335,6 +337,7 @@ def _launch_setup(context):
             '--experiment', PathJoinSubstitution([LaunchConfiguration("ckpt_dir"), "monitor"]),
         ],
         output=out,
+        name="reward_monitor",
         condition=IfCondition(LaunchConfiguration("use_reward_monitor")),
     )
     
@@ -354,17 +357,20 @@ def _launch_setup(context):
             target_action=learner_proc,
             on_exit=[Shutdown(reason="learner exited -- full node logs are in $ROS_LOG_DIR")],
         )))
+        # Redirected output (docker logs, nohup): summary lines, no redraws, and a
+        # pipe instead of a pty (a pty turns every "\n" into "\r\n" -> ^M in the log)
+        tty = sys.stdout.isatty()
         actions.append(
             ExecuteProcess(
                 cmd=[
                     "python3", "-m", "senior_project.status_panel",
                     "--total-steps", LaunchConfiguration("total_steps"),
                     "--target", LaunchConfiguration("target"),
-                    # Redirected output (docker logs, nohup): summary lines, no redraws
-                    *([] if sys.stdout.isatty() else ["--plain"]),
+                    *([] if tty else ["--plain"]),
                 ],
+                name="status_panel",  # not python3-N in launch output and logs
                 output="screen",
-                emulate_tty=True,
+                emulate_tty=tty,
                 output_format="{line}",
             )
         )

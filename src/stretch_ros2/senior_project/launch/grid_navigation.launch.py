@@ -146,9 +146,12 @@ def _setup(context):
             target_action=learner,
             on_exit=[Shutdown(reason="learner exited -- full node logs are in $ROS_LOG_DIR")],
         )))
+        # Redirected output (docker logs, nohup): summary lines, no redraws, and a
+        # pipe instead of a pty (a pty turns every "\n" into "\r\n" -> ^M in the log)
+        tty = sys.stdout.isatty()
         actions.append(ExecuteProcess(
             cmd=["python3", "-m", "senior_project.status_panel",
                  "--num-robots", str(n), "--total-steps", arg("total_steps"), "--target", arg("target"),
-                 *([] if sys.stdout.isatty() else ["--plain"])],
-            output="screen", emulate_tty=True, output_format="{line}", name="status_panel"))
+                 *([] if tty else ["--plain"])],
+            output="screen", emulate_tty=tty, output_format="{line}", name="status_panel"))
     return actions

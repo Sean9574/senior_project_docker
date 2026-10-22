@@ -326,7 +326,9 @@ class SAM3GoalGeneratorV2(Node):
         self.set_sam3_prompt(self.target, timeout_s=180.0)
         self.check_mono_depth_server()
         self._init_gui()
-        
+        # Camera frames only arrive once spinning: ~/status counts the wait from here
+        self._last_rgb_time = time.time()
+
         # Subscribe to goal reached topic for target cycling
         self.create_subscription(
             PointStamped, f'/{self.ns}/goal_reached', self.goal_reached_callback, 10
@@ -594,6 +596,7 @@ class SAM3GoalGeneratorV2(Node):
     def rgb_callback(self, msg: Image):
         with self.lock:
             self.latest_rgb = self.bridge.imgmsg_to_cv2(msg, 'bgr8')
+            self._last_rgb_time = time.time()
 
     def depth_callback(self, msg: Image):
         with self.lock:
@@ -912,13 +915,22 @@ class SAM3GoalGeneratorV2(Node):
     def viz_callback(self):
         """Fast callback for smooth visualization (15+ Hz)."""
         with self.lock:
-            if self.latest_rgb is None:
-                return
-            rgb = self.latest_rgb.copy()
+            rgb = self.latest_rgb.copy() if self.latest_rgb is not None else None
             depth = self.latest_depth.copy() if self.latest_depth is not None else None
+
+        if rgb is None:
+            # No camera frame yet: report anyway, so the status panel says "no camera"
+            self._publish_status({'found': False, 'target': self.target, 'message': 'No camera frame yet'})
+            return
 
         # Always publish visualization with latest SAM3 results overlay
         self._publish_visualization(rgb, depth)
+
+    def _publish_status(self, status: dict):
+        """~/status for the terminal panel: prompt confirmed, camera frames arriving."""
+        status['prompt_confirmed'] = self._prompt_confirmed
+        status['frame_age_s'] = time.time() - self._last_rgb_time
+        self.status_pub.publish(String(data=json.dumps(status)))
 
     def sam3_callback(self):
         """Slower callback for SAM3 detection (2 Hz)."""
@@ -1159,8 +1171,7 @@ class SAM3GoalGeneratorV2(Node):
                 'locked_goal': list(self._locked_goal) if self._locked_goal else None,
             }
 
-        status['prompt_confirmed'] = self._prompt_confirmed
-        self.status_pub.publish(String(data=json.dumps(status)))
+        self._publish_status(status)
 
         # ===== Build visualization =====
         orig_h, orig_w = viz_base.shape[0], viz_base.shape[1]

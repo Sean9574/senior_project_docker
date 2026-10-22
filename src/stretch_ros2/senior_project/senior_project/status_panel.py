@@ -7,14 +7,13 @@ learner's /reward_breakdown, the SAM3 goal generator's status and /rosout
 (warnings and errors from every node) and redraws one panel in place, so the
 launch terminal shows progress instead of interleaved node logs.
 
-With --plain (stdout is not a terminal: docker logs, nohup) it prints one
-summary line every 30 s instead of redrawing.
+With --plain, or when stdout is not a terminal (docker logs, nohup), it
+prints one summary line every 30 s instead of redrawing.
 """
 
 import argparse
 import json
 import os
-import shutil
 import sys
 import time
 
@@ -23,7 +22,7 @@ from rcl_interfaces.msg import Log
 from rclpy.node import Node
 from std_msgs.msg import String
 
-from senior_project.status_panel_core import PanelState, render, summary_line
+from senior_project.status_panel_core import PanelState, frame, render, summary_line, terminal_width
 
 try:
     from rclpy.executors import ExternalShutdownException
@@ -31,7 +30,6 @@ except ImportError:  # older rclpy
     class ExternalShutdownException(Exception):
         pass
 
-CLEAR = "\x1b[H\x1b[2J"
 HIDE_CURSOR = "\x1b[?25l"
 SHOW_CURSOR = "\x1b[?25h"
 
@@ -71,8 +69,7 @@ class StatusPanelNode(Node):
     def _draw(self):
         now = time.time()
         if self.interactive:
-            width = shutil.get_terminal_size((80, 24)).columns
-            sys.stdout.write(CLEAR + "\n".join(render(self.state, now, width)) + "\n")
+            sys.stdout.write(frame(render(self.state, now, terminal_width())))
         else:
             sys.stdout.write(summary_line(self.state, now) + "\n")
         sys.stdout.flush()
@@ -91,7 +88,8 @@ def main():
         os.environ.get("ROS_HOME", os.path.expanduser("~/.ros")), "log")
     state = PanelState(total_steps=args.total_steps, target=args.target,
                        domain=os.environ.get("ROS_DOMAIN_ID", "0"), log_dir=log_dir)
-    interactive = not args.plain
+    # Redraws only on a terminal; anything else gets plain lines (no ANSI codes)
+    interactive = not args.plain and sys.stdout.isatty()
 
     rclpy.init()
     node = StatusPanelNode(state, interactive, num_robots=args.num_robots)

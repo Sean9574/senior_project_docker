@@ -3,11 +3,17 @@
 Run: python3 -m pytest src/stretch_ros2/senior_project/test/test_status_panel.py
 """
 
+import fcntl
 import os
+import pty
+import struct
 import sys
+import termios
+from contextlib import contextmanager
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from senior_project.status_panel_core import PanelState, render, summary_line  # noqa: E402
+from senior_project.status_panel_core import (  # noqa: E402
+    MIN_WIDTH, PanelState, frame, render, summary_line, terminal_width)
 
 
 def _state():
@@ -52,6 +58,14 @@ def test_progress_rate_and_eta():
     assert "ETA 4h59m" in out
 
 
+def test_eta_is_unknown_while_the_learner_is_silent():
+    s = _state()
+    s.on_breakdown(_bd(global_step=1_000), 0.0)
+    s.on_breakdown(_bd(global_step=2_100), 100.0)
+    out = _text(s, 140.0)
+    assert "ETA --" in out and "ETA 4h59m" not in out
+
+
 def test_search_vs_goal_seek():
     s = _state()
     s.on_breakdown(_bd(mode="explore"), 1.0)
@@ -76,6 +90,15 @@ def test_unconfirmed_sam3_prompt_is_flagged():
     assert 'SAM3 ok "chair"' in _text(s, 2.0)
 
 
+def test_no_camera_frames_is_not_reported_as_sam3_waiting():
+    s = _state()
+    s.on_generator_status({"target": "chair", "prompt_confirmed": True, "frame_age_s": 15.0}, 1.0)
+    out = _text(s, 1.0)
+    assert "no camera" in out and "SAM3 waiting" not in out and "SAM3 ok" not in out
+    s.on_generator_status({"target": "chair", "prompt_confirmed": True, "frame_age_s": 0.5}, 2.0)
+    assert 'SAM3 ok "chair"' in _text(s, 2.0)
+
+
 def test_alerts_dedupe_ignore_info_and_keep_last_three():
     s = _state()
     s.on_log(20, "learner", "just info", 1.0)
@@ -95,6 +118,39 @@ def test_every_line_fits_the_terminal():
     s.on_breakdown(_bd(), 0.0)
     s.on_log(40, "sam3_goal_generator", "x" * 300, 1.0)
     assert all(len(line) <= 40 for line in render(s, 2.0, 40))
+
+
+@contextmanager
+def _terminal(columns):
+    """A real pseudo-terminal `columns` wide; yields its device path."""
+    master, slave = pty.openpty()
+    fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, columns, 0, 0))
+    try:
+        yield os.ttyname(slave)
+    finally:
+        os.close(master)
+        os.close(slave)
+
+
+def test_width_is_the_real_terminal_width():
+    with _terminal(132) as tty:
+        assert terminal_width(tty) == 132
+
+
+def test_width_never_drops_below_the_minimum():
+    with _terminal(10) as tty:
+        assert terminal_width(tty) == MIN_WIDTH
+
+
+def test_width_falls_back_to_80_without_a_sized_terminal(tmp_path):
+    with _terminal(0) as tty:  # what launch's emulate_tty hands the panel
+        assert terminal_width(tty) == 80
+    assert terminal_width(str(tmp_path / "no-tty")) == 80
+
+
+def test_redraw_overwrites_in_place_instead_of_clearing_the_screen():
+    # cursor home, each line then clear-to-end-of-line, clear below the last one
+    assert frame(["a", "b"]) == "\x1b[Ha\x1b[K\nb\x1b[K\x1b[J\n"
 
 
 def test_summary_is_a_single_line():
@@ -151,3 +207,10 @@ def test_arena_sam3_confirmation_per_robot():
     assert "SAM3 NOT CONFIRMED: r1" in _text(s, 1.0)
     s.on_generator_status({"target": "chair", "prompt_confirmed": True}, 2.0, robot=1)
     assert 'SAM3 ok 2/2 "chair"' in _text(s, 2.0)
+
+
+def test_arena_names_robots_without_camera_frames():
+    s = _state()
+    s.on_generator_status({"target": "chair", "prompt_confirmed": True, "frame_age_s": 0.5}, 1.0, robot=0)
+    s.on_generator_status({"target": "chair", "prompt_confirmed": True, "frame_age_s": 20.0}, 1.0, robot=1)
+    assert "no camera: r1" in _text(s, 1.0)
