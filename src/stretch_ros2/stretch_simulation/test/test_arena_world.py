@@ -78,15 +78,28 @@ def test_target_is_a_real_size_soda_can_standing_on_the_table(world8):
     assert gid("room0_blue_target") < 0
     can, top = gid("room0_can_body"), gid("room0_table_top")
     assert can >= 0 and top >= 0
-    # 12 oz can: 66 mm across, 122 mm tall including the lids
-    assert m.geom_size[can][0] == pytest.approx(0.033, abs=1e-3)
+    # 12 oz can: 66 mm across, 122 mm tall including the lids (geom_aabb:
+    # local centre + half sizes, the same for the mesh body and the lids)
+    assert m.geom_aabb[can][3] == pytest.approx(0.033, abs=1e-3)
     lids = [gid("room0_can_top"), gid("room0_can_bottom")]
-    tallest = max(d.geom_xpos[g][2] + m.geom_size[g][1] for g in [can] + lids)
-    lowest = min(d.geom_xpos[g][2] - m.geom_size[g][1] for g in [can] + lids)
+    tallest = max(d.geom_xpos[g][2] + m.geom_aabb[g][2] + m.geom_aabb[g][5] for g in [can] + lids)
+    lowest = min(d.geom_xpos[g][2] + m.geom_aabb[g][2] - m.geom_aabb[g][5] for g in [can] + lids)
     assert tallest - lowest == pytest.approx(0.122, abs=2e-3)
     table_surface = d.geom_xpos[top][2] + m.geom_size[top][2]
     assert lowest == pytest.approx(table_surface, abs=1e-3)
     assert d.geom_xpos[can][:2] == pytest.approx(d.geom_xpos[top][:2], abs=1e-6)
+
+
+@needs_mujoco
+def test_can_wears_a_printed_label_so_sam3_sees_a_soda_can(world8):
+    import mujoco
+    m = world8.model
+    can = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_GEOM, "room0_can_body")
+    assert m.geom_type[can] == mujoco.mjtGeom.mjGEOM_MESH
+    assert m.mesh_texcoordnum[m.geom_dataid[can]] > 0  # wrapped round the can
+    tex = m.mat_texid[m.geom_matid[can]][mujoco.mjtTextureRole.mjTEXROLE_RGB]
+    assert tex >= 0 and m.tex_type[tex] == mujoco.mjtTexture.mjTEXTURE_2D
+    assert m.tex_width[tex] >= 512
 
 
 @needs_mujoco

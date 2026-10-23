@@ -82,6 +82,11 @@ def _room_spec(room_xml: str, wall_height: float):
     import mujoco
     text = open(room_xml).read()
     text = re.sub(r'<include file="[^"]*stretch[^"]*\.xml"\s*/>', "", text)
+    # Asset files (the can label) sit next to the room XML, but a spec made
+    # from a string has no folder to look in: make their paths absolute
+    room_dir = os.path.dirname(os.path.abspath(room_xml))
+    text = re.sub(r'(<(?:texture|mesh|hfield)\b[^>]*?\bfile=")([^"/][^"]*)"',
+                  lambda m: f'{m.group(1)}{os.path.join(room_dir, m.group(2))}"', text)
     # One static carrier body so the whole room attaches (and moves) as a unit
     text = text.replace("<worldbody>", '<worldbody><body name="room">', 1)
     text = text.replace("</worldbody>", "</body></worldbody>", 1)

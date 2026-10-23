@@ -396,6 +396,8 @@ RUN mkdir -p $AMENT_WS/install/stretch_description/share/stretch_description/urd
 # explore_arena.xml (30x30 m) is selectable with mujoco_xml:=<models>/explore_arena.xml
 RUN cp $AMENT_WS/src/stretch_ros2/senior_project/config/scene.xml \
        $AMENT_WS/src/stretch_mujoco/stretch_mujoco/models/scene.xml && \
+    cp $AMENT_WS/src/stretch_ros2/senior_project/config/can_label.png \
+       $AMENT_WS/src/stretch_mujoco/stretch_mujoco/models/assets/can_label.png && \
     cp $AMENT_WS/src/stretch_ros2/senior_project/map/map.xml \
        $AMENT_WS/src/stretch_mujoco/stretch_mujoco/models/explore_arena.xml
 
