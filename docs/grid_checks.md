@@ -29,7 +29,9 @@ python3 -m senior_project.sam3_server --port 8100 &   # wait for "Uvicorn runnin
 python3 -m senior_project.sam3_bench --robots 8 --seconds 30
 ```
 
-Needs `verdict OK`: each robot gets at least the planned 1 Hz.
+Needs `verdict OK`: each robot gets at least the planned 1 Hz. Every request
+sends a different frame, as moving robots do. For comparison, a laptop RTX 3070
+Ti got 3.1 req/s in total: 0.39 Hz per robot with 8 robots (`TOO SLOW`).
 
 ## 4. First full launch
 

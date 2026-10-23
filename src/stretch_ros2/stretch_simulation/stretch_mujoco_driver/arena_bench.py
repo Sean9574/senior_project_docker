@@ -36,6 +36,8 @@ def main():
     parser.add_argument("--robots", type=int, default=8)
     parser.add_argument("--seconds", type=float, default=5.0, help="simulated seconds to time")
     parser.add_argument("--cameras", action="store_true", help="also time head-camera renders (needs GL)")
+    parser.add_argument("--width", type=int, default=1280, help="camera render size (arena_sim default)")
+    parser.add_argument("--height", type=int, default=720)
     parser.add_argument("--timestep", type=float, default=0.004, help="physics step (arena_sim default)")
     parser.add_argument("--robot-xml", default="")
     parser.add_argument("--room-xml", default="")
@@ -67,14 +69,21 @@ def main():
 
     if args.cameras:
         import mujoco
-        r = mujoco.Renderer(world.model, width=212, height=120)
+        world.model.vis.global_.offwidth = max(world.model.vis.global_.offwidth, args.width)
+        world.model.vis.global_.offheight = max(world.model.vis.global_.offheight, args.height)
+        rgb = mujoco.Renderer(world.model, width=args.width, height=args.height)
+        depth = mujoco.Renderer(world.model, width=args.width, height=args.height)
+        depth.enable_depth_rendering()
         t0 = time.perf_counter()
         for _ in range(reps):
-            for room in world.rooms:
-                r.update_scene(arena.data, camera=room.camera_rgb)
-                r.render()
+            for room in world.rooms:  # what arena_sim renders per robot per camera tick
+                rgb.update_scene(arena.data, camera=room.camera_rgb)
+                rgb.render()
+                depth.update_scene(arena.data, camera=room.camera_depth)
+                depth.render()
         per = (time.perf_counter() - t0) / (reps * args.robots)
-        print(f"camera     {per * 1000:.2f} ms/render   max {1.0 / (per * args.robots):.1f} Hz per robot (RGB only)")
+        print(f"camera     {per * 1000:.2f} ms/frame   max {1.0 / (per * args.robots):.1f} Hz per robot "
+              f"(RGB + depth, {args.width}x{args.height})")
 
     budget = 1.0 / CONTROL_HZ
     load = wall / args.seconds + per_scan * SCAN_HZ * args.robots

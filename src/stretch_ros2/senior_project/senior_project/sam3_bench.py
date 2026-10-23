@@ -25,21 +25,31 @@ def main():
     parser.add_argument("--seconds", type=float, default=30.0)
     parser.add_argument("--url", default="http://localhost:8100")
     parser.add_argument("--prompt", default="chair")
-    parser.add_argument("--width", type=int, default=212)
-    parser.add_argument("--height", type=int, default=120)
+    # The goal generator sends the 1280x720 head-camera frame turned upright
+    parser.add_argument("--width", type=int, default=720)
+    parser.add_argument("--height", type=int, default=1280)
     args = parser.parse_args()
 
     requests.post(f"{args.url}/prompt/{args.prompt}", timeout=10).raise_for_status()
-    img = (np.random.default_rng(0).random((args.height, args.width, 3)) * 255).astype(np.uint8)
-    _, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 60])
-    payload = {"image_base64": base64.b64encode(buf).decode(), "confidence_threshold": 0.2}
+    # A different frame every request, as from moving robots: the server skips
+    # the encoder for a repeated frame, which made one frame sent over and
+    # over look ~5x faster than SAM3 is. Blurred noise compresses about like a
+    # rendered frame (raw noise JPEGs are ~20x bigger).
+    payloads = []
+    for seed in range(2 * args.robots):
+        noise = (np.random.default_rng(seed).random((args.height, args.width, 3)) * 255).astype(np.uint8)
+        _, buf = cv2.imencode(".jpg", cv2.GaussianBlur(noise, (0, 0), 8), [cv2.IMWRITE_JPEG_QUALITY, 60])
+        payloads.append({"image_base64": base64.b64encode(buf).decode(), "confidence_threshold": 0.2})
 
-    latencies, errors, lock = [], [0], threading.Lock()
+    latencies, errors, sent, lock = [], [0], [0], threading.Lock()
     stop_at = time.time() + args.seconds
 
     def client():
         session = requests.Session()
         while time.time() < stop_at:
+            with lock:
+                payload = payloads[sent[0] % len(payloads)]
+                sent[0] += 1
             t0 = time.perf_counter()
             try:
                 session.post(f"{args.url}/segment", json=payload, timeout=10).raise_for_status()
