@@ -29,6 +29,7 @@ from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import CameraInfo, Image
 from std_msgs.msg import Empty, String
 
+from senior_project import sam3_upright
 from senior_project.prompt import send_prompt
 from tf2_ros import Buffer, TransformException, TransformListener
 from tf_transformations import euler_from_quaternion, quaternion_matrix
@@ -955,16 +956,21 @@ class SAM3GoalGeneratorV2(Node):
 
     def _send_sam3_request(self, rgb: np.ndarray):
         """Send image to SAM3 server in background thread."""
+        # The camera is sideways and SAM3 misses far more on sideways images:
+        # send it upright, then map its answer back to raw pixels (sam3_upright)
+        upright = self.rotate_viz_90_clockwise
+        rgb_for_sam3 = sam3_upright.to_upright(rgb) if upright else rgb
+
         # Downscale image for faster SAM3 inference
-        orig_h, orig_w = rgb.shape[:2]
+        orig_h, orig_w = rgb_for_sam3.shape[:2]
         scale_factor = 1.0
-        rgb_for_sam3 = rgb
-        
+
         if orig_w > self.sam3_max_width:
             scale_factor = self.sam3_max_width / orig_w
             new_w = self.sam3_max_width
             new_h = int(orig_h * scale_factor)
-            rgb_for_sam3 = cv2.resize(rgb, (new_w, new_h), interpolation=cv2.INTER_AREA)
+            rgb_for_sam3 = cv2.resize(rgb_for_sam3, (new_w, new_h), interpolation=cv2.INTER_AREA)
+        sent_w = rgb_for_sam3.shape[1]
 
         _, buf = cv2.imencode('.jpg', rgb_for_sam3, [cv2.IMWRITE_JPEG_QUALITY, self.sam3_jpeg_quality])
         img_b64 = base64.b64encode(buf).decode()
@@ -980,6 +986,8 @@ class SAM3GoalGeneratorV2(Node):
                     timeout=5  # Reduced from 10s - fail faster if server is overloaded
                 )
                 result = r.json()
+                if upright:
+                    self._result_to_raw(result, sent_w)
                 # Store scale factor with result for coordinate adjustment
                 result['_scale_factor'] = scale_factor
                 with self._sam3_lock:
@@ -993,6 +1001,20 @@ class SAM3GoalGeneratorV2(Node):
                 self._sam3_busy = False
 
         threading.Thread(target=run_sam3, daemon=True).start()
+
+    def _result_to_raw(self, result: dict, upright_w: int):
+        """Boxes and masks SAM3 found in the upright frame -> raw (sideways)
+        frame pixels, in place, so everything downstream is unchanged."""
+        result['boxes'] = [sam3_upright.box_to_raw(b, upright_w) for b in result.get('boxes', [])]
+        masks = []
+        for mask_b64 in result.get('masks_base64', []):
+            mask = self.decode_mask(mask_b64)
+            if mask is None:
+                masks.append(mask_b64)
+                continue
+            _, png = cv2.imencode('.png', sam3_upright.mask_to_raw(mask))
+            masks.append(base64.b64encode(png).decode())
+        result['masks_base64'] = masks
 
     def _publish_visualization(self, rgb: np.ndarray, depth: Optional[np.ndarray]):
         """Publish visualization with latest SAM3 results (or raw frame if none)."""
