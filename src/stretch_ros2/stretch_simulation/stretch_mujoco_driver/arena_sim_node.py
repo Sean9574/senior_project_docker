@@ -31,7 +31,7 @@ from sensor_msgs.msg import CameraInfo, Image, LaserScan
 from std_srvs.srv import Trigger
 from tf2_ros import TransformBroadcaster
 
-from stretch_mujoco_driver.arena_core import Arena, steps_owed
+from stretch_mujoco_driver.arena_core import Arena, camera_matrices, steps_owed
 from stretch_mujoco_driver.arena_world import build_arena
 
 CMD_TIMEOUT_S = 0.5
@@ -61,6 +61,9 @@ class ArenaSimNode(Node):
         camera_hz = float(p("camera_hz", 2.0).value)
         self.camera_period = 1.0 / camera_hz if camera_hz > 0 else float("inf")
         self.use_cameras = str(p("use_cameras", True).value).lower() == "true"
+        # 1280x720 (the real D435i colour size): SAM3 finds the soda can to
+        # ~6 m, vs ~2.5 m at stretch_mujoco's 424x240, for the same SAM3 time
+        self.camera_size = (int(p("camera_width", 1280).value), int(p("camera_height", 720).value))
         random_spawn = str(p("random_spawn", True).value).lower() == "true"
         seed = int(p("seed", 0).value)
         # 4 ms (the model's default is 2 ms): measured identical driving speed
@@ -204,33 +207,34 @@ class ArenaSimNode(Node):
 
     # ------------------------------------------------------------ cameras
     def _make_cameras(self):
-        """Renderers + intrinsics exactly as stretch_mujoco's camera manager
-        sets up the head D435i (fov, intrinsics, resolution, depth limit)."""
+        """Renderers + intrinsics for the head D435i as stretch_mujoco's camera
+        manager sets it up (fov, intrinsics, depth limit), rendered at
+        camera_width x camera_height, with K/P matching that render."""
         import mujoco
         from stretch_mujoco import config, utils
         from stretch_mujoco.enums.stretch_cameras import StretchCameras
 
         model = self.arena.model
         settings = StretchCameras.cam_d435i_rgb.initial_camera_settings
+        width, height = self.camera_size
         for room in self.arena.world.rooms:
             for cam in (room.camera_rgb, room.camera_depth):
                 model.cam_fovy[cam] = settings.field_of_view_vertical_in_degrees
                 model.cam_intrinsic[cam] = list(settings.focal) + [0, 0]
                 model.cam_resolution[cam] = (settings.sensor_resolution if settings.sensor_resolution
-                                             is not None else (settings.width, settings.height))
+                                             is not None else (width, height))
                 if settings.sensor_size is not None:
                     model.cam_sensorsize[cam] = settings.sensor_size
-        model.vis.global_.offwidth = max(model.vis.global_.offwidth, settings.width)
-        model.vis.global_.offheight = max(model.vis.global_.offheight, settings.height)
-        rgb = mujoco.Renderer(model, width=settings.width, height=settings.height)
-        depth = mujoco.Renderer(model, width=settings.width, height=settings.height)
+        model.vis.global_.offwidth = max(model.vis.global_.offwidth, width)
+        model.vis.global_.offheight = max(model.vis.global_.offheight, height)
+        rgb = mujoco.Renderer(model, width=width, height=height)
+        depth = mujoco.Renderer(model, width=width, height=height)
         depth.enable_depth_rendering()
         info = CameraInfo()
-        info.width, info.height = settings.width, settings.height
+        info.width, info.height = width, height
         info.distortion_model = "plumb_bob"
         info.d = settings.get_distortion_params_d()
-        info.k = settings.get_intrinsic_params_k()
-        info.p = settings.get_projection_matrix_p()
+        info.k, info.p = camera_matrices(width, height, settings.field_of_view_vertical_in_degrees)
         limit = config.depth_limits["d435i"]
         return rgb, depth, info, (lambda d: utils.limit_depth_distance(d, limit))
 

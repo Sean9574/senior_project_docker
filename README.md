@@ -167,6 +167,9 @@ much less memory than one simulator and learner per robot.
   into, or gets goals from another room.
 - **Respawns:** each robot respawns in its own room at a random free spot
   without restarting anything.
+- **Camera:** each robot's head camera renders at 1280x720, so SAM3 finds the
+  soda can out to about 6 m (about 2.5 m at the old 424x240). Add
+  `camera_width:=848 camera_height:=480` to render less (about 4 m).
 - **Shared SAM3:** one SAM3 server serves every robot. The per-robot
   detection rate drops as N grows (1 Hz at 8 robots).
 - **Panel:** shows one row per robot plus combined progress and success rates.

@@ -242,3 +242,34 @@ def test_far_beams_clamp_to_the_rangefinder_cutoff():
     scan = a.scan(0)
     assert scan.max() == pytest.approx(10.0)
     assert (scan <= 10.0).all()
+
+
+def test_camera_projection_matrix_is_the_camera_matrix_with_no_shift():
+    k, p = arena_core.camera_matrices(1280, 720, 42.0)
+    assert p == [k[0], k[1], k[2], 0.0, k[3], k[4], k[5], 0.0, 0.0, 0.0, 1.0, 0.0]
+
+
+@needs_mujoco
+def test_camera_matrix_puts_the_can_where_the_camera_renders_it():
+    # The goal generator turns mask pixels into points with the published K:
+    # K must match the rendered image at the size the arena renders
+    import mujoco
+    w, h, fovy = 1280, 720, 42.0
+    a = _arena(1)
+    m, room = a.model, a.world.rooms[0]
+    m.cam_fovy[room.camera_rgb] = fovy
+    m.vis.global_.offwidth, m.vis.global_.offheight = w, h
+    a.respawn_at(0, 1.5, 0.6, 0.0)   # can 2.5 m ahead, well off the image centre
+    can = [mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_GEOM, f"room0_{g}") for g in ("can_body", "can_top", "can_bottom")]
+    r = mujoco.Renderer(m, h, w)
+    r.enable_segmentation_rendering()
+    r.update_scene(a.data, camera=room.camera_rgb)
+    rows, cols = np.nonzero(np.isin(r.render()[:, :, 0], can))
+    r.close()
+
+    k, _ = arena_core.camera_matrices(w, h, fovy)
+    r_opt = a.data.cam_xmat[room.camera_rgb].reshape(3, 3) @ np.diag([1.0, -1.0, -1.0])
+    x, y, z = r_opt.T @ (a.data.geom_xpos[can[0]] - a.data.cam_xpos[room.camera_rgb])
+    u, v = k[0] * x / z + k[2], k[4] * y / z + k[5]
+    assert abs(u - (cols.mean() + 0.5)) < 1.5 and abs(v - (rows.mean() + 0.5)) < 1.5
+    assert abs(v - h / 2) > 150   # far enough off centre that a 3 % focal error would show

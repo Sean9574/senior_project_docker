@@ -52,6 +52,8 @@ def generate_launch_description():
         ("seed", "42", ""),
         ("random_spawn", "true", "Random free start pose for every robot, every episode"),
         ("room_xml", "", "Room layout (empty = senior_project/config/scene.xml)"),
+        ("camera_width", "1280", "Head camera size; SAM3 finds the soda can to ~6 m at 1280x720, ~4 m at 848x480"),
+        ("camera_height", "720", ""),
         ("status_panel", "true", "Live status panel in this terminal; node output goes to log files"),
         ("use_reward_monitor", "true", "Web dashboard on 127.0.0.1:5555"),
         ("start_sam3_server", "true", "false = use a SAM3 server that is already running"),
@@ -90,6 +92,8 @@ def _setup(context):
         parameters=[{
             "num_robots": n,
             "camera_hz": rate,
+            "camera_width": int(arg("camera_width")),
+            "camera_height": int(arg("camera_height")),
             "use_cameras": True,
             "random_spawn": arg("random_spawn") == "true",
             "seed": int(arg("seed")),
@@ -111,7 +115,8 @@ def _setup(context):
                 "auto_publish_goal": True,
                 "depth_mode": arg("depth_mode"),
                 "min_distance": 0.5,
-                "max_distance": 5.0,
+                # the sim's D435i depth limit: keep the far cans SAM3 now finds
+                "max_distance": 10.0,
                 "rgb_topic": f"/r{i}/camera/color/image_raw",
                 "depth_topic": f"/r{i}/camera/depth/image_rect_raw",
                 "camera_info_topic": f"/r{i}/camera/color/camera_info",

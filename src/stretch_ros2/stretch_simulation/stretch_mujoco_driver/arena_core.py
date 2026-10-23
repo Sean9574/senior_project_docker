@@ -32,6 +32,17 @@ def clamp_cmd(v: float, w: float) -> Tuple[float, float]:
             max(-MAX_ANGULAR_RADPS, min(MAX_ANGULAR_RADPS, w)))
 
 
+def camera_matrices(width: int, height: int, fovy_deg: float) -> Tuple[List[float], List[float]]:
+    """CameraInfo K (3x3) and P (3x4), row-major, of a MuJoCo camera rendered
+    at width x height: square pixels, focal length set by the vertical fov
+    (MuJoCo ignores the D435i focal stretch_mujoco also sets, so its K is ~3 % off)."""
+    f = (height / 2.0) / math.tan(math.radians(fovy_deg) / 2.0)
+    cx, cy = width / 2.0, height / 2.0
+    k = [f, 0.0, cx, 0.0, f, cy, 0.0, 0.0, 1.0]
+    p = [f, 0.0, cx, 0.0, 0.0, f, cy, 0.0, 0.0, 0.0, 1.0, 0.0]
+    return k, p
+
+
 def wheel_speeds(v: float, w: float) -> Tuple[float, float]:
     """(left, right) wheel angular velocity, as stretch_mujoco.utils.diff_drive_inv_kinematics."""
     return ((v - w * WHEEL_SEPARATION / 2.0) / WHEEL_RADIUS,

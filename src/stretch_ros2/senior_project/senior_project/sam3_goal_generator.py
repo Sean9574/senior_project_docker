@@ -148,7 +148,9 @@ class SAM3GoalGeneratorV2(Node):
         self.declare_parameter('camera_forward_offset', 0.0)
         
         # Performance parameters
-        self.declare_parameter('sam3_max_width', 640)  # Downscale images for faster inference
+        # Wider frames are shrunk before sending. SAM3 takes the same time at any
+        # size (it resizes to 1008x1008), so shrinking only loses far-away objects
+        self.declare_parameter('sam3_max_width', 1280)
         self.declare_parameter('sam3_jpeg_quality', 60)  # Lower quality = smaller payload
 
         self.declare_parameter('use_tf', True)
