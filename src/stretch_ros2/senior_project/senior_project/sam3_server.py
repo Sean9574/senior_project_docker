@@ -3,7 +3,10 @@
 SAM3 Segmentation Server — Performance Optimized
 
 Optimizations over original:
-1. Input cap: resize images BEFORE encoder (512px default — SAM resizes internally anyway)
+1. Input cap: shrink images whose long side is over the cap (1280 default, or
+   $SAM3_MAX_INPUT_SIZE) BEFORE the encoder; boxes and masks come back in the
+   pixels of the image the client sent. SAM3 resizes every input to 1008x1008,
+   so its time is the same at any size: a smaller cap only throws detail away
 2. FP16 autocast: half-precision inference without dtype mismatch issues
 3. torch.compile: 20-40% GPU speedup on repeated inference patterns
 4. RLE masks: 10x faster than PNG encode, ~3x smaller payload
@@ -13,14 +16,13 @@ Optimizations over original:
 8. Reduced CUDA syncs: batch operations before pulling to CPU
 
 Usage:
-    python sam3_server.py --port 8100
-    python sam3_server.py --port 8100 --max-input-size 640  # Higher quality
-    python sam3_server.py --port 8100 --no-compile           # Skip torch.compile
+    python3 -m senior_project.sam3_server --port 8100
+    python3 -m senior_project.sam3_server --port 8100 --max-input-size 1920
+    python3 -m senior_project.sam3_server --port 8100 --no-compile  # Skip torch.compile
 """
 
 import argparse
 import base64
-import hashlib
 import io
 import os
 import time
@@ -38,12 +40,15 @@ from pydantic import BaseModel
 from sam3.model.sam3_image_processor import Sam3Processor
 from sam3.model_builder import build_sam3_image_model
 
+from senior_project import sam3_frames
+
 # ============== GLOBAL STATE ==============
 model = None
 processor = None
 CURRENT_PROMPT = "object"
 SERVER_PORT = 8100
-MAX_INPUT_SIZE = 512       # Cap input long side BEFORE encoder
+# Cap input long side BEFORE encoder (env too, for `uvicorn ...:app` launches)
+MAX_INPUT_SIZE = int(os.environ.get("SAM3_MAX_INPUT_SIZE", "1280"))
 USE_COMPILE = True         # torch.compile the model
 # ==========================================
 
@@ -167,8 +172,9 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 # Fast image decode + resize (cv2 is 2-3x faster than PIL for this)
 # =============================================================================
 
-def decode_image_fast(base64_str: str) -> Image.Image:
-    """Decode base64 -> numpy (cv2) -> resize if needed -> PIL Image."""
+def decode_image_fast(base64_str: str) -> tuple[Image.Image, tuple[int, int]]:
+    """Decode base64 -> numpy (cv2) -> resize if needed -> (PIL Image, (w, h)
+    of the image as sent)."""
     if "," in base64_str:
         base64_str = base64_str.split(",", 1)[1]
 
@@ -178,29 +184,17 @@ def decode_image_fast(base64_str: str) -> Image.Image:
 
     if img_bgr is None:
         # Fallback to PIL if cv2 fails (unusual formats)
-        return Image.open(io.BytesIO(img_bytes)).convert("RGB")
+        image = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+        return image, image.size
 
-    # Resize BEFORE sending to model — SAM3 resizes internally anyway,
-    # but this saves CPU time in preprocessing and GPU time in the encoder
+    # Resize BEFORE sending to model: saves CPU time in preprocessing
     h, w = img_bgr.shape[:2]
-    long_side = max(h, w)
-    if long_side > MAX_INPUT_SIZE:
-        scale = MAX_INPUT_SIZE / long_side
-        new_w = max(1, int(w * scale))
-        new_h = max(1, int(h * scale))
+    new_w, new_h = sam3_frames.capped_size(w, h, MAX_INPUT_SIZE)
+    if (new_w, new_h) != (w, h):
         img_bgr = cv2.resize(img_bgr, (new_w, new_h), interpolation=cv2.INTER_AREA)
 
     img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-    return Image.fromarray(img_rgb)
-
-
-def _image_hash(base64_str: str) -> str:
-    """Fast hash of image payload for cache check. Uses first+last 4KB."""
-    if len(base64_str) < 16384:
-        return hashlib.md5(base64_str.encode(), usedforsecurity=False).hexdigest()
-    # For large images, hash bookends (fast approximation)
-    sample = base64_str[:8192] + base64_str[-8192:]
-    return hashlib.md5(sample.encode(), usedforsecurity=False).hexdigest()
+    return Image.fromarray(img_rgb), (w, h)
 
 
 # =============================================================================
@@ -332,11 +326,12 @@ async def segment_image(request: SegmentRequest):
         t0 = time.time()
 
         # --- Image decode + resize (cv2, capped resolution) ---
-        image = decode_image_fast(request.image_base64)
+        image, sent_wh = decode_image_fast(request.image_base64)
+        shrunk = image.size != sent_wh
 
         # --- Image embedding cache ---
         # If same image as last call, skip the encoder entirely (~60% of GPU time)
-        img_hash = _image_hash(request.image_base64)
+        img_hash = sam3_frames.cache_key(request.image_base64)
 
         with torch.inference_mode():
             if img_hash == _embed_cache_hash and _embed_cache_state is not None:
@@ -389,6 +384,8 @@ async def segment_image(request: SegmentRequest):
         if request.max_objects > 0:
             order = order[:request.max_objects]
         masks_np, boxes_np, scores_np = masks_np[order], boxes_np[order], scores_np[order]
+        if shrunk:  # answer in the pixels of the image as sent
+            boxes_np = np.asarray(sam3_frames.boxes_to_sent(boxes_np, image.size, sent_wh), dtype=np.float32)
 
         # --- Min area threshold ---
         sample_u8 = _mask_to_u8(masks_np[0], request.mask_threshold)
@@ -415,6 +412,8 @@ async def segment_image(request: SegmentRequest):
                     inference_time_ms=inference_ms, mask_encoding=request.mask_encoding,
                 )
 
+            if shrunk:
+                combined = sam3_frames.mask_to_sent(combined, sent_wh)
             combined = _downscale_u8(combined, request.mask_size)
             encoded = encode_mask_rle(combined) if use_rle else encode_mask_png_base64(combined)
 
@@ -433,6 +432,8 @@ async def segment_image(request: SegmentRequest):
             m_u8 = _mask_to_u8(m, request.mask_threshold)
             if min_area > 0 and int((m_u8 > 0).sum()) < min_area:
                 continue
+            if shrunk:
+                m_u8 = sam3_frames.mask_to_sent(m_u8, sent_wh)
             m_u8 = _downscale_u8(m_u8, request.mask_size)
             encoded_masks.append(encode_mask_png_base64(m_u8))
             kept_boxes.append(b)
@@ -475,8 +476,9 @@ def main():
 
     parser = argparse.ArgumentParser(description="SAM3 Segmentation Server (Optimized)")
     parser.add_argument("--port", type=int, default=8100)
-    parser.add_argument("--max-input-size", type=int, default=512,
-                        help="Cap input image long side (default: 512). Higher = better quality, slower.")
+    parser.add_argument("--max-input-size", type=int, default=MAX_INPUT_SIZE,
+                        help=f"Cap input image long side (default: {MAX_INPUT_SIZE}, or $SAM3_MAX_INPUT_SIZE). "
+                             "Lower = less detail; SAM3 time stays the same.")
     parser.add_argument("--no-compile", action="store_true",
                         help="Disable torch.compile")
     args = parser.parse_args()
